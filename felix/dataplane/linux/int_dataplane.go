@@ -221,6 +221,7 @@ type Config struct {
 	BPFExcludeCIDRsFromNAT             []string
 	KubeProxyMinSyncPeriod             time.Duration
 	SidecarAccelerationEnabled         bool
+	ServiceLoopPrevention              string
 
 	LookPathOverride func(file string) (string, error)
 
@@ -633,6 +634,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			log.WithError(err).Info("Failed to remove BPF connect-time load balancer, ignoring.")
 		}
 		tc.CleanUpProgramsAndPins()
+		removeBPFSpecialDevices()
 	} else {
 		// In BPF mode we still use iptables for raw egress policy.
 		dp.RegisterManager(newRawEgressPolicyManager(rawTableV4, ruleRenderer, 4, ipSetsV4.SetFilter))
@@ -713,6 +715,8 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			dp.loopSummarizer,
 			featureDetector,
 			config.HealthAggregator,
+			dataplaneFeatures,
+			podMTU,
 		)
 
 		if err != nil {
@@ -720,8 +724,6 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		}
 
 		dp.RegisterManager(bpfEndpointManager)
-
-		bpfEndpointManager.Features = dataplaneFeatures
 
 		// HostNetworkedNAT is Enabled and CTLB enabled.
 		// HostNetworkedNAT is Disabled and CTLB is either disabled/TCP.
@@ -1511,7 +1513,9 @@ func (d *InternalDataplane) setUpIptablesBPF() {
 				// only go to the host. Make sure that they are not forwarded.
 				fwdRules = append(fwdRules, rules.ICMPv6Filter(d.ruleRenderer.IptablesFilterDenyAction())...)
 			}
-		} else {
+		}
+
+		if t.IPVersion == 4 || d.config.BPFIpv6Enabled {
 			// Let the BPF programs know if Linux conntrack knows about the flow.
 			fwdRules = append(fwdRules, bpfMarkPreestablishedFlowsRules()...)
 			// The packet may be about to go to a local workload.  However, the local workload may not have a BPF
