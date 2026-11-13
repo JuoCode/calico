@@ -5,6 +5,15 @@
 #ifndef __CALI_POLICY_H__
 #define __CALI_POLICY_H__
 
+#include "cali_bpf.h"
+#include "ip_addr.h"
+
+// Base of range for reserved IP set IDs for Calico Enterprise.
+#define RESERVED_IP_SET_BASE (((__u64)1)<<32)
+
+// IP set ID for All Istio WEPs.  Must match the ID defined in ipsets.go.
+#define ALL_ISTIO_WEPS_ID (RESERVED_IP_SET_BASE + 3)
+
 enum calico_policy_result {
 	CALI_POL_NO_MATCH,
 	CALI_POL_ALLOW,
@@ -33,10 +42,6 @@ struct ip_set_key {
 	__u8 pad;
 } __attribute__((packed));
 
-union ip_set_lpm_key {
-	struct bpf_lpm_trie_key lpm;
-	struct ip_set_key ip;
-};
 
 #ifdef IPVER6
 CALI_MAP_NAMED(cali_v6_ip_sets, cali_ip_sets,,
@@ -44,7 +49,7 @@ CALI_MAP_NAMED(cali_v6_ip_sets, cali_ip_sets,,
 CALI_MAP_NAMED(cali_v4_ip_sets, cali_ip_sets,,
 #endif
 	BPF_MAP_TYPE_LPM_TRIE,
-	union ip_set_lpm_key,
+	struct ip_set_key,
 	__u32,
 	1024*1024,
 	BPF_F_NO_PREALLOC)

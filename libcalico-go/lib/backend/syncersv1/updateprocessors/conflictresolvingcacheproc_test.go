@@ -15,9 +15,8 @@
 package updateprocessors_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -54,7 +53,7 @@ var _ = Describe("Test the conflict resolving cache", func() {
 		Revision: "12345",
 	}
 	v1Key1 := model.GlobalBGPPeerKey{
-		PeerIP: net.MustParseIP("1.2.3.4"),
+		PeerIP: model.AddrFromIP(net.MustParseIP("1.2.3.4")),
 	}
 
 	converter := &fakeconverter{}

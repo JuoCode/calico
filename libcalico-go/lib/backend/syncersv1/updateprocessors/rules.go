@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,12 @@ package updateprocessors
 
 import (
 	"fmt"
+	"maps"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
 
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -29,14 +29,14 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/selector/parser"
 )
 
-func RulesAPIV2ToBackend(ars []apiv3.Rule, ns string) []model.Rule {
+func RulesAPIV3ToBackend(ars []apiv3.Rule, ns string) []model.Rule {
 	if len(ars) == 0 {
 		return nil
 	}
 
 	brs := make([]model.Rule, len(ars))
 	for idx, ar := range ars {
-		brs[idx] = RuleAPIV2ToBackend(ar, ns)
+		brs[idx] = RuleAPIV3ToBackend(ar, ns)
 	}
 	return brs
 }
@@ -127,7 +127,7 @@ func getEndpointSelector(namespaceSelector, endpointSelector, serviceAccountSele
 }
 
 // RuleAPIToBackend converts an API Rule structure to a Backend Rule structure.
-func RuleAPIV2ToBackend(ar apiv3.Rule, ns string) model.Rule {
+func RuleAPIV3ToBackend(ar apiv3.Rule, ns string) model.Rule {
 	var icmpCode, icmpType, notICMPCode, notICMPType *int
 	if ar.ICMP != nil {
 		icmpCode = ar.ICMP.Code
@@ -163,7 +163,7 @@ func RuleAPIV2ToBackend(ar apiv3.Rule, ns string) model.Rule {
 	}
 
 	r := model.Rule{
-		Action:      ruleActionAPIV2ToBackend(ar.Action),
+		Action:      ruleActionAPIV3ToBackend(ar.Action),
 		IPVersion:   ar.IPVersion,
 		Protocol:    convertV3ProtocolToV1(ar.Protocol),
 		ICMPCode:    icmpCode,
@@ -208,9 +208,7 @@ func RuleAPIV2ToBackend(ar apiv3.Rule, ns string) model.Rule {
 	if ar.Metadata != nil {
 		if ar.Metadata.Annotations != nil {
 			r.Metadata = &model.RuleMetadata{Annotations: make(map[string]string)}
-			for k, v := range ar.Metadata.Annotations {
-				r.Metadata.Annotations[k] = v
-			}
+			maps.Copy(r.Metadata.Annotations, ar.Metadata.Annotations)
 		}
 	}
 	return r
@@ -272,21 +270,24 @@ func normalizeIPNet(n string) *cnet.IPNet {
 }
 
 // NormalizeIPNets converts an []*IPNet to a slice of networks by ensuring the IP addresses
-// are correctly masked.
+// are correctly masked. Unparseable CIDRs are skipped.
 func NormalizeIPNets(nets []string) []*cnet.IPNet {
 	if len(nets) == 0 {
 		return nil
 	}
-	out := make([]*cnet.IPNet, len(nets))
-	for i, n := range nets {
-		out[i] = normalizeIPNet(n)
+	var out []*cnet.IPNet
+	for _, n := range nets {
+		ipn := normalizeIPNet(n)
+		if ipn != nil {
+			out = append(out, ipn)
+		}
 	}
 	return out
 }
 
-// ruleActionAPIV2ToBackend converts the rule action field value from the API
+// ruleActionAPIV3ToBackend converts the rule action field value from the API
 // value to the equivalent backend value.
-func ruleActionAPIV2ToBackend(action apiv3.Action) string {
+func ruleActionAPIV3ToBackend(action apiv3.Action) string {
 	if action == apiv3.Pass {
 		return "next-tier"
 	}

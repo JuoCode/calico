@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package errors
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,7 +27,11 @@ import (
 // Error indicating a problem connecting to the backend.
 type ErrorDatastoreError struct {
 	Err        error
-	Identifier interface{}
+	Identifier any
+}
+
+func (e ErrorDatastoreError) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorDatastoreError) Error() string {
@@ -43,7 +48,7 @@ func (e ErrorDatastoreError) Status() metav1.Status {
 		Status:  metav1.StatusFailure,
 		Code:    http.StatusBadRequest,
 		Reason:  metav1.StatusReasonInvalid,
-		Message: fmt.Sprintf(e.Error()),
+		Message: e.Error(),
 		Details: &metav1.StatusDetails{
 			Name: fmt.Sprintf("%v", e.Identifier),
 		},
@@ -54,17 +59,30 @@ func (e ErrorDatastoreError) Status() metav1.Status {
 // update a nonexistent resource.
 type ErrorResourceDoesNotExist struct {
 	Err        error
-	Identifier interface{}
+	Identifier any
 }
 
 func (e ErrorResourceDoesNotExist) Error() string {
 	return fmt.Sprintf("resource does not exist: %v with error: %v", e.Identifier, e.Err)
 }
 
+func (e ErrorResourceDoesNotExist) Unwrap() error {
+	return e.Err
+}
+
+// Error indicating an IP is in its cooldown period.
+type ErrorIPInCooldown struct {
+	IP string
+}
+
+func (e ErrorIPInCooldown) Error() string {
+	return fmt.Sprintf("address %s is in cooldown", e.IP)
+}
+
 // Error indicating an operation is not supported.
 type ErrorOperationNotSupported struct {
 	Operation  string
-	Identifier interface{}
+	Identifier any
 	Reason     string
 }
 
@@ -80,16 +98,24 @@ func (e ErrorOperationNotSupported) Error() string {
 // resource that already exists.
 type ErrorResourceAlreadyExists struct {
 	Err        error
-	Identifier interface{}
+	Identifier any
+}
+
+func (e ErrorResourceAlreadyExists) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorResourceAlreadyExists) Error() string {
-	return fmt.Sprintf("resource already exists: %v", e.Identifier)
+	return fmt.Sprintf("resource already exists: %v with error: %v", e.Identifier, e.Err)
 }
 
 // Error indicating a problem connecting to the backend.
 type ErrorConnectionUnauthorized struct {
 	Err error
+}
+
+func (e ErrorConnectionUnauthorized) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorConnectionUnauthorized) Error() string {
@@ -103,7 +129,7 @@ type ErrorValidation struct {
 
 type ErroredField struct {
 	Name   string
-	Value  interface{}
+	Value  any
 	Reason string
 }
 
@@ -148,7 +174,11 @@ func (e ErrorInsufficientIdentifiers) Error() string {
 // Error indicating an atomic update attempt that failed due to a update conflict.
 type ErrorResourceUpdateConflict struct {
 	Err        error
-	Identifier interface{}
+	Identifier any
+}
+
+func (e ErrorResourceUpdateConflict) Unwrap() error {
+	return e.Err
 }
 
 func (e ErrorResourceUpdateConflict) Error() string {
@@ -192,7 +222,7 @@ func (e ErrorPartialFailure) Error() string {
 
 // UpdateErrorIdentifier modifies the supplied error to use the new resource
 // identifier.
-func UpdateErrorIdentifier(err error, id interface{}) error {
+func UpdateErrorIdentifier(err error, id any) error {
 	if err == nil {
 		return nil
 	}
@@ -228,6 +258,86 @@ func (e ErrorParsingDatastoreEntry) Error() string {
 	return fmt.Sprintf("failed to parse datastore entry key=%s; value=%s: %v", e.RawKey, e.RawValue, e.Err)
 }
 
+type ErrorClusterNetworkPolicyConversion struct {
+	PolicyName string
+	Rules      []ErrorClusterNetworkPolicyConversionRule
+}
+
+func (e *ErrorClusterNetworkPolicyConversion) BadEgressRule(rule any, reason string) {
+	e.Rules = append(e.Rules, ErrorClusterNetworkPolicyConversionRule{
+		EgressRule:  rule,
+		IngressRule: nil,
+		Reason:      reason,
+	})
+}
+
+func (e *ErrorClusterNetworkPolicyConversion) BadIngressRule(rule any, reason string) {
+	e.Rules = append(e.Rules, ErrorClusterNetworkPolicyConversionRule{
+		EgressRule:  nil,
+		IngressRule: rule,
+		Reason:      reason,
+	})
+}
+
+func (e ErrorClusterNetworkPolicyConversion) Error() string {
+	var s strings.Builder
+	s.WriteString(fmt.Sprintf("policy: %s", e.PolicyName))
+
+	switch {
+	case len(e.Rules) == 0:
+		s.WriteString(": unknown policy conversion error")
+	case len(e.Rules) == 1:
+		f := e.Rules[0]
+
+		s.WriteString(fmt.Sprintf(": error with rule %s", f))
+	default:
+		s.WriteString(": error with the following rules:\n")
+		for _, f := range e.Rules {
+			s.WriteString(fmt.Sprintf("-  %s\n", f))
+		}
+	}
+
+	return s.String()
+}
+
+func (e ErrorClusterNetworkPolicyConversion) GetError() error {
+	if len(e.Rules) == 0 {
+		return nil
+	}
+
+	return e
+}
+
+type ErrorClusterNetworkPolicyConversionRule struct {
+	EgressRule  any
+	IngressRule any
+	Reason      string
+}
+
+func (e ErrorClusterNetworkPolicyConversionRule) String() string {
+	var fieldString string
+
+	switch {
+	case e.EgressRule != nil:
+		fieldString = fmt.Sprintf("%+v", e.EgressRule)
+	case e.IngressRule != nil:
+		fieldString = fmt.Sprintf("%+v", e.IngressRule)
+	default:
+		fieldString = "unknown rule"
+	}
+
+	if e.Reason != "" {
+		fieldString = fmt.Sprintf("%s (%s)", fieldString, e.Reason)
+	}
+
+	return fieldString
+}
+
+type ErrorPolicyConversion struct {
+	PolicyName string
+	Rules      []ErrorPolicyConversionRule
+}
+
 type ErrorPolicyConversionRule struct {
 	EgressRule  *networkingv1.NetworkPolicyEgressRule
 	IngressRule *networkingv1.NetworkPolicyIngressRule
@@ -251,11 +361,6 @@ func (e ErrorPolicyConversionRule) String() string {
 	}
 
 	return fieldString
-}
-
-type ErrorPolicyConversion struct {
-	PolicyName string
-	Rules      []ErrorPolicyConversionRule
 }
 
 func (e *ErrorPolicyConversion) BadEgressRule(rule *networkingv1.NetworkPolicyEgressRule, reason string) {
@@ -282,23 +387,24 @@ func (e *ErrorPolicyConversion) BadIngressRule(
 }
 
 func (e ErrorPolicyConversion) Error() string {
-	s := fmt.Sprintf("policy: %s", e.PolicyName)
+	var s strings.Builder
+	s.WriteString(fmt.Sprintf("policy: %s", e.PolicyName))
 
 	switch {
 	case len(e.Rules) == 0:
-		s += ": unknown policy conversion error"
+		s.WriteString(": unknown policy conversion error")
 	case len(e.Rules) == 1:
 		f := e.Rules[0]
 
-		s += fmt.Sprintf(": error with rule %s", f)
+		s.WriteString(fmt.Sprintf(": error with rule %s", f))
 	default:
-		s += ": error with the following rules:\n"
+		s.WriteString(": error with the following rules:\n")
 		for _, f := range e.Rules {
-			s += fmt.Sprintf("-  %s\n", f)
+			s.WriteString(fmt.Sprintf("-  %s\n", f))
 		}
 	}
 
-	return s
+	return s.String()
 }
 
 func (e ErrorPolicyConversion) GetError() error {

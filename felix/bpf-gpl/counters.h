@@ -5,7 +5,10 @@
 #ifndef __CALI_COUNTERS_H__
 #define __CALI_COUNTERS_H__
 
-#define MAX_COUNTERS_SIZE 14
+#include "cali_bpf.h"
+#include "types.h"
+
+#define MAX_COUNTERS_SIZE 29
 
 typedef __u64 counters_t[MAX_COUNTERS_SIZE];
 
@@ -18,7 +21,7 @@ struct counters_key {
 #define COUNTERS_TC_EGRESS	1
 #define COUNTERS_XDP		2
 
-CALI_MAP(cali_counters, 2,
+CALI_MAP(cali_counters, 8,
 		BPF_MAP_TYPE_PERCPU_HASH,
 		struct counters_key, counters_t, 20000,
 		0)
@@ -41,21 +44,7 @@ static CALI_BPF_INLINE counters_t *counters_get(int ifindex)
 		key.hook = COUNTERS_TC_INGRESS;
 	}
 
-	void * val = cali_counters_lookup_elem(&key);
-
-	if (!val) {
-		/* If there was no entry created yet, create it. It is a hash
-		 * map so any entry must be created first!
-		 */
-		counters_t ctrs = {};
-		if (cali_counters_update_elem(&key, ctrs, BPF_ANY)) {
-			return NULL;
-		}
-
-		val = cali_counters_lookup_elem(&key);
-	}
-
-	return val;
+	return cali_counters_lookup_elem(&key);
 }
 
 static CALI_BPF_INLINE void counter_inc(struct cali_tc_ctx *ctx, int type)
@@ -67,7 +56,7 @@ static CALI_BPF_INLINE void counter_inc(struct cali_tc_ctx *ctx, int type)
 
 static CALI_BPF_INLINE void deny_reason(struct cali_tc_ctx *ctx, int reason)
 {
-	ctx->fwd.reason = reason;
+	ctx->state->fwd.reason = reason;
 	counter_inc(ctx, reason);
 }
 

@@ -23,16 +23,32 @@ package utils
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
+	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
 )
+
+var memLockOnce sync.Once
+
+func IncreaseLockedMemoryQuota() {
+	memLockOnce.Do(func() {
+		err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+		if err != nil {
+			log.WithError(err).Error("Failed to increase RLIMIT_MEMLOCK, loading BPF programs may fail")
+		}
+	})
+}
 
 func MaybeMountBPFfs() (string, error) {
 	var err error
@@ -149,4 +165,39 @@ func isMount(path string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// FVLogPrefix returns a short host-identifying prefix (e.g. "f0-") when running
+// inside a Felix FV test container (hostname ends with "-felixfv"). Returns ""
+// in production so there is no impact on non-test deployments.
+var FVLogPrefix = sync.OnceValue(func() string {
+	hostname, err := os.Hostname()
+	if err != nil || !strings.HasSuffix(hostname, "-felixfv") {
+		return ""
+	}
+	// Hostname format: felix-<id>-<pid>-<counter>-felixfv
+	// Extract the <id> part after "felix-".
+	if !strings.HasPrefix(hostname, "felix-") {
+		return ""
+	}
+	rest := hostname[len("felix-"):]
+	idx, _, _ := strings.Cut(rest, "-")
+	return "f" + idx + "-"
+})
+
+func RemoveBPFSpecialDevices() {
+	bpfin, err := netlink.LinkByName(dataplanedefs.BPFInDev)
+	if err != nil {
+		var lnf netlink.LinkNotFoundError
+		if errors.As(err, &lnf) {
+			return
+		}
+		log.WithError(err).Warnf("Failed to make sure that %s/%s device is (not) present.", dataplanedefs.BPFInDev, dataplanedefs.BPFOutDev)
+		return
+	}
+
+	err = netlink.LinkDel(bpfin)
+	if err != nil {
+		log.WithError(err).Warnf("Failed to remove %s/%s device.", dataplanedefs.BPFInDev, dataplanedefs.BPFOutDev)
+	}
 }

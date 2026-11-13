@@ -14,23 +14,20 @@
 package testutils
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-
-	"fmt"
-
 	"k8s.io/apimachinery/pkg/conversion"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/go-yaml-wrapper"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
@@ -40,23 +37,25 @@ const ExpectNoNamespace = ""
 
 type resourceMatcher struct {
 	kind, namespace, name string
-	spec                  interface{}
-	status                interface{}
+	spec                  any
+	status                any
 }
 
-func Resource(kind, namespace, name string, spec interface{}, optionalDescription ...interface{}) *resourceMatcher {
+func Resource(kind, namespace, name string, spec any, optionalDescription ...any) *resourceMatcher {
 	return &resourceMatcher{kind, namespace, name, spec, nil}
 }
 
-func ResourceWithStatus(kind, namespace, name string, spec, status interface{}, optionalDescription ...interface{}) *resourceMatcher {
+func ResourceWithStatus(kind, namespace, name string, spec, status any, optionalDescription ...any) *resourceMatcher {
 	return &resourceMatcher{kind, namespace, name, spec, status}
 }
 
 // Another name for the same matcher (which reads better when checking a single item).
-var MatchResource = Resource
-var MatchResourceWithStatus = ResourceWithStatus
+var (
+	MatchResource           = Resource
+	MatchResourceWithStatus = ResourceWithStatus
+)
 
-func (m *resourceMatcher) Match(actual interface{}) (success bool, err error) {
+func (m *resourceMatcher) Match(actual any) (success bool, err error) {
 	// 'actual' here may be a resource struct like v3.HostEndpoint, or a pointer to a resource
 	// struct.  If it's a pointer we can immediately convert it to runtime.Object.
 	res, ok := actual.(runtime.Object)
@@ -68,36 +67,69 @@ func (m *resourceMatcher) Match(actual interface{}) (success bool, err error) {
 		res = ptr.Interface().(runtime.Object)
 	}
 	ma := res.(v1.ObjectMetaAccessor)
-	success = (ma.GetObjectMeta().GetNamespace() == m.namespace) &&
-		(ma.GetObjectMeta().GetName() == m.name) &&
-		(ma.GetObjectMeta().GetResourceVersion() != "") &&
-		(res.GetObjectKind().GroupVersionKind().Kind == m.kind) &&
-		(res.GetObjectKind().GroupVersionKind().Group == apiv3.Group) &&
-		(res.GetObjectKind().GroupVersionKind().Version == apiv3.VersionCurrent) &&
-		(m.spec == nil || reflect.DeepEqual(getSpec(res), m.spec)) &&
-		(m.status == nil || reflect.DeepEqual(getStatus(res), m.status))
+	success = true
+	if ma.GetObjectMeta().GetNamespace() != m.namespace {
+		success = false
+		err = fmt.Errorf("namespace does not match (expected %q, got %q)", m.namespace, ma.GetObjectMeta().GetNamespace())
+	}
+	if ma.GetObjectMeta().GetName() != m.name {
+		success = false
+		err = fmt.Errorf("name does not match (expected %q, got %q)", m.name, ma.GetObjectMeta().GetName())
+	}
+	if ma.GetObjectMeta().GetResourceVersion() == "" {
+		success = false
+		err = fmt.Errorf("resource version is empty")
+	}
+	if res.GetObjectKind().GroupVersionKind().Kind != m.kind {
+		success = false
+		err = fmt.Errorf("kind does not match (expected %q, got %q)", m.kind, res.GetObjectKind().GroupVersionKind().Kind)
+	}
+	if res.GetObjectKind().GroupVersionKind().Group != apiv3.Group {
+		success = false
+		err = fmt.Errorf("group does not match (expected %q, got %q)", apiv3.Group, res.GetObjectKind().GroupVersionKind().Group)
+	}
+	if res.GetObjectKind().GroupVersionKind().Version != apiv3.VersionCurrent {
+		success = false
+		err = fmt.Errorf("version does not match (expected %q, got %q)", apiv3.VersionCurrent, res.GetObjectKind().GroupVersionKind().Version)
+	}
+	if m.spec != nil && !reflect.DeepEqual(getSpec(res), m.spec) {
+		success = false
+		err = fmt.Errorf("spec does not match (expected %+v, got %+v)", m.spec, getSpec(res))
+	}
+	if m.status != nil && !reflect.DeepEqual(getStatus(res), m.status) {
+		success = false
+		err = fmt.Errorf("status does not match (expected %+v, got %+v)", m.status, getStatus(res))
+	}
 	return
 }
 
-func (m *resourceMatcher) FailureMessage(actual interface{}) (message string) {
+func (m *resourceMatcher) FailureMessage(actual any) (message string) {
 	message = fmt.Sprintf("Expected\n\t%#v\nto match\n\t%#v", actual, m)
 	return
 }
 
-func (m *resourceMatcher) NegatedFailureMessage(actual interface{}) (message string) {
+func (m *resourceMatcher) NegatedFailureMessage(actual any) (message string) {
 	message = fmt.Sprintf("Expected\n\t%#v\nnot to match\n\t%#v", actual, m)
 	return
 }
 
-// TestResourceWatch is a test helper used to validate a set of events are received
-// from a watcher.  The caller creates a watch.Interface from the resource-specific
-// client and passes that to TestResourceWatch to create a TestResourceWatchInterface.
-func NewTestResourceWatch(datastoreType apiconfig.DatastoreType, w watch.Interface) TestResourceWatchInterface {
+// NewTestResourceWatch is a test helper used to validate a set of events are
+// received from a watcher. The caller creates a watch.Interface from the
+// resource-specific client and passes that in to get a TestResourceWatchInterface.
+// Any names passed in ignoredNames are filtered out of the received events, which
+// is useful for watches that return a snapshot of resources the caller does not
+// control - for example the built-in tiers, which always exist and cannot be deleted.
+func NewTestResourceWatch(datastoreType apiconfig.DatastoreType, w watch.Interface, ignoredNames ...string) TestResourceWatchInterface {
+	ignored := map[string]bool{}
+	for _, n := range ignoredNames {
+		ignored[n] = true
+	}
 	tw := &testResourceWatcher{
 		datastoreType: datastoreType,
 		watch:         w,
 		events:        []watch.Event{},
 		watchClosedCh: make(chan struct{}),
+		ignoredNames:  ignored,
 	}
 	go tw.run()
 	return tw
@@ -130,6 +162,10 @@ type testResourceWatcher struct {
 	watchClosedCh chan struct{}
 	closing       bool
 	lock          sync.Mutex
+
+	// ignoredNames are resource names whose events are dropped before they reach
+	// the events list, so they don't count towards the expected event set.
+	ignoredNames map[string]bool
 }
 
 // run is the main loop that consumes and stores the watch events.
@@ -137,6 +173,9 @@ func (t *testResourceWatcher) run() {
 	for {
 		select {
 		case event := <-t.watch.ResultChan():
+			if t.ignored(event) {
+				continue
+			}
 			t.lock.Lock()
 			t.events = append(t.events, event)
 			t.lock.Unlock()
@@ -145,6 +184,22 @@ func (t *testResourceWatcher) run() {
 			return
 		}
 	}
+}
+
+// ignored reports whether the event is for a resource the caller asked to skip.
+func (t *testResourceWatcher) ignored(e watch.Event) bool {
+	if len(t.ignoredNames) == 0 {
+		return false
+	}
+	obj := e.Object
+	if obj == nil {
+		obj = e.Previous
+	}
+	accessor, ok := obj.(v1.ObjectMetaAccessor)
+	if !ok {
+		return false
+	}
+	return t.ignoredNames[accessor.GetObjectMeta().GetName()]
 }
 
 // Stop closes down the Watcher and the main watch loop.
@@ -167,12 +222,13 @@ func (t *testResourceWatcher) ExpectEvents(kind string, expectedEvents []watch.E
 // ExpectEventsAnyOrder validates the received events match those expected but the order
 // is not necessarily fixed.  KDD watch without a resource version does not appear to be
 // deterministic in the order of events from the initial "list".
-//
-// This should be called within a Ginkgo test, and should only be called when listing the
-// current snapshot - it should only include added event types.
 func (t *testResourceWatcher) ExpectEventsAnyOrder(kind string, expectedEvents []watch.Event) {
+	var establishedType *watch.EventType
 	for _, e := range expectedEvents {
-		Expect(e.Type).To(Equal(watch.Added))
+		if establishedType != nil && *establishedType != e.Type {
+			Fail("ExpectEventsAnyOrder should only be used with a set of events of the same type")
+		}
+		establishedType = &e.Type
 	}
 	t.expectEvents(kind, true, expectedEvents)
 }
@@ -208,7 +264,7 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 	// events, so protect against that scenario - we'll check later once we've
 	// constructed useful diagnostics.
 	var actualEvents []watch.Event
-	log.Infof("Received %s events, expected %d", len(t.events), len(expectedEvents))
+	log.Infof("Received %d events, expected %d", len(t.events), len(expectedEvents))
 	if len(t.events) != len(expectedEvents) {
 		// Log out the events we received before failing the test.
 		log.Errorf("Number of received events does not match expected.")
@@ -229,7 +285,7 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 		}
 
 		// Fail the test.
-		Expect(len(t.events)).To(Equal(len(expectedEvents)))
+		ExpectWithOffset(2, len(t.events)).To(Equal(len(expectedEvents)))
 	} else {
 		actualEvents = t.events
 	}
@@ -282,7 +338,7 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 	}
 
 	// And verify we got the correct number of events.
-	Expect(actualEvents).To(HaveLen(len(expectedEvents)))
+	ExpectWithOffset(2, actualEvents).To(HaveLen(len(expectedEvents)))
 
 	for i, expectedEvent := range expectedEvents {
 		actualEvent := actualEvents[i]
@@ -292,8 +348,8 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 
 		Expect(actualEvent.Type).To(Equal(expectedEvent.Type), traceString)
 		if expectedEvent.Object != nil {
-			Expect(actualEvent.Object).NotTo(BeNil(), traceString)
-			Expect(actualEvent.Object).To(MatchResourceWithStatus(
+			ExpectWithOffset(2, actualEvent.Object).NotTo(BeNil(), traceString)
+			ExpectWithOffset(2, actualEvent.Object).To(MatchResourceWithStatus(
 				kind,
 				expectedEvent.Object.(v1.ObjectMetaAccessor).GetObjectMeta().GetNamespace(),
 				expectedEvent.Object.(v1.ObjectMetaAccessor).GetObjectMeta().GetName(),
@@ -302,14 +358,14 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 				traceString,
 			))
 		} else {
-			Expect(actualEvent.Object).To(BeNil(), traceString)
+			ExpectWithOffset(2, actualEvent.Object).To(BeNil(), traceString)
 		}
 
 		// Kubernetes does not provide the "previous" value in a modified event, so don't
 		// check for that if the datastore is KDD.
 		if expectedEvent.Previous != nil && (expectedEvent.Type == watch.Deleted || t.datastoreType != apiconfig.Kubernetes) {
-			Expect(actualEvent.Previous).NotTo(BeNil(), traceString)
-			Expect(actualEvent.Previous).To(MatchResourceWithStatus(
+			ExpectWithOffset(2, actualEvent.Previous).NotTo(BeNil(), traceString)
+			ExpectWithOffset(2, actualEvent.Previous).To(MatchResourceWithStatus(
 				kind,
 				expectedEvent.Previous.(v1.ObjectMetaAccessor).GetObjectMeta().GetNamespace(),
 				expectedEvent.Previous.(v1.ObjectMetaAccessor).GetObjectMeta().GetName(),
@@ -318,7 +374,7 @@ func (t *testResourceWatcher) expectEvents(kind string, anyOrder bool, expectedE
 				traceString,
 			))
 		} else {
-			Expect(actualEvent.Previous).To(BeNil(), traceString)
+			ExpectWithOffset(2, actualEvent.Previous).To(BeNil(), traceString)
 		}
 	}
 
@@ -356,7 +412,7 @@ func (t *testResourceWatcher) sortEvents(events []watch.Event) []watch.Event {
 }
 
 // getSpec returns the Spec structure from the supplied resource.
-func getSpec(res runtime.Object) interface{} {
+func getSpec(res runtime.Object) any {
 	v, err := conversion.EnforcePtr(res)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -368,7 +424,7 @@ func getSpec(res runtime.Object) interface{} {
 }
 
 // getStatus returns the Status structure from the supplied resource.
-func getStatus(res runtime.Object) interface{} {
+func getStatus(res runtime.Object) any {
 	v, err := conversion.EnforcePtr(res)
 	Expect(err).NotTo(HaveOccurred())
 

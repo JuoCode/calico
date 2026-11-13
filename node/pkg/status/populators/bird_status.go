@@ -24,10 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/table"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/olekukonko/tablewriter"
-
 	log "github.com/sirupsen/logrus"
 )
 
@@ -68,14 +66,14 @@ func (b *birdStatus) unmarshalBIRD(line string) bool {
 		b.ready = true
 	} else if strings.HasPrefix(line, "BIRD v") {
 		b.version = strings.TrimPrefix(line, "BIRD ")
-	} else if strings.HasPrefix(line, "Router ID is ") {
-		b.routerID = strings.TrimPrefix(line, "Router ID is ")
-	} else if strings.HasPrefix(line, "Current server time is ") {
-		b.serverTime = strings.TrimPrefix(line, "Current server time is ")
-	} else if strings.HasPrefix(line, "Last reboot on ") {
-		b.lastBootTime = strings.TrimPrefix(line, "Last reboot on ")
-	} else if strings.HasPrefix(line, "Last reconfiguration on ") {
-		b.lastReconfigTime = strings.TrimPrefix(line, "Last reconfiguration on ")
+	} else if after, ok := strings.CutPrefix(line, "Router ID is "); ok {
+		b.routerID = after
+	} else if after, ok := strings.CutPrefix(line, "Current server time is "); ok {
+		b.serverTime = after
+	} else if after, ok := strings.CutPrefix(line, "Last reboot on "); ok {
+		b.lastBootTime = after
+	} else if after, ok := strings.CutPrefix(line, "Last reconfiguration on "); ok {
+		b.lastReconfigTime = after
 	} else {
 		return false
 	}
@@ -227,18 +225,16 @@ func (b BirdInfo) Show() {
 
 // printStatus prints out bird status.
 func printStatus(status *birdStatus, out io.Writer) {
-	table := tablewriter.NewWriter(out)
-	table.SetHeader([]string{"Ready", "Version", "RouteID", "ServerTime", "LastBoot", "LastReconfig"})
-
-	row := []string{
-		fmt.Sprintf("%t", status.ready),
+	t := table.NewWriter()
+	t.SetOutputMirror(out)
+	t.AppendHeader(table.Row{"Ready", "Version", "RouteID", "ServerTime", "LastBoot", "LastReconfig"})
+	t.AppendRow(table.Row{
+		status.ready,
 		status.version,
 		status.routerID,
 		status.serverTime,
 		status.lastBootTime,
 		status.lastReconfigTime,
-	}
-	table.Append(row)
-
-	table.Render()
+	})
+	t.Render()
 }

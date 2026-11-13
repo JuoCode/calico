@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package deltatracker
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 
 	"github.com/sirupsen/logrus"
@@ -43,6 +44,14 @@ import (
 // keys that are in the dataplane map but not in the desired map.  The
 // pending maps are exposed via the IterPendingUpdates and IterPendingDeletions
 // methods.
+//
+// Note: it is not safe to mutate keys/values that are stored in a DeltaTracker
+// because it would corrupt the internal state. Surprisingly(!), it is also
+// unsafe to delete a key, modify the value and then re-insert the value!  This
+// is because (as an occupancy optimisation) the DeltaTracker aliases the
+// Desired and Dataplane values if they happen to be equal.  So, to safely
+// mutate a value, you must take a copy, mutate the copy and re-insert the
+// copy.
 type DeltaTracker[K comparable, V any] struct {
 	// To reduce occupancy, we treat the set of KVs in the dataplane and in the
 	// desired state like a Venn diagram, and we only store each region once
@@ -78,6 +87,8 @@ type DeltaTracker[K comparable, V any] struct {
 	inDataplaneNotDesired map[K]V
 	desiredUpdates        map[K]V
 
+	desiredLen int
+
 	// valuesEqual is the comparison function for the value type, it defaults to
 	// reflect.DeepEqual.
 	valuesEqual func(a, b V) bool
@@ -98,6 +109,15 @@ func WithLogCtx[K comparable, V any](lc *logrus.Entry) Option[K, V] {
 }
 
 func New[K comparable, V any](opts ...Option[K, V]) *DeltaTracker[K, V] {
+	var valueZero V
+	valType := reflect.TypeOf(valueZero)
+	if valType != nil && valType.Kind() == reflect.Map {
+		// Storing a map as the value is particularly confusing.  Even if
+		// the caller does Desired().Delete(k) to remove the mapping, we may
+		// keep hold of the same map in the inDataplaneNotDesired map resulting
+		// in aliasing.
+		logrus.Panic("Map values should not be used in a DeltaTracker.")
+	}
 	cm := &DeltaTracker[K, V]{
 		inDataplaneAndDesired: make(map[K]V),
 		inDataplaneNotDesired: make(map[K]V),
@@ -131,18 +151,25 @@ func (c *DesiredView[K, V]) Set(k K, v V) {
 		// the "not desired" map to the "desired map".
 		c.inDataplaneAndDesired[k] = currentVal
 		delete(c.inDataplaneNotDesired, k)
+		c.desiredLen++
 	} else {
 		// Didn't find the key in the "not-desired" map, check the "desired" map.
 		currentVal, presentInDP = c.inDataplaneAndDesired[k]
 	}
 
 	// Check if we think we need to update the dataplane as a result.
-	if presentInDP && c.valuesEqual(currentVal, v) {
+	if !presentInDP {
+		if _, presentInDesired := c.desiredUpdates[k]; !presentInDesired {
+			// New key, increment our count.
+			c.desiredLen++
+		}
+	} else if c.valuesEqual(currentVal, v) {
 		// Dataplane already agrees with the new value so clear any pending update.
 		c.logCtx.Debug("Set: Key in dataplane already, ignoring.")
 		delete(c.desiredUpdates, k)
 		return
 	}
+
 	// Either key is not in the dataplane, or the value associated with it is not as desired.
 	// Queue up an update.
 	c.desiredUpdates[k] = v
@@ -161,15 +188,25 @@ func (c *DesiredView[K, V]) Get(k K) (V, bool) {
 // cache, it is added to the pending deletions set.  Removes the key from the pending updates set.
 func (c *DesiredView[K, V]) Delete(k K) {
 	if logrus.GetLevel() >= logrus.DebugLevel {
-		c.logCtx.WithFields(logrus.Fields{"k": k}).Debug("Delete")
+		c.logCtx.WithFields(logrus.Fields{"k": k}).Debug("Delete (desired)")
 	}
-	delete(c.desiredUpdates, k)
+	_, presentInDesired := c.desiredUpdates[k]
+	if presentInDesired {
+		// Key was present.
+		delete(c.desiredUpdates, k)
+	}
 
 	// Check if we need to update the dataplane.
-	if currentVal, ok := c.inDataplaneAndDesired[k]; ok {
+	currentVal, presentInDPDesired := c.inDataplaneAndDesired[k]
+	if presentInDPDesired {
 		// Value is in dataplane, move it to pending deletions.
 		c.inDataplaneNotDesired[k] = currentVal
 		delete(c.inDataplaneAndDesired, k)
+	}
+
+	if presentInDesired || presentInDPDesired {
+		// Key was present, decrement the count.
+		c.desiredLen--
 	}
 }
 
@@ -193,6 +230,10 @@ func (c *DesiredView[K, V]) Iter(f func(k K, v V)) {
 		}
 		f(k, v)
 	}
+}
+
+func (c *DesiredView[K, V]) Len() int {
+	return c.desiredLen
 }
 
 type DataplaneView[K comparable, V any] DeltaTracker[K, V]
@@ -263,12 +304,8 @@ func (c *DataplaneView[K, V]) ReplaceAllIter(iter func(func(k K, v V)) error) er
 		// state broken because we've removed all the keys that we've seen from oldInDPDesired and
 		// oldInDPNotDesired, and updated c.desiredUpdates to match the new KV's from the iterator.
 		// Fix that up by applying the new keys to the old in-DP maps:
-		for k, v := range newInDPDesired {
-			oldInDPDesired[k] = v
-		}
-		for k, v := range newInDPNotDesired {
-			oldInDPNotDesired[k] = v
-		}
+		maps.Copy(oldInDPDesired, newInDPDesired)
+		maps.Copy(oldInDPNotDesired, newInDPNotDesired)
 		return fmt.Errorf("failed to iterate over dataplane state: %w", err)
 	}
 
@@ -285,9 +322,9 @@ func (c *DataplaneView[K, V]) ReplaceAllIter(iter func(func(k K, v V)) error) er
 	c.inDataplaneAndDesired = newInDPDesired
 	c.inDataplaneNotDesired = newInDPNotDesired
 	c.logCtx.WithFields(logrus.Fields{
-		"totalNumInDP":          len(c.inDataplaneAndDesired),
-		"desiredUpdates":        len(c.desiredUpdates),
-		"inDataplaneNotDesired": len(c.inDataplaneNotDesired),
+		"totalInDataplane":        len(c.inDataplaneAndDesired) + len(c.inDataplaneNotDesired),
+		"pendingCreatesOrUpdates": len(c.desiredUpdates),
+		"pendingDeletions":        len(c.inDataplaneNotDesired),
 	}).Debug("Updated dataplane state.")
 
 	return nil
@@ -380,6 +417,7 @@ func (c *PendingUpdatesView[K, V]) Get(k K) (V, bool) {
 // IterActionUpdateDataplane then the pending update is cleared, and, the KV is applied
 // to the dataplane cache (as if the function had called Dataplane().Set(k, v)).
 func (c *PendingUpdatesView[K, V]) Iter(f func(k K, v V) IterAction) {
+iterLoop:
 	for k, v := range c.desiredUpdates {
 		updateDataplane := f(k, v)
 		switch updateDataplane {
@@ -388,7 +426,74 @@ func (c *PendingUpdatesView[K, V]) Iter(f func(k K, v V) IterAction) {
 		case IterActionUpdateDataplane:
 			delete(c.desiredUpdates, k)
 			c.inDataplaneAndDesired[k] = v
+		case IterActionNoOpStopIteration:
+			// A bare break would only break the switch; label the loop so we
+			// actually stop iterating.
+			break iterLoop
 		}
+	}
+}
+
+// IterBatched is like Iter but calls applyFn with batches of KVs to apply to
+// the dataplane. Iteration continues after errors, skipping over the
+// failed items. The applyFn function should return the number of items
+// successfully applied and an error if there was a problem applying any.
+//
+// When IterBatched returns an error, it means that at least one item
+// failed to be applied, but it returns number of items successfully applied.
+func (c *PendingUpdatesView[K, V]) IterBatched(applyFn func(k []K, v []V) (int, error)) {
+	batchSize := 128
+
+	ks := make([]K, 0, batchSize)
+	vs := make([]V, 0, batchSize)
+	count := 0
+
+	for k, v := range c.desiredUpdates {
+		ks = append(ks, k)
+		vs = append(vs, v)
+		count++
+
+		if count == batchSize {
+			applied, err := applyFn(ks, vs)
+			for i := 0; i < applied; i++ {
+				delete(c.desiredUpdates, ks[i])
+				c.inDataplaneAndDesired[ks[i]] = vs[i]
+			}
+
+			if err != nil {
+				applied++ // skip over the item that erred
+			}
+
+			count = batchSize - applied
+			if count == 0 {
+				if applied == batchSize {
+					ks = ks[:0]
+					vs = vs[:0]
+				} else {
+					ks = make([]K, 0, batchSize)
+					vs = make([]V, 0, batchSize)
+				}
+			} else {
+				ks = ks[applied:]
+				vs = vs[applied:]
+			}
+		}
+	}
+
+	for count > 0 {
+		applied, err := applyFn(ks, vs)
+		for i := 0; i < applied; i++ {
+			delete(c.desiredUpdates, ks[i])
+			c.inDataplaneAndDesired[ks[i]] = vs[i]
+		}
+
+		if err != nil {
+			applied++ // skip over the item that erred
+		}
+
+		ks = ks[applied:]
+		vs = vs[applied:]
+		count -= applied
 	}
 }
 
@@ -415,6 +520,7 @@ func (c *PendingDeletionsView[K, V]) Get(k K) (V, bool) {
 // IterActionUpdateDataplane then the pending deletion is cleared, and, the KV is applied
 // to the dataplane cache (as if the function had called Dataplane().Delete(k)).
 func (c *PendingDeletionsView[K, V]) Iter(f func(k K) IterAction) {
+iterLoop:
 	for k := range c.inDataplaneNotDesired {
 		updateDataplane := f(k)
 		switch updateDataplane {
@@ -423,8 +529,58 @@ func (c *PendingDeletionsView[K, V]) Iter(f func(k K) IterAction) {
 		case IterActionUpdateDataplane:
 			delete(c.inDataplaneNotDesired, k)
 		case IterActionNoOpStopIteration:
-			break
+			// A bare break would only break the switch; label the loop so we
+			// actually stop iterating.
+			break iterLoop
 		}
+	}
+}
+
+func (c *PendingDeletionsView[K, V]) IterBatched(applyFn func(k []K) (int, error)) {
+	batchSize := 128
+
+	ks := make([]K, 0, batchSize)
+	count := 0
+
+	for k := range c.inDataplaneNotDesired {
+		ks = append(ks, k)
+		count++
+
+		if count == batchSize {
+			applied, err := applyFn(ks)
+			for i := 0; i < applied; i++ {
+				delete(c.inDataplaneNotDesired, ks[i])
+			}
+
+			if err != nil {
+				applied++ // skip over the item that erred
+			}
+
+			count -= applied
+			if count == 0 {
+				if applied == batchSize {
+					ks = ks[:0]
+				} else {
+					ks = make([]K, 0, batchSize)
+				}
+			} else {
+				ks = ks[applied:]
+			}
+		}
+	}
+
+	for count > 0 {
+		applied, err := applyFn(ks)
+		for i := 0; i < applied; i++ {
+			delete(c.inDataplaneNotDesired, ks[i])
+		}
+
+		if err != nil {
+			applied++ // skip over the item that erred
+		}
+
+		ks = ks[applied:]
+		count -= applied
 	}
 }
 

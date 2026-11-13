@@ -15,7 +15,6 @@
 package syncserver
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -24,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -33,26 +33,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/golang/snappy"
-
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 	"github.com/projectcalico/calico/libcalico-go/lib/writelogger"
-	"github.com/projectcalico/calico/typha/pkg/promutils"
-
-	"github.com/projectcalico/calico/typha/pkg/buildinfo"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 	"github.com/projectcalico/calico/typha/pkg/jitter"
+	"github.com/projectcalico/calico/typha/pkg/promutils"
 	"github.com/projectcalico/calico/typha/pkg/snapcache"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 	"github.com/projectcalico/calico/typha/pkg/tlsutils"
 )
 
 var (
-	ErrReadFailed               = errors.New("Failed to read from client")
-	ErrUnexpectedClientMsg      = errors.New("Unexpected message from client")
-	ErrUnsupportedClientFeature = errors.New("Unsupported client feature")
+	ErrReadFailed               = errors.New("failed to read from client")
+	ErrUnexpectedClientMsg      = errors.New("unexpected message from client")
+	ErrUnsupportedClientFeature = errors.New("unsupported client feature")
+	ErrNoSnapshotCache          = errors.New("no snapshot cache for negotiated compression algorithm")
+	errInboundMessageTooLarge   = errors.New("inbound message too large")
 )
 
 var (
@@ -74,12 +73,19 @@ var (
 	gaugeVecNumConnectionsStreaming = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "typha_connections_streaming",
 		Help: "Number of client connections that completed the handshake and are streaming data.",
-	}, []string{"syncer"})
+	}, []string{"syncer", "compression"})
 	counterVecGracePeriodUsed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "typha_connections_grace_used",
 		Help: "Total number of connections that made use of the grace period to catch up after sending the initial " +
 			"snapshot.",
 	}, []string{"syncer"})
+
+	// allCompressionMetricAlgorithms lists every algorithm value used for
+	// the "compression" metric label, including CompressionNone (reported
+	// as "none") for uncompressed connections.
+	allCompressionMetricAlgorithms = append(
+		[]syncproto.CompressionAlgorithm{syncproto.CompressionNone},
+		syncproto.AllCompressionAlgorithms[:]...)
 )
 
 func init() {
@@ -88,7 +94,11 @@ func init() {
 	prometheus.MustRegister(gaugeNumConnections)
 
 	prometheus.MustRegister(gaugeVecNumConnectionsStreaming)
-	promutils.PreCreateGaugePerSyncer(gaugeVecNumConnectionsStreaming)
+	for _, st := range syncproto.AllSyncerTypes {
+		for _, alg := range allCompressionMetricAlgorithms {
+			gaugeVecNumConnectionsStreaming.WithLabelValues(string(st), alg.MetricLabelValue())
+		}
+	}
 	prometheus.MustRegister(counterVecGracePeriodUsed)
 	promutils.PreCreateCounterPerSyncer(counterVecGracePeriodUsed)
 }
@@ -98,14 +108,24 @@ const (
 	defaultMaxMessageSize                 = 100
 	defaultMaxFallBehind                  = 300 * time.Second
 	defaultNewClientFallBehindGracePeriod = 300 * time.Second
-	defaultBatchingAgeThreshold           = 100 * time.Millisecond
-	defaultPingInterval                   = 10 * time.Second
-	defaultWriteTimeout                   = 120 * time.Second
-	defaultHandshakeTimeout               = 10 * time.Second
-	defaultDropInterval                   = 1 * time.Second
-	defaultShutdownTimeout                = 300 * time.Second
-	defaultMaxConns                       = math.MaxInt32
-	PortRandom                            = -1
+
+	// maxInboundMessageBytes is the maximum number of bytes we'll read from a
+	// client for a single gob message. Client messages (MsgClientHello, MsgPong,
+	// MsgACK, MsgDecoderRestart) are small; 1 MiB is far more than any legitimate
+	// message requires but safely caps memory usage against malformed or
+	// malicious input.
+	maxInboundMessageBytes      int64 = 1 << 20
+	defaultBatchingAgeThreshold       = 100 * time.Millisecond
+	defaultPingInterval               = 10 * time.Second
+	defaultWriteTimeout               = 120 * time.Second
+	defaultHandshakeTimeout           = 10 * time.Second
+	defaultDropInterval               = 1 * time.Second
+	defaultShutdownTimeout            = 300 * time.Second
+	defaultMaxConns                   = math.MaxInt32
+	// Prefer zstd: it compresses the sync data to roughly half the size
+	// that snappy manages.  Snappy is the fallback for older clients.
+	defaultCompressionAlgorithmOrder = "zstd,snappy"
+	PortRandom                       = -1
 )
 
 type Server struct {
@@ -132,7 +152,13 @@ type BreadcrumbProvider interface {
 	CurrentBreadcrumb() *snapcache.Breadcrumb
 }
 
+// Config holds the configuration for the Typha sync server.
+//
+// IMPORTANT: When adding new fields, also update LogFields() below so the
+// field appears in startup logs.  Do NOT add fields that contain credentials,
+// private keys, or other secrets — LogFields() is logged at Info level.
 type Config struct {
+	Host                           string
 	Port                           int
 	MaxMessageSize                 int
 	BinarySnapshotTimeout          time.Duration
@@ -155,9 +181,38 @@ type Config struct {
 	ClientURISAN                   string
 	WriteBufferSize                int
 
+	PreferredCompressionAlgorithmOrder []syncproto.CompressionAlgorithm
+
 	// DebugLogWrites tells the server to wrap each connection with a Writer that
 	// logs every write.  Intended only for use in tests!
 	DebugLogWrites bool
+}
+
+// LogFields returns a logrus.Fields map with operational config values
+// for logging.  TLS-related fields (KeyFile, CertFile, CAFile, ClientCN,
+// ClientURISAN) and internal fields (HealthAggregator, DebugLogWrites)
+// are omitted; a "tlsEnabled" boolean is included instead.
+func (c Config) LogFields() log.Fields {
+	return log.Fields{
+		"host":                               c.Host,
+		"port":                               c.Port,
+		"maxMessageSize":                     c.MaxMessageSize,
+		"binarySnapshotTimeout":              c.BinarySnapshotTimeout,
+		"maxFallBehind":                      c.MaxFallBehind,
+		"newClientFallBehindGracePeriod":     c.NewClientFallBehindGracePeriod,
+		"minBatchingAgeThreshold":            c.MinBatchingAgeThreshold,
+		"pingInterval":                       c.PingInterval,
+		"pongTimeout":                        c.PongTimeout,
+		"handshakeTimeout":                   c.HandshakeTimeout,
+		"writeTimeout":                       c.WriteTimeout,
+		"dropInterval":                       c.DropInterval,
+		"shutdownTimeout":                    c.ShutdownTimeout,
+		"shutdownMaxDropInterval":            c.ShutdownMaxDropInterval,
+		"maxConns":                           c.MaxConns,
+		"tlsEnabled":                         c.requiringTLS(),
+		"writeBufferSize":                    c.WriteBufferSize,
+		"preferredCompressionAlgorithmOrder": c.PreferredCompressionAlgorithmOrder,
+	}
 }
 
 const (
@@ -263,6 +318,36 @@ func (c *Config) ApplyDefaults() {
 		}).Info("Defaulting Port.")
 		c.Port = syncproto.DefaultPort
 	}
+	if len(c.PreferredCompressionAlgorithmOrder) == 0 {
+		log.WithFields(log.Fields{
+			"value":   c.PreferredCompressionAlgorithmOrder,
+			"default": defaultCompressionAlgorithmOrder,
+		}).Info("Defaulting PreferredCompressionAlgorithmOrder.")
+		c.PreferredCompressionAlgorithmOrder = c.parseCompressionOrder(defaultCompressionAlgorithmOrder)
+	}
+	// Drop unknown algorithms and duplicates so that the rest of the server
+	// can assume the order contains only valid, unique entries.
+	c.PreferredCompressionAlgorithmOrder = sanitizeCompressionOrder(c.PreferredCompressionAlgorithmOrder)
+}
+
+// sanitizeCompressionOrder returns the given compression algorithm order with
+// unknown algorithms and duplicates removed.
+func sanitizeCompressionOrder(order []syncproto.CompressionAlgorithm) []syncproto.CompressionAlgorithm {
+	var result []syncproto.CompressionAlgorithm
+	seen := map[syncproto.CompressionAlgorithm]bool{}
+	for _, alg := range order {
+		switch alg {
+		case syncproto.CompressionSnappy, syncproto.CompressionZstd:
+			if !seen[alg] {
+				seen[alg] = true
+				result = append(result, alg)
+			}
+		default:
+			log.WithField("algorithm", alg).Warn(
+				"Ignoring unknown compression algorithm in PreferredCompressionAlgorithmOrder.")
+		}
+	}
+	return result
 }
 
 func (c *Config) ListenPort() int {
@@ -277,25 +362,61 @@ func (c *Config) requiringTLS() bool {
 	return c.KeyFile+c.CertFile+c.CAFile+c.ClientCN+c.ClientURISAN != ""
 }
 
+func (c *Config) parseCompressionOrder(s string) []syncproto.CompressionAlgorithm {
+	var order []syncproto.CompressionAlgorithm
+	parts := strings.SplitSeq(s, ",")
+	for part := range parts {
+		alg := strings.ToLower(strings.TrimSpace(part))
+		switch alg {
+		case "snappy":
+			order = append(order, syncproto.CompressionSnappy)
+		case "zstd":
+			order = append(order, syncproto.CompressionZstd)
+		default:
+			log.WithField("algorithm", alg).Warn("ignoring unknown compression algorithm")
+		}
+	}
+	return order
+}
+
 func New(caches map[syncproto.SyncerType]BreadcrumbProvider, config Config) *Server {
 	config.ApplyDefaults()
-	log.WithField("config", config).Info("Creating server")
+	log.WithFields(config.LogFields()).Info("Creating server")
 	s := &Server{
 		config:               config,
 		caches:               caches,
 		binSnapCaches:        map[syncproto.CompressionAlgorithm]map[syncproto.SyncerType]snapshotCache{},
 		maxConnsC:            make(chan int),
 		shutdownC:            make(chan struct{}),
-		nextConnID:           1,
+		nextConnID:           rand.Uint64()<<32 | 1,
 		connIDToConn:         map[uint64]*connection{},
 		listeningC:           make(chan struct{}),
 		perSyncerConnMetrics: map[syncproto.SyncerType]perSyncerConnMetrics{},
 	}
 
-	s.binSnapCaches[syncproto.CompressionSnappy] = map[syncproto.SyncerType]snapshotCache{}
+	// Only create snapshot caches for algorithms that are in the server's
+	// preferred compression order, avoiding unnecessary allocations for
+	// unused algorithms.  ApplyDefaults has already removed unknown
+	// algorithms and duplicates from the order.
+	for _, alg := range config.PreferredCompressionAlgorithmOrder {
+		s.binSnapCaches[alg] = map[syncproto.SyncerType]snapshotCache{}
+	}
 	for st, cache := range caches {
 		s.perSyncerConnMetrics[st] = makePerSyncerConnMetrics(st)
-		s.binSnapCaches[syncproto.CompressionSnappy][st] = NewSnappySnapCache(string(st), cache, config.BinarySnapshotTimeout, config.WriteTimeout)
+		for _, alg := range config.PreferredCompressionAlgorithmOrder {
+			switch alg {
+			case syncproto.CompressionSnappy:
+				s.binSnapCaches[alg][st] = NewSnappySnapCache(string(st), cache, config.BinarySnapshotTimeout, config.WriteTimeout)
+			case syncproto.CompressionZstd:
+				s.binSnapCaches[alg][st] = NewZstdSnapCache(string(st), cache, config.BinarySnapshotTimeout, config.WriteTimeout)
+			default:
+				// Negotiation picks from the same order, so a missing arm
+				// here would put every client that prefers the new
+				// algorithm into a connect/tear-down loop.  Fail at startup
+				// instead.
+				log.WithField("algorithm", alg).Panic("No snapshot cache implementation for compression algorithm.")
+			}
+		}
 	}
 
 	// Register that we will report liveness.
@@ -338,6 +459,8 @@ func (s *Server) serve(cxt context.Context) {
 		l   net.Listener
 		err error
 	)
+
+	laddr := net.JoinHostPort(s.config.Host, fmt.Sprint(s.config.ListenPort()))
 	if s.config.requiringTLS() {
 		pwd, _ := os.Getwd()
 		logCxt.WithField("pwd", pwd).Info("Opening TLS listen socket")
@@ -348,7 +471,11 @@ func (s *Server) serve(cxt context.Context) {
 				"keyFile":  s.config.KeyFile,
 			}).WithError(tlsErr).Panic("Failed to load certificate and key")
 		}
-		tlsConfig := calicotls.NewTLSConfig()
+		var tlsConfig *tls.Config
+		tlsConfig, err = calicotls.NewTLSConfig()
+		if err != nil {
+			logCxt.WithError(err).Panic("Failed to create TLS Config")
+		}
 		tlsConfig.Certificates = []tls.Certificate{cert}
 
 		// Arrange for server to verify the clients' certificates.
@@ -369,20 +496,17 @@ func (s *Server) serve(cxt context.Context) {
 			s.config.ClientCN,
 			s.config.ClientURISAN,
 		)
-
-		laddr := fmt.Sprintf("0.0.0.0:%v", s.config.ListenPort())
 		l, err = tls.Listen("tcp", laddr, tlsConfig)
 	} else {
 		logCxt.Info("Opening listen socket")
-		l, err = net.ListenTCP("tcp", &net.TCPAddr{Port: s.config.ListenPort()})
+		l, err = net.Listen("tcp", laddr)
 	}
 	if err != nil {
 		logCxt.WithError(err).Panic("Failed to open listen socket")
 	}
 	logCxt.Info("Opened listen socket")
 
-	s.Finished.Add(1)
-	go func() {
+	s.Finished.Go(func() {
 		select {
 		case <-cxt.Done():
 			log.Info("Context finished, closing listen socket.")
@@ -393,8 +517,7 @@ func (s *Server) serve(cxt context.Context) {
 		if err != nil {
 			log.WithError(err).Warn("Ignoring error from socket Close during shut-down.")
 		}
-		s.Finished.Done()
-	}()
+	})
 
 	chosenPort := l.Addr().(*net.TCPAddr).Port
 
@@ -454,9 +577,7 @@ func (s *Server) serve(cxt context.Context) {
 				"connID": connID,
 			}),
 
-			encoder:     gob.NewEncoder(connW),
-			flushWriter: func() error { return nil },
-			readC:       make(chan interface{}),
+			readC: make(chan any),
 
 			allMetrics: s.perSyncerConnMetrics,
 		}
@@ -682,8 +803,11 @@ type connection struct {
 	writeLock            sync.Mutex
 	currentWriteDeadline time.Time
 	encoder              *gob.Encoder
-	flushWriter          func() error
-	readC                chan interface{}
+	// writer is the (possibly compressing) writer that the encoder writes
+	// to; it wraps connW.  Replaced together with the encoder at each
+	// encoding restart.
+	writer syncproto.Compressor
+	readC  chan any
 
 	logCxt                       *log.Entry
 	chosenCompression            syncproto.CompressionAlgorithm
@@ -693,6 +817,12 @@ type connection struct {
 	// of them to the unnamed field after the handshake.
 	allMetrics map[syncproto.SyncerType]perSyncerConnMetrics
 	perSyncerConnMetrics
+
+	// Metrics that carry the "compression" label as well as the "syncer"
+	// label; bound by bindCompressionMetrics once the handshake has chosen
+	// the compression algorithm.
+	summarySnapshotSendTime      prometheus.Summary
+	gaugeNumConnectionsStreaming prometheus.Gauge
 }
 
 type snapshotCache interface {
@@ -713,6 +843,12 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 		}
 		// Wait for the background threads to shut down.
 		h.shutDownWG.Wait()
+		// Now that no other goroutine can be writing, close the writer to
+		// release the compression writer's resources (if any).  The
+		// connection is already closed, so nothing reaches the client.
+		if h.writer != nil {
+			_ = h.writer.Close()
+		}
 		gaugeNumConnections.Dec()
 		h.logCxt.Info("Client connection shut down.")
 		finishedWG.Done()
@@ -725,6 +861,13 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 	h.shutDownWG.Add(1)
 	go h.readFromClient(h.logCxt.WithField("thread", "read"))
 
+	// The handshake always starts uncompressed; if it picks a compression
+	// algorithm, we restart the encoding below.
+	if err = h.restartEncoder(); err != nil {
+		log.WithError(err).Error("Failed to create initial encoder")
+		return
+	}
+
 	// Now do the (synchronous) handshake.
 	if err = h.doHandshake(); err != nil {
 		return // Error already logged.
@@ -736,17 +879,25 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 	var binSnapCache snapshotCache
 	if h.clientSupportsDecoderRestart {
 		binSnapCache = h.allSnapshotters[h.chosenCompression][h.syncerType]
-		var reasonsToRestart []string
-		if h.chosenCompression != "" {
-			reasonsToRestart = append(reasonsToRestart, fmt.Sprintf("enable compression: %v", h.chosenCompression))
+		if h.chosenCompression != syncproto.CompressionNone && binSnapCache == nil {
+			// Shouldn't happen: the server creates a snapshot cache for
+			// every algorithm it can choose, for every syncer type that
+			// passes the handshake.
+			h.logCxt.WithField("algorithm", h.chosenCompression).Error(
+				"No snapshot cache for negotiated compression algorithm.")
+			err = ErrNoSnapshotCache
+			return
 		}
 		if binSnapCache != nil {
-			reasonsToRestart = append(reasonsToRestart, "send binary snapshot")
-		}
-		if len(reasonsToRestart) > 0 {
-			// We have a reason to restart the encoding...
-			h.logCxt.WithField("reasons", reasonsToRestart).Info("Restarting encoding.")
-			err = h.restartEncodingIfSupported(strings.Join(reasonsToRestart, ";"))
+			// A snapshot cache only exists for a negotiated compression
+			// algorithm, so both reasons always apply together.  Send
+			// MsgDecoderRestart and wait for ACK, but don't create the new
+			// encoder yet -- the binary snapshot that follows is sent as raw
+			// bytes directly to the connection, bypassing the encoder.  The
+			// new encoder is created after the snapshot.
+			reason := fmt.Sprintf("enable compression: %v; send binary snapshot", h.chosenCompression)
+			h.logCxt.WithField("reason", reason).Info("Restarting encoding.")
+			err = h.sendDecoderRestartAndWaitForAck(reason)
 			if err != nil {
 				log.WithError(err).Info("Failed to restart encoding after handshake, tearing down connection.")
 				return
@@ -764,8 +915,14 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 			log.WithError(err).Info("Failed to send snapshot to client, tearing down connection.")
 			return
 		}
+		// SendSnapshot manages the connection's write deadline itself and
+		// leaves it unset; zero our cached deadline so the next sendMsg arms
+		// a fresh one rather than trusting the stale value.
+		h.currentWriteDeadline = time.Time{}
 
-		// The canned snapshot ends with a MsgDecoderRestart, so we just need to wait for the ACK.
+		// The canned snapshot ends with a MsgDecoderRestart, so we just need
+		// to wait for the ACK and then create the compressed encoder for
+		// subsequent delta updates.
 		err = h.waitForAckAndRestartEncoder()
 		if err != nil {
 			log.WithError(err).Info("Failed to restart encoding after snapshot, tearing down connection.")
@@ -805,7 +962,6 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 	// Use this goroutine to wait for client messages and do the ping/pong liveness check.
 	h.logCxt.Info("Waiting for messages from client")
 	for {
-
 		select {
 		case msg := <-h.readC:
 			if msg == nil {
@@ -819,7 +975,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 				h.summaryPingLatency.Observe(time.Since(msg.PingTimestamp).Seconds())
 			default:
 				h.logCxt.WithField("msg", msg).Error("Unknown message from client")
-				return errors.New("Unknown message type")
+				return errors.New("unknown message type")
 			}
 		case <-pongTicker.C:
 			since := time.Since(lastPongReceived)
@@ -828,7 +984,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 					"pongTimeout":       h.config.PongTimeout,
 					"timeSinceLastPong": since,
 				}).Info("Too long since last pong from client, disconnecting")
-				return errors.New("No pong received from client")
+				return errors.New("no pong received from client")
 			}
 		case <-h.cxt.Done():
 			h.logCxt.Info("Asked to stop by Context.")
@@ -846,8 +1002,10 @@ func (h *connection) readFromClient(logCxt *log.Entry) {
 		h.shutDownWG.Done()
 		logCxt.Info("Read goroutine finished")
 	}()
-	r := gob.NewDecoder(h.conn)
+	lr := &limitedReader{r: h.conn, limit: maxInboundMessageBytes}
+	r := gob.NewDecoder(lr)
 	for {
+		lr.reset()
 		var envelope syncproto.Envelope
 		err := r.Decode(&envelope)
 		if err != nil {
@@ -871,8 +1029,35 @@ func (h *connection) readFromClient(logCxt *log.Entry) {
 	}
 }
 
+// limitedReader wraps an io.Reader and tracks the total bytes read since the
+// last call to reset. If the cumulative bytes exceed the limit, Read returns
+// an error. Call reset between gob Decode calls so the limit applies
+// per-message rather than over the whole connection lifetime.
+type limitedReader struct {
+	r     io.Reader
+	limit int64
+	n     int64
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	avail := l.limit - l.n
+	if avail <= 0 {
+		return 0, fmt.Errorf("%w (read %d bytes, limit %d)", errInboundMessageTooLarge, l.n, l.limit)
+	}
+	if int64(len(p)) > avail {
+		p = p[:avail]
+	}
+	n, err := l.r.Read(p)
+	l.n += int64(n)
+	return n, err
+}
+
+func (l *limitedReader) reset() {
+	l.n = 0
+}
+
 // waitForMessage blocks, waiting for a message on the h.readC channel.  It imposes a timeout.
-func (h *connection) waitForMessage(logCxt *log.Entry, timeout time.Duration) (interface{}, error) {
+func (h *connection) waitForMessage(logCxt *log.Entry, timeout time.Duration) (any, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
@@ -923,21 +1108,33 @@ func (h *connection) doHandshake() error {
 	}
 	h.cache = desiredSyncerCache
 
+	clientSupportedCompressionAlgorithms := make(map[syncproto.CompressionAlgorithm]bool, len(hello.SupportedCompressionAlgorithms))
 	for _, alg := range hello.SupportedCompressionAlgorithms {
-		switch alg {
-		case syncproto.CompressionSnappy:
-			h.chosenCompression = syncproto.CompressionSnappy
+		clientSupportedCompressionAlgorithms[alg] = true
+	}
+	for _, alg := range h.config.PreferredCompressionAlgorithmOrder {
+		if clientSupportedCompressionAlgorithms[alg] {
+			h.chosenCompression = alg
+			break
 		}
 	}
 	h.clientSupportsDecoderRestart = hello.SupportsDecoderRestart
-	if h.chosenCompression != "" && !hello.SupportsDecoderRestart {
-		log.WithError(err).Warning("Client signalled compression but no support for decoder restart")
+	if h.chosenCompression != syncproto.CompressionNone && !hello.SupportsDecoderRestart {
+		h.logCxt.Warning("Client signalled compression but no support for decoder restart")
 		h.chosenCompression = ""
+	}
+	h.bindCompressionMetrics()
+
+	if !hello.SupportsModernPolicyKeys {
+		// The client is too old and we cannot support it. Reject the connection and wait for the
+		// client to be upgraded.
+		h.logCxt.Info("Client does not support modern policy keys, disconnecting.")
+		return ErrUnsupportedClientFeature
 	}
 
 	// Respond to client's hello.
 	err = h.sendMsg(syncproto.MsgServerHello{
-		Version: buildinfo.GitVersion,
+		Version: buildinfo.Version,
 		// Echo back the SyncerType so that up-level clients know that we understood their request.  Down-level
 		// clients will ignore.
 		SyncerType:                  syncerType,
@@ -951,31 +1148,42 @@ func (h *connection) doHandshake() error {
 	return nil
 }
 
-func (h *connection) restartEncodingIfSupported(message string) error {
-	if !h.clientSupportsDecoderRestart {
-		log.Debug("Can't restart decoder, client doesn't support it.")
-		return nil
-	}
+// bindCompressionMetrics binds the metrics that carry the "compression"
+// label; the handshake must have chosen the compression algorithm already.
+func (h *connection) bindCompressionMetrics() {
+	h.gaugeNumConnectionsStreaming = gaugeVecNumConnectionsStreaming.WithLabelValues(
+		string(h.syncerType), h.chosenCompression.MetricLabelValue())
+	h.summarySnapshotSendTime = makeSnapshotSendTimeSummary(h.syncerType, h.chosenCompression)
+}
 
-	// Signal for the client to restart its decoder (possibly) with compression enabled.
+// sendDecoderRestartAndWaitForAck signals the client to restart its decoder
+// (possibly with compression enabled) and waits for the ACK.  The restart
+// message is the last message in the old encoding: we write it, then close
+// the old writer, which puts the whole old stream on the wire and ends it
+// exactly there.  The client relies on that to discard its decompressor at
+// the boundary without losing bytes.  The caller starts the new encoding
+// after this returns: either a cached binary snapshot written directly to
+// the connection, or a new encoder from restartEncoder.
+func (h *connection) sendDecoderRestartAndWaitForAck(message string) error {
+	// Nothing else writes during this phase of the protocol, and we write
+	// nothing more until the ACK arrives.
 	err := h.sendMsg(syncproto.MsgDecoderRestart{
 		Message:              message,
 		CompressionAlgorithm: h.chosenCompression,
 	})
+	if err == nil {
+		err = h.writer.Close()
+	}
 	if err != nil {
 		log.WithError(err).Warning("Failed to send DecoderRestart to client")
 		return err
 	}
 
-	err = h.waitForAckAndRestartEncoder()
-	return err
+	return h.waitForAck()
 }
 
-func (h *connection) waitForAckAndRestartEncoder() error {
-	// Wait until the client ACKs.  This avoids sending compressed data that
-	// might get misinterpreted by the gob decoder.  We use the pong timeout
-	// here because it has a very similar purpose; we sent something, and
-	// we're waiting for the response.
+// waitForAck waits for a MsgACK from the client.
+func (h *connection) waitForAck() error {
 	msg, err := h.waitForMessage(h.logCxt, h.config.PongTimeout)
 	if err != nil {
 		h.logCxt.WithError(err).Warn("Failed to read client ACK.")
@@ -987,29 +1195,34 @@ func (h *connection) waitForAckAndRestartEncoder() error {
 		return ErrUnexpectedClientMsg
 	}
 	h.logCxt.WithField("msg", ack).Info("Received ACK message from client.")
-
-	// Upgrade to compressed connection if required.
-	bw := bufio.NewWriter(h.connW)
-	switch h.chosenCompression {
-	case syncproto.CompressionSnappy:
-		w := snappy.NewBufferedWriter(bw)
-		h.encoder = gob.NewEncoder(w) // Need a new Encoder, there's no way to change out the Writer.
-		h.flushWriter = func() error {
-			err := w.Flush()
-			if err != nil {
-				return err
-			}
-			return bw.Flush()
-		}
-	default:
-		h.encoder = gob.NewEncoder(bw) // Need a new Encoder, there's no way to change out the Writer.
-		h.flushWriter = bw.Flush
-	}
 	return nil
 }
 
-// sendMsg sends a message to the client.  It may be called from multiple goroutines.
-func (h *connection) sendMsg(msg interface{}) error {
+func (h *connection) waitForAckAndRestartEncoder() error {
+	if err := h.waitForAck(); err != nil {
+		return err
+	}
+	return h.restartEncoder()
+}
+
+// restartEncoder creates a fresh encoder for the connection, writing through
+// a compression writer chosen during the handshake (a pass-through before
+// the handshake or if no compression was negotiated).  Each encoding is a
+// self-contained stream: the previous one, if any, was closed by
+// sendDecoderRestartAndWaitForAck.
+func (h *connection) restartEncoder() error {
+	w, err := syncproto.NewStreamCompressor(h.chosenCompression, h.connW)
+	if err != nil {
+		return err
+	}
+	h.writer = w
+	h.encoder = gob.NewEncoder(w) // Need a new Encoder, there's no way to change out the Writer.
+	return nil
+}
+
+// sendMsg sends a message to the client and flushes it through to the
+// connection.  It may be called from multiple goroutines.
+func (h *connection) sendMsg(msg any) error {
 	if h.cxt.Err() != nil {
 		// Optimisation, don't bother to send if we're being torn down.
 		return h.cxt.Err()
@@ -1035,7 +1248,7 @@ func (h *connection) sendMsg(msg interface{}) error {
 		h.logCxt.WithError(err).Info("Failed to write to client")
 		return err
 	}
-	if err := h.flushWriter(); err != nil {
+	if err := h.writer.Flush(); err != nil {
 		h.logCxt.WithError(err).Info("Failed to flush write to client")
 		return err
 	}
@@ -1312,16 +1525,15 @@ func (h *connection) sendPingsToClient(logCxt *log.Entry) {
 }
 
 // perSyncerConnMetrics contains a set of Prometheus metrics that each connection needs to update.  There is one
-// set per syncer type.
+// set per syncer type.  Metrics that also carry the "compression" label are
+// bound per connection after the handshake instead (see bindCompressionMetrics).
 type perSyncerConnMetrics struct {
-	counterGracePeriodUsed       prometheus.Counter
-	summarySnapshotSendTime      prometheus.Summary
-	summaryClientLatency         prometheus.Summary
-	summaryWriteLatency          prometheus.Summary
-	summaryNextCatchupLatency    prometheus.Summary
-	summaryPingLatency           prometheus.Summary
-	summaryNumKVsPerMsg          prometheus.Summary
-	gaugeNumConnectionsStreaming prometheus.Gauge
+	counterGracePeriodUsed    prometheus.Counter
+	summaryClientLatency      prometheus.Summary
+	summaryWriteLatency       prometheus.Summary
+	summaryNextCatchupLatency prometheus.Summary
+	summaryPingLatency        prometheus.Summary
+	summaryNumKVsPerMsg       prometheus.Summary
 }
 
 func makePerSyncerConnMetrics(syncerType syncproto.SyncerType) perSyncerConnMetrics {
@@ -1329,11 +1541,11 @@ func makePerSyncerConnMetrics(syncerType syncproto.SyncerType) perSyncerConnMetr
 	syncerLabels := map[string]string{
 		"syncer": string(syncerType),
 	}
-	c.summarySnapshotSendTime = promutils.GetOrRegister(cprometheus.NewSummary(prometheus.SummaryOpts{
-		Name:        "typha_client_snapshot_send_secs",
-		Help:        "How long it took to send the initial snapshot to each client.",
-		ConstLabels: syncerLabels,
-	}))
+	// Pre-create the per-compression metrics for this syncer so that they
+	// exist (with zero values) before the first client connects.
+	for _, alg := range allCompressionMetricAlgorithms {
+		makeSnapshotSendTimeSummary(syncerType, alg)
+	}
 	c.summaryClientLatency = promutils.GetOrRegister(cprometheus.NewSummary(prometheus.SummaryOpts{
 		Name: "typha_client_latency_secs",
 		Help: "Per-client latency.  I.e. how far behind the current state is each client.",
@@ -1363,6 +1575,18 @@ func makePerSyncerConnMetrics(syncerType syncproto.SyncerType) perSyncerConnMetr
 		ConstLabels: syncerLabels,
 	}))
 	c.counterGracePeriodUsed = counterVecGracePeriodUsed.WithLabelValues(string(syncerType))
-	c.gaugeNumConnectionsStreaming = gaugeVecNumConnectionsStreaming.WithLabelValues(string(syncerType))
 	return c
+}
+
+// makeSnapshotSendTimeSummary returns the snapshot-send-time summary for the
+// given syncer and compression algorithm, registering it on first use.
+func makeSnapshotSendTimeSummary(syncerType syncproto.SyncerType, alg syncproto.CompressionAlgorithm) prometheus.Summary {
+	return promutils.GetOrRegister(cprometheus.NewSummary(prometheus.SummaryOpts{
+		Name: "typha_client_snapshot_send_secs",
+		Help: "How long it took to send the initial snapshot to each client.",
+		ConstLabels: map[string]string{
+			"syncer":      string(syncerType),
+			"compression": alg.MetricLabelValue(),
+		},
+	}))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,16 +19,15 @@ import (
 	"fmt"
 	"reflect"
 
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 )
 
 func init() {
-
 	asNumberType := reflect.TypeOf(numorstring.ASNumber(0))
 	protocolType := reflect.TypeOf(numorstring.Protocol{})
+	dscpType := reflect.TypeOf(numorstring.DSCP{})
 	portType := reflect.TypeOf(numorstring.Port{})
 
 	// Perform tests of JSON unmarshaling of the various field types.
@@ -72,12 +71,13 @@ func init() {
 		Entry("should accept 65535 port as int", "65535", portType, numorstring.SinglePort(65535)),
 		Entry("should accept 0:65535 port range as string", "\"0:65535\"", portType, portFromRange(0, 65535)),
 		Entry("should accept 1:10 port range as string", "\"1:10\"", portType, portFromRange(1, 10)),
-		Entry("should accept foo-bar as named port", "\"foo-bar\"", portType, numorstring.NamedPort("foo-bar")),
+		Entry("should accept foo-bar as named port", "\"foo-bar\"", portType, numorstring.Port{PortName: "foo-bar"}),
 		Entry("should reject -1 port as int", "-1", portType, nil),
 		Entry("should reject 65536 port as int", "65536", portType, nil),
 		Entry("should reject 0:65536 port range as string", "\"0:65536\"", portType, nil),
 		Entry("should reject -1:65535 port range as string", "\"-1:65535\"", portType, nil),
-		Entry("should reject 10:1 port range as string", "\"10:1\"", portType, nil),
+		// A stored descending range must decode so it can't fail a whole list; the validator rejects it.
+		Entry("should decode 10:1 port range as string", "\"10:1\"", portType, numorstring.Port{MinPort: 10, MaxPort: 1}),
 		Entry("should reject 1:2:3 port range as string", "\"1:2:3\"", portType, nil),
 		Entry("should reject bad named port string", "\"*\"", portType, nil),
 		Entry("should reject bad port string", "\"1:2", portType, nil),
@@ -91,6 +91,12 @@ func init() {
 		Entry("should accept 0 protocol as string", "\"255\"", protocolType, numorstring.ProtocolFromInt(255)),
 		Entry("should accept 256 protocol as string", "\"256\"", protocolType, numorstring.ProtocolFromString("256")),
 		Entry("should reject bad protocol string", "\"25", protocolType, nil),
+
+		// DSCP tests.
+		Entry("should accept 0 DSCP as int", "0", dscpType, numorstring.DSCPFromInt(0)),
+		Entry("should accept 63 DSCP as int", "63", dscpType, numorstring.DSCPFromInt(63)),
+		Entry("should accept DF DSCP as string", "\"DF\"", dscpType, numorstring.DSCPFromString(numorstring.DF)),
+		Entry("should reject bad DSCP string", "\"25", dscpType, nil),
 	)
 
 	// Perform tests of JSON marshaling of the various field types.
@@ -117,11 +123,16 @@ func init() {
 		Entry("should marshal port of 10", portFromString("10"), "10"),
 		Entry("should marshal port range of 10:20", portFromRange(10, 20), "\"10:20\""),
 		Entry("should marshal port range of 20:30", portFromRange(20, 30), "\"20:30\""),
-		Entry("should marshal named port", numorstring.NamedPort("foobar"), `"foobar"`),
+		Entry("should marshal named port", numorstring.Port{PortName: "foobar"}, `"foobar"`),
 
 		// Protocol tests.
 		Entry("should marshal protocol of 0", numorstring.ProtocolFromInt(0), "0"),
 		Entry("should marshal protocol of udp", numorstring.ProtocolFromString("UDP"), "\"UDP\""),
+
+		// DSCP tests.
+		Entry("should marshal dscp of 0", numorstring.DSCPFromInt(0), "0"),
+		Entry("should marshal dscp of 120", numorstring.DSCPFromInt(120), "120"),
+		Entry("should marshal dscp of DF", numorstring.DSCPFromString("DF"), "\"DF\""),
 	)
 
 	// Perform tests of Stringer interface various field types.
@@ -142,6 +153,10 @@ func init() {
 		// Protocol tests.
 		Entry("should stringify protocol of 0", numorstring.ProtocolFromInt(0), "0"),
 		Entry("should stringify protocol of udp", numorstring.ProtocolFromString("UDP"), "UDP"),
+
+		// DSCP tests.
+		Entry("should stringify DSCP of 0", numorstring.DSCPFromInt(0), "0"),
+		Entry("should stringify DSCP of AF22", numorstring.DSCPFromString("AF22"), "AF22"),
 	)
 
 	// Perform tests of Protocols supporting ports.
@@ -191,6 +206,107 @@ func init() {
 		// Protocol tests.
 		Entry("protocol udp -> UDP", numorstring.ProtocolFromInt(2), numorstring.ProtocolFromInt(2)),
 		Entry("protocol tcp -> TCP", numorstring.ProtocolFromString("TCP"), numorstring.ProtocolFromStringV1("TCP")),
+	)
+
+	DescribeTable("NumOrString named ports",
+		func(input string, expected numorstring.Port, valid bool) {
+			p, err := numorstring.NamedPort(input)
+			if valid {
+				Expect(err).To(BeNil())
+			} else {
+				Expect(err).ToNot(BeNil())
+			}
+			Expect(p).To(Equal(expected), "expected parsed named ports to match")
+		},
+		// Named port tests.
+		Entry("named port http-port", "http-port", numorstring.Port{PortName: "http-port"}, true),
+		Entry("named port 8080", "8080", numorstring.Port{PortName: "8080"}, true),
+		Entry("named port with space", "http port", numorstring.Port{}, false),
+		Entry("named port with invalid chars", "http%port", numorstring.Port{}, false),
+	)
+
+	It("PortFromString should reject a descending port range", func() {
+		_, err := numorstring.PortFromString("9000:8000")
+		Expect(err).To(MatchError(ContainSubstring("greater than maximum port number")))
+	})
+
+	It("should decode a list in which one item has a descending port range", func() {
+		var items []struct {
+			Ports []numorstring.Port `json:"ports"`
+		}
+		err := json.Unmarshal([]byte(`[{"ports":["8000:9000"]},{"ports":["9000:8000"]}]`), &items)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(items).To(HaveLen(2))
+		Expect(items[0].Ports).To(Equal([]numorstring.Port{portFromRange(8000, 9000)}))
+		Expect(items[1].Ports).To(Equal([]numorstring.Port{{MinPort: 9000, MaxPort: 8000}}))
+	})
+
+	// Perform tests of DSCP FromString method.
+	DescribeTable("NumOrStringDSCP FromString is not case-sensitive",
+		func(input, expected string) {
+			Expect(numorstring.DSCPFromString(input).StrVal).To(Equal(expected),
+				"expected parsed dscp to match")
+		},
+		Entry("dscp cs6 -> CS6", "cs6", "CS6"),
+		Entry("dscp Af11 -> AF11", "Af11", "AF11"),
+		Entry("dscp ef -> EF", "ef", "EF"),
+		Entry("unknown dscp xxxXXX", "xxxXXX", "xxxXXX"),
+	)
+
+	// Perform tests for DSCP ToUint8 method for straing values.
+	DescribeTable("NumOrStringDSCP ToUint8 returns valid values",
+		func(input string, expected int) {
+			dscp := numorstring.DSCPFromString(input)
+			Expect(dscp.ToUint8()).To(Equal(uint8(expected)),
+				"expect parsed dscp to match")
+		},
+		Entry("dscp BE", "BE", 0),
+		Entry("dscp AF33", "AF33", 30),
+		Entry("dscp CS5", "CS5", 40),
+	)
+
+	// Perform tests for DSCP validation for string values.
+	DescribeTable("NumOrStringDSCP Validate method validates string inputs correctly",
+		func(input string, valid bool) {
+			dscp := numorstring.DSCPFromString(input)
+			err := dscp.Validate()
+			if valid {
+				Expect(err).To(BeNil(), "expect validate to not return error")
+			} else {
+				Expect(err).ToNot(BeNil(), "expect validate to return error")
+			}
+		},
+		Entry("should accept EF", "EF", true),
+		Entry("should accept AF11", "AF11", true),
+		Entry("should accept CS2", "CS2", true),
+		Entry("should accept 0", "0", true),
+		Entry("should accept 40", "40", true),
+		Entry("should accept 63", "63", true),
+		Entry("should reject 64", "64", false),
+		Entry("should reject 120", "120", false),
+		Entry("should reject -1", "-1", false),
+		Entry("should reject CS9", "CS9", false),
+		Entry("should reject xxx", "xxx", false),
+		Entry("should reject empty string", "", false),
+		Entry("should reject empty string", " ", false),
+	)
+
+	// Perform tests for DSCP validation for numerical values.
+	DescribeTable("NumOrStringDSCP Validate method validates numerical inputs correctly",
+		func(input int, valid bool) {
+			dscp := numorstring.DSCPFromInt(uint8(input))
+			err := dscp.Validate()
+			if valid {
+				Expect(err).To(BeNil(), "expect validate to not return error")
+			} else {
+				Expect(err).ToNot(BeNil(), "expect validate to return error")
+			}
+		},
+		Entry("should accept 0", 0, true),
+		Entry("should accept 40", 40, true),
+		Entry("should accept 63", 63, true),
+		Entry("should reject 64", 64, false),
+		Entry("should reject 120", 120, false),
 	)
 }
 

@@ -17,10 +17,10 @@ package updateprocessors
 import (
 	"errors"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -64,7 +64,7 @@ func convertGlobalNetworkSetV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
 	}
 
 	v1value := &model.NetworkSet{
-		Labels: v3res.GetLabels(),
+		Labels: uniquelabels.Make(v3res.GetLabels()),
 		Nets:   addrs,
 	}
 

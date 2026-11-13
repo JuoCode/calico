@@ -15,15 +15,18 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"slices"
 	"sort"
-
-	"github.com/projectcalico/calico/felix/bpf/ipsets"
-	"github.com/projectcalico/calico/felix/bpf/maps"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/projectcalico/calico/felix/bpf/ipsets"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 )
 
 func init() {
@@ -59,6 +62,7 @@ func dumpIPSets() error {
 	if err := ipsetMap.Open(); err != nil {
 		return errors.WithMessage(err, "failed to open map")
 	}
+	defer ipsetMap.Close()
 
 	membersBySet := map[uint64][]string{}
 	err := ipsetMap.Iter(func(k, v []byte) maps.IteratorAction {
@@ -81,9 +85,25 @@ func dumpIPSets() error {
 		setIDs = append(setIDs, k)
 		sort.Strings(v)
 	}
-	sort.Slice(setIDs, func(i, j int) bool {
-		return setIDs[i] < setIDs[j]
-	})
+	slices.Sort(setIDs)
+
+	if *jsonOutput {
+		type ipsetJSON struct {
+			SetID   string   `json:"set_id"`
+			Members []string `json:"members"`
+		}
+		var sets []ipsetJSON
+		for _, setID := range setIDs {
+			sets = append(sets, ipsetJSON{
+				SetID:   fmt.Sprintf("%#x", setID),
+				Members: membersBySet[setID],
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(sets)
+	}
+
 	for _, setID := range setIDs {
 		fmt.Printf("IP set %#x\n", setID)
 		for _, member := range membersBySet[setID] {

@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,22 @@ package kubecontrollersconfig
 import (
 	"context"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
-	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/server"
+	"github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/util"
 )
 
 // rest implements a RESTStorage for API services against etcd
 type REST struct {
-	*genericregistry.Store
+	*util.Store
+	shortNames []string
 }
 
 // EmptyObject returns an empty instance
@@ -47,7 +47,8 @@ func NewList() runtime.Object {
 
 // StatusREST implements the REST endpoint for changing the status of a deployment
 type StatusREST struct {
-	store *genericregistry.Store
+	store      *registry.Store
+	shortNames []string
 }
 
 func (r *StatusREST) New() runtime.Object {
@@ -70,26 +71,15 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 }
 
 // NewREST returns a RESTStorage object that will work against API services.
-func NewREST(scheme *runtime.Scheme, opts server.Options) (*REST, *StatusREST, error) {
+func NewREST(scheme *runtime.Scheme, opts server.Options, statusOpts server.Options) (*REST, *StatusREST, error) {
 	strategy := NewStrategy(scheme)
 
 	prefix := "/" + opts.ResourcePrefix()
-	// We adapt the store's keyFunc so that we can use it with the StorageDecorator
-	// without making any assumptions about where objects are stored in etcd
-	keyFunc := func(obj runtime.Object) (string, error) {
-		accessor, err := meta.Accessor(obj)
-		if err != nil {
-			return "", err
-		}
-		return registry.NoNamespaceKeyFunc(
-			genericapirequest.NewContext(),
-			prefix,
-			accessor.GetName(),
-		)
-	}
+	statusPrefix := "/" + statusOpts.ResourcePrefix()
+
 	storageInterface, dFunc, err := opts.GetStorage(
 		prefix,
-		keyFunc,
+		configureKeyFunc(prefix),
 		strategy,
 		func() runtime.Object { return &calico.KubeControllersConfiguration{} },
 		func() runtime.Object { return &calico.KubeControllersConfigurationList{} },
@@ -100,7 +90,8 @@ func NewREST(scheme *runtime.Scheme, opts server.Options) (*REST, *StatusREST, e
 	if err != nil {
 		return nil, nil, err
 	}
-	store := &genericregistry.Store{
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &calico.KubeControllersConfiguration{} },
 		NewListFunc: func() runtime.Object { return &calico.KubeControllersConfigurationList{} },
 		KeyRootFunc: opts.KeyRootFunc(false),
@@ -120,8 +111,42 @@ func NewREST(scheme *runtime.Scheme, opts server.Options) (*REST, *StatusREST, e
 		DestroyFunc: dFunc,
 	}
 
+	statusStorageInterface, statusDFunc, err := statusOpts.GetStorage(
+		prefix,
+		configureKeyFunc(statusPrefix),
+		strategy,
+		func() runtime.Object { return &calico.KubeControllersConfiguration{} },
+		func() runtime.Object { return &calico.KubeControllersConfigurationList{} },
+		GetAttrs,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	statusStore := *store
 	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
+	statusStore.Storage = statusStorageInterface
+	statusStore.DestroyFunc = statusDFunc
 
-	return &REST{store}, &StatusREST{&statusStore}, nil
+	return &REST{util.NewStore(store), opts.ShortNames}, &StatusREST{&statusStore, opts.ShortNames}, nil
+}
+
+func configureKeyFunc(resourcePrefix string) func(obj runtime.Object) (string, error) {
+	return func(obj runtime.Object) (string, error) {
+		accessor, err := meta.Accessor(obj)
+		if err != nil {
+			return "", err
+		}
+		return registry.NoNamespaceKeyFunc(
+			genericapirequest.NewContext(),
+			resourcePrefix,
+			accessor.GetName(),
+		)
+	}
+}
+
+func (r *REST) ShortNames() []string {
+	return r.shortNames
 }

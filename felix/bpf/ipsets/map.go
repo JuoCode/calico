@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Copyright (c) 2020 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +18,12 @@ package ipsets
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
-
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/maps"
@@ -95,6 +97,10 @@ func (e IPSetEntry) Port() uint16 {
 	return binary.LittleEndian.Uint16(e[16:18])
 }
 
+func (e IPSetEntry) String() string {
+	return fmt.Sprintf("0x%08x %11s prefix %d port %d  proto %d", e.SetID(), e.Addr(), e.PrefixLen(), e.Port(), e.Protocol())
+}
+
 func IPSetEntryFromBytes(b []byte) IPSetEntryInterface {
 	var e IPSetEntry
 	copy(e[:], b)
@@ -152,4 +158,27 @@ func ProtoIPSetMemberToBPFEntry(id uint64, member string) IPSetEntryInterface {
 	}
 	entry := MakeBPFIPSetEntry(id, cidr, port, protocol)
 	return entry
+}
+
+type MapMem map[IPSetEntry]struct{}
+
+func MapMemIter(m MapMem) func(k, v []byte) {
+	ks := len(IPSetEntry{})
+
+	return func(k, v []byte) {
+		var key IPSetEntry
+		copy(key[:ks], k[:ks])
+
+		m[key] = struct{}{}
+	}
+}
+
+func (m MapMem) String() string {
+	var out strings.Builder
+
+	for k := range m {
+		out.WriteString(k.String() + "\n")
+	}
+
+	return out.String()
 }

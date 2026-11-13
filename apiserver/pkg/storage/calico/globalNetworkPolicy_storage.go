@@ -1,20 +1,16 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -55,10 +51,10 @@ func NewGlobalNetworkPolicyStorage(opts Options) (registry.DryRunnableStorage, f
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.GlobalNetworkPolicy{}),
-		aapiListType:      reflect.TypeOf(aapi.GlobalNetworkPolicyList{}),
-		libCalicoType:     reflect.TypeOf(api.GlobalNetworkPolicy{}),
-		libCalicoListType: reflect.TypeOf(api.GlobalNetworkPolicyList{}),
+		aapiType:          reflect.TypeFor[api.GlobalNetworkPolicy](),
+		aapiListType:      reflect.TypeFor[api.GlobalNetworkPolicyList](),
+		libCalicoType:     reflect.TypeFor[api.GlobalNetworkPolicy](),
+		libCalicoListType: reflect.TypeFor[api.GlobalNetworkPolicyList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -76,7 +72,7 @@ type GlobalNetworkPolicyConverter struct {
 }
 
 func (gc GlobalNetworkPolicyConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiGlobalNetworkPolicy := aapiObj.(*aapi.GlobalNetworkPolicy)
+	aapiGlobalNetworkPolicy := aapiObj.(*api.GlobalNetworkPolicy)
 	lcgGlobalNetworkPolicy := &api.GlobalNetworkPolicy{}
 	lcgGlobalNetworkPolicy.TypeMeta = aapiGlobalNetworkPolicy.TypeMeta
 	lcgGlobalNetworkPolicy.ObjectMeta = aapiGlobalNetworkPolicy.ObjectMeta
@@ -88,23 +84,32 @@ func (gc GlobalNetworkPolicyConverter) convertToLibcalico(aapiObj runtime.Object
 
 func (gc GlobalNetworkPolicyConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgGlobalNetworkPolicy := libcalicoObject.(*api.GlobalNetworkPolicy)
-	aapiGlobalNetworkPolicy := aapiObj.(*aapi.GlobalNetworkPolicy)
+	aapiGlobalNetworkPolicy := aapiObj.(*api.GlobalNetworkPolicy)
 	aapiGlobalNetworkPolicy.Spec = lcgGlobalNetworkPolicy.Spec
+	// Default the tier field if not specified
+	if aapiGlobalNetworkPolicy.Spec.Tier == "" {
+		aapiGlobalNetworkPolicy.Spec.Tier = "default"
+	}
 	aapiGlobalNetworkPolicy.TypeMeta = lcgGlobalNetworkPolicy.TypeMeta
 	aapiGlobalNetworkPolicy.ObjectMeta = lcgGlobalNetworkPolicy.ObjectMeta
+	// Workflows associated with label "projectcalico.org/tier" should be deprecated thereafter.
+	if aapiGlobalNetworkPolicy.Labels == nil {
+		aapiGlobalNetworkPolicy.Labels = make(map[string]string)
+	}
+	aapiGlobalNetworkPolicy.Labels["projectcalico.org/tier"] = aapiGlobalNetworkPolicy.Spec.Tier
 }
 
 func (gc GlobalNetworkPolicyConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgGlobalNetworkPolicyList := libcalicoListObject.(*api.GlobalNetworkPolicyList)
-	aapiGlobalNetworkPolicyList := aapiListObj.(*aapi.GlobalNetworkPolicyList)
+	aapiGlobalNetworkPolicyList := aapiListObj.(*api.GlobalNetworkPolicyList)
 	if libcalicoListObject == nil {
-		aapiGlobalNetworkPolicyList.Items = []aapi.GlobalNetworkPolicy{}
+		aapiGlobalNetworkPolicyList.Items = []api.GlobalNetworkPolicy{}
 		return
 	}
 	aapiGlobalNetworkPolicyList.TypeMeta = lcgGlobalNetworkPolicyList.TypeMeta
 	aapiGlobalNetworkPolicyList.ListMeta = lcgGlobalNetworkPolicyList.ListMeta
 	for _, item := range lcgGlobalNetworkPolicyList.Items {
-		aapiGlobalNetworkPolicy := aapi.GlobalNetworkPolicy{}
+		aapiGlobalNetworkPolicy := api.GlobalNetworkPolicy{}
 		gc.convertToAAPI(&item, &aapiGlobalNetworkPolicy)
 		if matched, err := pred.Matches(&aapiGlobalNetworkPolicy); err == nil && matched {
 			aapiGlobalNetworkPolicyList.Items = append(aapiGlobalNetworkPolicyList.Items, aapiGlobalNetworkPolicy)

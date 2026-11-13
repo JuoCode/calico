@@ -1,4 +1,4 @@
-// Copyright (c) 2017,2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ import (
 	"context"
 	"sync/atomic"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -57,6 +56,7 @@ type resourceList interface {
 type resourceInterface interface {
 	Create(ctx context.Context, opts options.SetOptions, kind string, in resource) (resource, error)
 	Update(ctx context.Context, opts options.SetOptions, kind string, in resource) (resource, error)
+	UpdateStatus(ctx context.Context, opts options.SetOptions, kind string, in resource) (resource, error)
 	Delete(ctx context.Context, opts options.DeleteOptions, kind, ns, name string) (resource, error)
 	Get(ctx context.Context, opts options.GetOptions, kind, ns, name string) (resource, error)
 	List(ctx context.Context, opts options.ListOptions, kind, listkind string, inout resourceList) error
@@ -111,7 +111,7 @@ func (c *resources) Create(ctx context.Context, opts options.SetOptions, kind st
 
 	// Convert the resource to a KVPair and pass that to the backend datastore, converting
 	// the response (if we get one) back to a resource.
-	kvp, err := c.backend.Create(ctx, c.resourceToKVPair(opts, kind, in))
+	kvp, err := c.backend.Create(writeContext(ctx, opts), c.resourceToKVPair(opts, kind, in))
 	if kvp != nil {
 		return c.kvPairToResource(kvp), err
 	}
@@ -156,7 +156,62 @@ func (c *resources) Update(ctx context.Context, opts options.SetOptions, kind st
 
 	// Convert the resource to a KVPair and pass that to the backend datastore, converting
 	// the response (if we get one) back to a resource.
-	kvp, err := c.backend.Update(ctx, c.resourceToKVPair(opts, kind, in))
+	kvp, err := c.backend.Update(writeContext(ctx, opts), c.resourceToKVPair(opts, kind, in))
+	if kvp != nil {
+		return c.kvPairToResource(kvp), err
+	}
+	return nil, err
+}
+
+// UpdateStatus updates the status of a resource in the backend datastore.
+// For backends that support it (Kubernetes), this uses the status subresource.
+// For backends that don't (etcd), this falls back to a regular Update.
+func (c *resources) UpdateStatus(ctx context.Context, opts options.SetOptions, kind string, in resource) (resource, error) {
+	// A ResourceVersion should always be specified on an UpdateStatus.
+	if len(in.GetObjectMeta().GetResourceVersion()) == 0 {
+		logWithResource(in).Info("Rejecting UpdateStatus request with empty resource version")
+		return nil, cerrors.ErrorValidation{
+			ErroredFields: []cerrors.ErroredField{{
+				Name:   "Metadata.ResourceVersion",
+				Reason: "field must be set for an Update request",
+				Value:  in.GetObjectMeta().GetResourceVersion(),
+			}},
+		}
+	}
+	if err := c.checkNamespace(in.GetObjectMeta().GetNamespace(), kind); err != nil {
+		return nil, err
+	}
+	creationTimestamp := in.GetObjectMeta().GetCreationTimestamp()
+	if creationTimestamp.IsZero() {
+		return nil, cerrors.ErrorValidation{
+			ErroredFields: []cerrors.ErroredField{{
+				Name:   "Metadata.CreationTimestamp",
+				Reason: "field must be set for an Update request",
+				Value:  in.GetObjectMeta().GetCreationTimestamp(),
+			}},
+		}
+	}
+	if in.GetObjectMeta().GetUID() == "" {
+		return nil, cerrors.ErrorValidation{
+			ErroredFields: []cerrors.ErroredField{{
+				Name:   "Metadata.UID",
+				Reason: "field must be set for an Update request",
+				Value:  in.GetObjectMeta().GetUID(),
+			}},
+		}
+	}
+
+	// If the backend supports UpdateStatus, use it. Otherwise fall back to Update.
+	if sc, ok := c.backend.(bapi.StatusClient); ok {
+		kvp, err := sc.UpdateStatus(writeContext(ctx, opts), c.resourceToKVPair(opts, kind, in))
+		if kvp != nil {
+			return c.kvPairToResource(kvp), err
+		}
+		return nil, err
+	}
+
+	// Fallback to regular Update for backends that don't support status subresource (e.g., etcd).
+	kvp, err := c.backend.Update(writeContext(ctx, opts), c.resourceToKVPair(opts, kind, in))
 	if kvp != nil {
 		return c.kvPairToResource(kvp), err
 	}
@@ -251,7 +306,7 @@ func (c *resources) Watch(ctx context.Context, opts options.ListOptions, kind st
 
 	// Create the backend watcher.  We need to process the results to add revision data etc.
 	ctx, cancel := context.WithCancel(ctx)
-	backend, err := c.backend.Watch(ctx, list, opts.ResourceVersion)
+	backend, err := c.backend.Watch(ctx, list, bapi.WatchOptions{Revision: opts.ResourceVersion})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -266,6 +321,15 @@ func (c *resources) Watch(ctx context.Context, opts options.ListOptions, kind st
 	}
 	go w.run()
 	return w, nil
+}
+
+// writeContext returns the context for a backend write, marked as a dry run when the
+// caller's options ask for one.
+func writeContext(ctx context.Context, opts options.SetOptions) context.Context {
+	if opts.DryRun {
+		return bapi.WithDryRun(ctx)
+	}
+	return ctx
 }
 
 // resourceToKVPair converts the resource to a KVPair that can be consumed by the

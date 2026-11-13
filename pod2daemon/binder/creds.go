@@ -15,11 +15,11 @@
 package binder
 
 import (
+	"context"
 	"errors"
+	"maps"
 	"net"
 	"sync"
-
-	"context"
 
 	"google.golang.org/grpc/credentials"
 )
@@ -55,8 +55,6 @@ func (s *workloadStore) ServerHandshake(conn net.Conn) (net.Conn, credentials.Au
 func (s *workloadStore) Info() credentials.ProtocolInfo {
 	return credentials.ProtocolInfo{
 		SecurityProtocol: authType,
-		SecurityVersion:  "0.1",
-		ServerName:       "workloadhandler",
 	}
 }
 
@@ -64,9 +62,7 @@ func (s *workloadStore) Clone() credentials.TransportCredentials {
 	other := make(map[string]workload)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for k, v := range s.creds {
-		other[k] = v
-	}
+	maps.Copy(other, s.creds)
 	return &workloadStore{creds: other}
 }
 

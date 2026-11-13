@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,16 @@ package updateprocessors_test
 
 import (
 	"fmt"
+	"maps"
+	"reflect"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/sirupsen/logrus"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/updateprocessors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -39,14 +38,26 @@ const (
 	isGlobalBgpConfig
 	isNodeBgpConfig
 
-	hostIPMarker    = "*HOSTIP*"
 	nodeMarker      = "*NODEMARKER*"
 	wireguardMarker = "*WIREGUARDMARKER*"
 )
 
-const (
-	numBaseFelixConfigs = 136
+var (
+	// numBaseFelixConfigs is the number of FelixConfigurationSpec fields that are
+	// converted to config KVPairs. Fields tagged with confignamev1:"-" (like
+	// NodeSelector) are excluded.
+	numBaseFelixConfigs = countConfigFields(reflect.TypeFor[apiv3.FelixConfigurationSpec]())
 )
+
+func countConfigFields(t reflect.Type) int {
+	count := 0
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Tag.Get("confignamev1") != "-" {
+			count++
+		}
+	}
+	return count
+}
 
 var _ = Describe("Test the generic configuration update processor and the concrete implementations", func() {
 	// Define some common values
@@ -58,7 +69,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		Kind: apiv3.KindFelixConfiguration,
 		Name: "default",
 	}
-	invalidFelixKey := model.ResourceKey{
+	selectorScopedFelixKey := model.ResourceKey{
 		Kind: apiv3.KindFelixConfiguration,
 		Name: "foobar",
 	}
@@ -73,7 +84,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 	numFelixConfigs := numBaseFelixConfigs
 	numClusterConfigs := 5
 	numNodeClusterConfigs := 4
-	felixMappedNames := map[string]interface{}{
+	felixMappedNames := map[string]any{
 		"RouteRefreshInterval":               nil,
 		"IptablesRefreshInterval":            nil,
 		"IpsetsRefreshInterval":              nil,
@@ -139,7 +150,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		By("Testing invalid Key on ProcessDeleted")
 		_, err := cc.Process(&model.KVPair{
 			Key: model.GlobalBGPPeerKey{
-				PeerIP: net.MustParseIP("1.2.3.4"),
+				PeerIP: model.AddrFromIP(net.MustParseIP("1.2.3.4")),
 			},
 		})
 		Expect(err).To(HaveOccurred())
@@ -147,7 +158,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		By("Testing invalid Key on Process")
 		_, err = cc.Process(&model.KVPair{
 			Key: model.GlobalBGPPeerKey{
-				PeerIP: net.MustParseIP("1.2.3.4"),
+				PeerIP: model.AddrFromIP(net.MustParseIP("1.2.3.4")),
 			},
 			Value: apiv3.NewFelixConfiguration(),
 		})
@@ -163,22 +174,26 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		By("Testing incorrect resource type value on Process with add/mod")
 		_, err = cc.Process(&model.KVPair{
 			Key:   globalFelixKey,
-			Value: libapiv3.NewWorkloadEndpoint(),
+			Value: internalapi.NewWorkloadEndpoint(),
 		})
 		Expect(err).To(HaveOccurred())
 
-		By("Testing incorrect name structure on Process with add/mod")
-		_, err = cc.Process(&model.KVPair{
-			Key:   invalidFelixKey,
+		By("Testing selector-scoped name passes through on Process with add/mod")
+		selectorKvps, err := cc.Process(&model.KVPair{
+			Key:   selectorScopedFelixKey,
 			Value: apiv3.NewFelixConfiguration(),
 		})
-		Expect(err).To(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(selectorKvps).To(HaveLen(1))
+		Expect(selectorKvps[0].Key).To(Equal(selectorScopedFelixKey))
 
-		By("Testing incorrect name structure on Process with delete")
-		_, err = cc.Process(&model.KVPair{
-			Key: invalidFelixKey,
+		By("Testing selector-scoped name passes through on Process with delete")
+		selectorKvps, err = cc.Process(&model.KVPair{
+			Key: selectorScopedFelixKey,
 		})
-		Expect(err).To(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(selectorKvps).To(HaveLen(1))
+		Expect(selectorKvps[0].Key).To(Equal(selectorScopedFelixKey))
 	})
 
 	It("should handle different field types being assigned", func() {
@@ -190,14 +205,14 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		duration3 := metav1.Duration{Duration: time.Duration(0)}
 		duration4 := metav1.Duration{Duration: time.Duration(0.1 * float64(time.Second))}
 		bool1 := false
-		uint1 := uint32(1313)
+		int1 := int64(1313)
 		res.Spec.RouteRefreshInterval = &duration1
 		res.Spec.IptablesLockProbeInterval = &duration2
 		res.Spec.EndpointReportingDelay = &duration3
 		res.Spec.IpsetsRefreshInterval = &duration4
 		res.Spec.InterfacePrefix = "califoobar"
 		res.Spec.IPIPEnabled = &bool1
-		res.Spec.IptablesMarkMask = &uint1
+		res.Spec.IptablesMarkMask = &int1
 		res.Spec.FailsafeInboundHostPorts = &[]apiv3.ProtoPort{}
 		res.Spec.FailsafeOutboundHostPorts = &[]apiv3.ProtoPort{
 			{
@@ -219,7 +234,14 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		res.Spec.ExternalNodesCIDRList = &[]string{"1.1.1.1", "2.2.2.2"}
 		res.Spec.IptablesNATOutgoingInterfaceFilter = "cali-123"
 		res.Spec.RouteTableRanges = &apiv3.RouteTableRanges{{Min: 43, Max: 211}}
-		expected := map[string]interface{}{
+		res.Spec.NftablesMarkMask = &int1
+		res.Spec.NftablesRefreshInterval = &duration4
+		res.Spec.NftablesFilterDenyAction = "Accept"
+		res.Spec.NftablesFilterAllowAction = "Drop"
+		res.Spec.NftablesMangleAllowAction = "Accept"
+		res.Spec.BPFMaglevMaxEndpointsPerService = &intype
+		res.Spec.BPFMaglevMaxServices = &intype
+		expected := map[string]any{
 			"RouteRefreshInterval":               "12.345",
 			"IptablesLockProbeIntervalMillis":    "54.321",
 			"EndpointReportingDelaySecs":         "0",
@@ -232,6 +254,13 @@ var _ = Describe("Test the generic configuration update processor and the concre
 			"ExternalNodesCIDRList":              "1.1.1.1,2.2.2.2",
 			"IptablesNATOutgoingInterfaceFilter": "cali-123",
 			"RouteTableRanges":                   "43-211",
+			"NftablesRefreshInterval":            "0.1",
+			"NftablesMarkMask":                   "1313",
+			"NftablesFilterDenyAction":           "Accept",
+			"NftablesFilterAllowAction":          "Drop",
+			"NftablesMangleAllowAction":          "Accept",
+			"BPFMaglevMaxServices":               "3",
+			"BPFMaglevMaxEndpointsPerService":    "3",
 		}
 		kvps, err := cc.Process(&model.KVPair{
 			Key:   perNodeFelixKey,
@@ -260,7 +289,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 				Timeout: metav1.Duration{Duration: 25 * time.Second},
 			},
 		}
-		expected := map[string]interface{}{
+		expected := map[string]any{
 			"HealthTimeoutOverrides": "Foo=20s,Bar=25s",
 		}
 		kvps, err := cc.Process(&model.KVPair{
@@ -282,7 +311,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		res := apiv3.NewClusterInformation()
 		res.Spec.ClusterGUID = "abcedfg"
 		res.Spec.ClusterType = "Mesos,K8s"
-		expected := map[string]interface{}{
+		expected := map[string]any{
 			"ClusterGUID": "abcedfg",
 			"ClusterType": "Mesos,K8s",
 		}
@@ -305,7 +334,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		res := apiv3.NewClusterInformation()
 		ready := true
 		res.Spec.DatastoreReady = &ready
-		expected := map[string]interface{}{
+		expected := map[string]any{
 			"ready-flag": true,
 		}
 		kvps, err := cc.Process(&model.KVPair{
@@ -327,7 +356,7 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		res := apiv3.NewClusterInformation()
 		ready := false
 		res.Spec.DatastoreReady = &ready
-		expected := map[string]interface{}{
+		expected := map[string]any{
 			"ready-flag": false,
 		}
 		kvps, err := cc.Process(&model.KVPair{
@@ -384,15 +413,13 @@ var _ = Describe("Test the generic configuration update processor and the concre
 // to be nil in the KVPair.
 // You can use expectedValues to verify certain fields were included in the response even
 // if the values were nil.
-func checkExpectedConfigs(kvps []*model.KVPair, dataType int, expectedNum int, expectedValues map[string]interface{}) {
+func checkExpectedConfigs(kvps []*model.KVPair, dataType int, expectedNum int, expectedValues map[string]any) {
 	// Copy/convert input data.  We keep track of:
 	// - all field names, so that we can check for duplicates
 	// - extra fields that we have not yet seen
 	// - expected field values that we have not yet validated
-	ev := make(map[string]interface{}, len(expectedValues))
-	for k, v := range expectedValues {
-		ev[k] = v
-	}
+	ev := make(map[string]any, len(expectedValues))
+	maps.Copy(ev, expectedValues)
 	allNames := map[string]struct{}{}
 
 	By(" - checking the expected number of results")
@@ -416,13 +443,6 @@ func checkExpectedConfigs(kvps []*model.KVPair, dataType int, expectedNum int, e
 				node := kt.Hostname
 				ExpectWithOffset(1, node).To(Equal("mynode"))
 				name = kt.Name
-			case model.HostIPKey:
-				// Although the HostIPKey is not in the same key space as the HostConfig, we
-				// special case this to make this test reusable for more tests.
-				node := kt.Hostname
-				ExpectWithOffset(1, node).To(Equal("mynode"))
-				name = hostIPMarker
-				logrus.Warnf("IP in key: %s", kvp.Value)
 			case model.ResourceKey:
 				node := kt.Name
 				ExpectWithOffset(1, node).To(Equal("mynode"))

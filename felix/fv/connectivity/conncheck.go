@@ -22,16 +22,20 @@ import (
 	"io"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
+	log "github.com/sirupsen/logrus"
+
+	//nolint:staticcheck // Ignore ST1001: should not use dot imports
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
@@ -52,6 +56,37 @@ type Checker struct {
 	CheckSNAT        bool
 	RetriesDisabled  bool
 	StaggerStartBy   time.Duration
+
+	// UniqueSourcePorts gives every expectation its own source port on each
+	// CheckConnectivity call, so that no two connections a checker makes ever
+	// share a 5-tuple.
+	//
+	// Tests that count flows per round of checking need this.  A connection the
+	// destination denies establishes nothing, so it leaves no TIME_WAIT socket
+	// holding its ephemeral port, and the kernel starts its port search for the
+	// next connect() to that same destination from the same offset - which makes
+	// the port just released a likely pick.  A repeat on the same port shares a
+	// 5-tuple with the first attempt, matches the conntrack entry it left behind,
+	// and is reported as one flow rather than two.
+	//
+	// Ports are assigned once per call, ahead of any retry, so a retried attempt
+	// keeps its port and folds into the flow it is retrying instead of counting as
+	// a new one.  ResetExpectations() does not clear this flag, so a checker that
+	// is reset and re-populated carries on assigning ports.
+	//
+	// Two things opt a single connection out of all this:
+	//
+	//   - An expectation pinned with ExpectWithSrcPort keeps its port, and so keeps
+	//     repeating its 5-tuple, which is the behaviour this option exists to
+	//     avoid.  Pin a port only where the test needs that exact port.  A pinned
+	//     port inside the range assigned here is rejected, since the two could
+	//     otherwise hand one port to two different connections.
+	//   - A connection source that supplies its own source port overrides the
+	//     assigned one, because it appends its option after the checker's and the
+	//     last one wins.  workload.Port does that, so a w.Port(n) used as the
+	//     source rather than the destination would take n.  No test does that
+	//     today, and the check above does not catch it.
+	UniqueSourcePorts bool
 
 	// OnFail, if set, will be called instead of ginkgo.Fail().  (Useful for testing the checker itself.)
 	OnFail func(msg string)
@@ -122,14 +157,14 @@ func (c *Checker) ExpectNone(from ConnectionSource, to ConnectionTarget, explici
 // and ConnectionTarget with details configurable with ExpectationOption(s).
 // This is a super set of ExpectSome()
 func (c *Checker) Expect(expected Expected,
-	from ConnectionSource, to ConnectionTarget, opts ...ExpectationOption) {
-
+	from ConnectionSource, to ConnectionTarget, opts ...ExpectationOption,
+) {
 	c.expect(expected, from, to, opts...)
 }
 
 func (c *Checker) ExpectLoss(from ConnectionSource, to ConnectionTarget,
-	duration time.Duration, maxPacketLossPercent float64, maxPacketLossNumber int, explicitPort ...uint16) {
-
+	duration time.Duration, maxPacketLossPercent float64, maxPacketLossNumber int, explicitPort ...uint16,
+) {
 	// Packet loss measurements shouldn't be retried.
 	c.RetriesDisabled = true
 
@@ -140,8 +175,8 @@ func (c *Checker) ExpectLoss(from ConnectionSource, to ConnectionTarget,
 }
 
 func (c *Checker) expect(expected Expected, from ConnectionSource, to ConnectionTarget,
-	opts ...ExpectationOption) {
-
+	opts ...ExpectationOption,
+) {
 	UnactivatedCheckers.Add(c)
 	if c.ReverseDirection {
 		from, to = to.(ConnectionSource), from.(ConnectionTarget)
@@ -296,26 +331,26 @@ func (c *Checker) ExpectedConnectivityPretty() []string {
 
 var defaultConnectivityTimeout = 10 * time.Second
 
-func (c *Checker) CheckConnectivityOffset(offset int, opts ...interface{}) {
+func (c *Checker) CheckConnectivityOffset(offset int, opts ...any) {
 	c.CheckConnectivityWithTimeoutOffset(offset+2, defaultConnectivityTimeout, opts...)
 }
 
-func (c *Checker) CheckConnectivity(opts ...interface{}) {
+func (c *Checker) CheckConnectivity(opts ...any) {
 	c.CheckConnectivityWithTimeoutOffset(2, defaultConnectivityTimeout, opts...)
 }
 
-func (c *Checker) CheckConnectivityPacketLoss(opts ...interface{}) {
+func (c *Checker) CheckConnectivityPacketLoss(opts ...any) {
 	// Timeout is not used for packet loss test because there is no retry.
 	c.CheckConnectivityWithTimeoutOffset(2, 0*time.Second, opts...)
 }
 
-func (c *Checker) CheckConnectivityWithTimeout(timeout time.Duration, opts ...interface{}) {
+func (c *Checker) CheckConnectivityWithTimeout(timeout time.Duration, opts ...any) {
 	Expect(timeout).To(BeNumerically(">", 100*time.Millisecond),
 		"Very low timeout, did you mean to multiply by time.<Unit>?")
 	c.CheckConnectivityWithTimeoutOffset(2, timeout, opts...)
 }
 
-func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout time.Duration, opts ...interface{}) {
+func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout time.Duration, opts ...any) {
 	log.Info("Starting connectivity check...")
 	for _, o := range opts {
 		switch v := o.(type) {
@@ -339,6 +374,11 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 
 	if c.init != nil {
 		c.init()
+	}
+
+	// After the init hook, so that expectations it adds are covered too.
+	if c.UniqueSourcePorts {
+		c.assignSourcePorts()
 	}
 
 	for {
@@ -414,6 +454,43 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 		c.OnFail(message)
 	} else {
 		ginkgo.Fail(message, callerSkip)
+	}
+}
+
+// Source ports for UniqueSourcePorts are drawn from a window clear of every port
+// the harness itself uses - a workload with a side service redirects its own
+// outgoing traffic to 15001 - and clear of the ports individual tests pin by
+// hand.  It ends where BPF source port NAT begins, and so is also below the
+// ephemeral range, meaning an assigned port collides neither with one the kernel
+// hands out nor with one the dataplane rewrites.
+const (
+	uniqueSrcPortFirst = 17000
+	uniqueSrcPortLast  = 20000
+)
+
+// nextUniqueSrcPort counts the source ports handed out to every checker in the
+// process, so that connections made by different checkers cannot collide either.
+// It wraps within the window, which only repeats a port after the whole window
+// has been used - long after any conntrack entry for the earlier connection has
+// gone.
+var nextUniqueSrcPort atomic.Uint32
+
+// assignSourcePorts gives each expectation its own source port, replacing any
+// port assigned by an earlier call but leaving one the caller set alone.
+func (c *Checker) assignSourcePorts() {
+	for i := range c.expectations {
+		e := &c.expectations[i]
+		if e.srcPort != 0 && !e.srcPortAuto {
+			// Pinned by the caller.  Leave it, but it must not sit in the range we
+			// allocate from, or one of the ports below could duplicate it.
+			Expect(e.srcPort < uniqueSrcPortFirst || e.srcPort >= uniqueSrcPortLast).To(BeTrue(),
+				"ExpectWithSrcPort(%d) is inside the range UniqueSourcePorts assigns from (%d-%d); "+
+					"pick a port outside it", e.srcPort, uniqueSrcPortFirst, uniqueSrcPortLast-1)
+			continue
+		}
+		n := nextUniqueSrcPort.Add(1) - 1
+		e.srcPort = uniqueSrcPortFirst + uint16(n%(uniqueSrcPortLast-uniqueSrcPortFirst))
+		e.srcPortAuto = true
 	}
 }
 
@@ -495,19 +572,19 @@ type ConnectionSource interface {
 	SourceIPs() []string
 }
 
-func (m *Matcher) Match(actual interface{}) (success bool, err error) {
+func (m *Matcher) Match(actual any) (success bool, err error) {
 	actual.(ConnectionSource).PreRetryCleanup(m.IP, m.Port, m.Protocol)
 	success = actual.(ConnectionSource).CanConnectTo(m.IP, m.Port, m.Protocol) != nil
 	return
 }
 
-func (m *Matcher) FailureMessage(actual interface{}) (message string) {
+func (m *Matcher) FailureMessage(actual any) (message string) {
 	src := actual.(ConnectionSource)
 	message = fmt.Sprintf("Expected %v\n\t%+v\nto have connectivity to %v\n\t%v:%v\nbut it does not", src.SourceName(), src, m.TargetName, m.IP, m.Port)
 	return
 }
 
-func (m *Matcher) NegatedFailureMessage(actual interface{}) (message string) {
+func (m *Matcher) NegatedFailureMessage(actual any) (message string) {
 	src := actual.(ConnectionSource)
 	message = fmt.Sprintf("Expected %v\n\t%+v\nnot to have connectivity to %v\n\t%v:%v\nbut it does", src.SourceName(), src, m.TargetName, m.IP, m.Port)
 	return
@@ -604,6 +681,9 @@ type Expectation struct {
 	clientMTUEnd   int
 
 	srcPort uint16
+	// srcPortAuto records that srcPort was assigned by UniqueSourcePorts rather
+	// than by the caller, and so may be replaced on the next call.
+	srcPortAuto bool
 
 	ErrorStr string
 
@@ -630,13 +710,7 @@ func (e Expectation) Matches(response *Result, checkSNAT bool) bool {
 		}
 
 		if checkSNAT {
-			match := false
-			for _, src := range e.ExpSrcIPs {
-				if src == response.LastResponse.SourceIP() {
-					match = true
-					break
-				}
-			}
+			match := slices.Contains(e.ExpSrcIPs, response.LastResponse.SourceIP())
 			if !match {
 				return false
 			}
@@ -683,7 +757,6 @@ func (e Expectation) Matches(response *Result, checkSNAT bool) bool {
 				return false
 			}
 		}
-
 	}
 
 	return true
@@ -766,7 +839,8 @@ func (cmd *CheckCmd) run(cName string, logMsg string) *Result {
 	logCxt.Debugf("Entering connectivity.Check(%v,%v,%v,%v,%v)",
 		cmd.ip, cmd.port, cmd.protocol, cmd.sendLen, cmd.recvLen)
 
-	args := []string{"exec", cName,
+	args := []string{
+		"exec", cName,
 		"test-connection", "--protocol=" + cmd.protocol,
 		fmt.Sprintf("--duration=%d", int(cmd.duration.Seconds())),
 		fmt.Sprintf("--sendlen=%d", cmd.sendLen),
@@ -816,7 +890,8 @@ func (cmd *CheckCmd) run(cName string, logMsg string) *Result {
 	err = connectionCmd.Wait()
 	logCxt.WithFields(log.Fields{
 		"stdout": string(wOut),
-		"stderr": string(wErr)}).WithError(err).Info(logMsg)
+		"stderr": string(wErr),
+	}).WithError(err).Info(logMsg)
 
 	var resp Result
 	r := regexp.MustCompile(`RESULT=(.*)\n`)
@@ -878,7 +953,6 @@ func WithTimeout(t time.Duration) CheckOption {
 
 // Check executes the connectivity check
 func Check(cName, logMsg, ip, port, protocol string, opts ...CheckOption) *Result {
-
 	const defaultPingTimeout = 2 * time.Second
 	cmd := CheckCmd{
 		nsPath:   "-",
@@ -895,8 +969,10 @@ func Check(cName, logMsg, ip, port, protocol string, opts ...CheckOption) *Resul
 	return cmd.run(cName, logMsg)
 }
 
-const ConnectionTypeStream = "stream"
-const ConnectionTypePing = "ping"
+const (
+	ConnectionTypeStream = "stream"
+	ConnectionTypePing   = "ping"
+)
 
 type ConnConfig struct {
 	ConnType string
@@ -941,16 +1017,21 @@ type Runtime interface {
 type PersistentConnection struct {
 	sync.Mutex
 
-	RuntimeName         string
-	Runtime             Runtime
-	Name                string
-	Protocol            string
-	IP                  string
-	Port                int
-	SourcePort          int
-	MonitorConnectivity bool
-	NamespacePath       string
-	Timeout             time.Duration
+	RuntimeName          string
+	Runtime              Runtime
+	Name                 string
+	Protocol             string
+	IP                   string
+	Port                 int
+	SourcePort           int
+	MonitorConnectivity  bool
+	NamespacePath        string
+	Timeout              time.Duration
+	Sleep                time.Duration
+	ProbeLoopFileTimeout time.Duration
+	SendRST              bool
+	NoKeepAlive          bool
+	connectionReset      bool
 
 	loopFile string
 	runCmd   *exec.Cmd
@@ -960,6 +1041,7 @@ type PersistentConnection struct {
 }
 
 func (pc *PersistentConnection) Stop() {
+	log.Infof("Stopping PersistentConnection %s, loopFile %s", pc.RuntimeName, pc.loopFile)
 	Expect(pc.stop()).NotTo(HaveOccurred())
 }
 
@@ -979,6 +1061,7 @@ func (pc *PersistentConnection) stop() error {
 }
 
 func (pc *PersistentConnection) Start() error {
+	log.Infof("Starting PersistentConnection %s", pc.RuntimeName)
 	namespacePath := pc.NamespacePath
 	if namespacePath == "" {
 		namespacePath = "-"
@@ -1010,6 +1093,15 @@ func (pc *PersistentConnection) Start() error {
 	if pc.Timeout > 0 {
 		args = append(args, fmt.Sprintf("--timeout=%d", pc.Timeout/time.Second))
 	}
+	if pc.Sleep > 0 {
+		args = append(args, fmt.Sprintf("--sleep=%d", pc.Sleep/time.Second))
+	}
+	if pc.SendRST {
+		args = append(args, "--send-rst")
+	}
+	if pc.NoKeepAlive {
+		args = append(args, "--no-keepalive")
+	}
 	runCmd := utils.Command(
 		"docker",
 		args...,
@@ -1033,6 +1125,9 @@ func (pc *PersistentConnection) Start() error {
 			line, err := stdoutReader.ReadString('\n')
 			if err != nil {
 				log.WithError(err).Info("End of permanent connection stdout")
+				pc.Lock()
+				pc.connectionReset = true
+				pc.Unlock()
 				return
 			}
 			line = strings.TrimSpace(string(line))
@@ -1053,6 +1148,9 @@ func (pc *PersistentConnection) Start() error {
 			line, err := stderrReader.ReadString('\n')
 			if err != nil {
 				log.WithError(err).Info("End of permanent connection stderr")
+				pc.Lock()
+				pc.connectionReset = true
+				pc.Unlock()
 				return
 			}
 			line = strings.TrimSpace(string(line))
@@ -1062,12 +1160,24 @@ func (pc *PersistentConnection) Start() error {
 	if err := runCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start a permanent connection: %v", err)
 	}
-	Eventually(func() error {
-		return pc.Runtime.ExecMayFail("stat", loopFile)
-	}, 5*time.Second, time.Second).Should(
-		HaveOccurred(),
-		"Failed to wait for test-connection to be ready, the loop file did not disappear",
-	)
+
+	timeout := 5 * time.Second
+	if pc.ProbeLoopFileTimeout > 0 {
+		timeout = pc.ProbeLoopFileTimeout
+	}
+
+	timedOut := time.After(timeout)
+	for {
+		err = pc.Runtime.ExecMayFail("stat", loopFile)
+		if err != nil {
+			break
+		}
+		select {
+		case <-timedOut:
+			return fmt.Errorf("failed to wait for test-connection to be ready, the loop file did not disappear")
+		case <-time.After(time.Second):
+		}
+	}
 
 	pc.loopFile = loopFile
 	pc.runCmd = runCmd
@@ -1091,4 +1201,10 @@ func (pc *PersistentConnection) PongCount() int {
 	defer pc.Unlock()
 	log.WithField("name", pc.Name).Infof("pong count %d", pc.pongCount)
 	return pc.pongCount
+}
+
+func (pc *PersistentConnection) IsConnectionReset() bool {
+	pc.Lock()
+	defer pc.Unlock()
+	return pc.connectionReset
 }

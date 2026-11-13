@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,27 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"net"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/names"
 
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/consistenthash"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -40,7 +45,7 @@ var (
 	// RegexpIfaceElemRegexp matches an individual element in the overall interface list;
 	// assumes the value represents a regular expression and is marked by '/' at the start
 	// and end and cannot have spaces
-	RegexpIfaceElemRegexp = regexp.MustCompile(`^\/[^\s]+\/$`)
+	RegexpIfaceElemRegexp = regexp.MustCompile(`^/[^\s]+/$`)
 	InterfaceRegex        = regexp.MustCompile("^[a-zA-Z0-9_.-]{1,15}$")
 	// NonRegexpIfaceElemRegexp matches an individual element in the overall interface list;
 	// assumes the value is between 1-15 chars long and only be alphanumeric or - or _
@@ -51,13 +56,9 @@ var (
 	StringRegexp             = regexp.MustCompile(`^.*$`)
 	IfaceParamRegexp         = regexp.MustCompile(`^[a-zA-Z0-9:._+-]{1,15}$`)
 	// Hostname  have to be valid ipv4, ipv6 or strings up to 64 characters.
-	HostAddressRegexp = regexp.MustCompile(`^[a-zA-Z0-9:._+-]{1,64}$`)
-)
-
-const (
-	maxUint = ^uint(0)
-	maxInt  = int(maxUint >> 1)
-	minInt  = -maxInt - 1
+	HostAddressRegexp   = regexp.MustCompile(`^[a-zA-Z0-9:._+-]{1,64}$`)
+	LogActionRateRegexp = regexp.MustCompile(`^([1-9]\d{0,3}/(?:second|minute|hour|day))?$`)
+	LogPrefixRegexp     = regexp.MustCompile(`^[a-zA-Z0-9%: /_-]*$`)
 )
 
 // Source of a config value.  Values from higher-numbered sources override
@@ -68,13 +69,22 @@ type Source uint8
 const (
 	Default Source = iota
 	DatastoreGlobal
+	DatastorePerSelector
 	DatastorePerHost
 	ConfigFile
 	EnvironmentVariable
 	InternalOverride
 )
 
-var SourcesInDescendingOrder = []Source{InternalOverride, EnvironmentVariable, ConfigFile, DatastorePerHost, DatastoreGlobal}
+// Default stats collection const used globally
+const (
+	DefaultAgeTimeout               = time.Duration(10) * time.Second
+	DefaultInitialReportingDelay    = time.Duration(5) * time.Second
+	DefaultExportingInterval        = time.Duration(1) * time.Second
+	DefaultConntrackPollingInterval = time.Duration(5) * time.Second
+)
+
+var SourcesInDescendingOrder = []Source{InternalOverride, EnvironmentVariable, ConfigFile, DatastorePerHost, DatastorePerSelector, DatastoreGlobal}
 
 func (source Source) String() string {
 	switch source {
@@ -82,6 +92,8 @@ func (source Source) String() string {
 		return "<default>"
 	case DatastoreGlobal:
 		return "datastore (global)"
+	case DatastorePerSelector:
+		return "datastore (per-node-selector)"
 	case DatastorePerHost:
 		return "datastore (per-host)"
 	case ConfigFile:
@@ -138,7 +150,7 @@ func newProvider(s string) (Provider, error) {
 	switch strings.ToLower(s) {
 	case strings.ToLower(ProviderNone.String()):
 		return ProviderNone, nil
-	case strings.ToLower(ProviderEKS.String()):
+	case strings.ToLower(ProviderEKS.String()), "ecs":
 		return ProviderEKS, nil
 	case strings.ToLower(ProviderGKE.String()):
 		return ProviderGKE, nil
@@ -173,13 +185,26 @@ type Config struct {
 	WireguardMTUV6                 int           `config:"int;0"`
 	WireguardHostEncryptionEnabled bool          `config:"bool;false"`
 	WireguardPersistentKeepAlive   time.Duration `config:"seconds;0"`
+	WireguardThreadingEnabled      bool          `config:"bool;false"`
 
+	// nftables configuration.
+	NFTablesMode                      string         `config:"oneof(Enabled,Disabled,Auto);Auto"`
+	NFTablesFlowTableOffload          string         `config:"oneof(All,Disabled);Disabled"`
+	NFTablesFlowTableDataIfacePattern *regexp.Regexp `config:"regexp(nil-on-empty);"`
+
+	// BPF configuration.
 	BPFEnabled                         bool              `config:"bool;false"`
+	BPFOverlayHostSourceIP             string            `config:"oneof(TunnelAddress,HostAddress);TunnelAddress;non-zero"`
 	BPFDisableUnprivileged             bool              `config:"bool;true"`
+	BPFJITHardening                    string            `config:"oneof(Auto,Strict);Auto;non-zero"`
 	BPFLogLevel                        string            `config:"oneof(off,info,debug);off;non-zero"`
+	BPFConntrackLogLevel               string            `config:"oneof(off,debug);off;non-zero"`
+	BPFConntrackCleanupMode            string            `config:"oneof(Auto,Userspace,BPFProgram);Auto"`
+	BPFConntrackTimeouts               map[string]string `config:"keyvaluelist;CreationGracePeriod=10s,TCPSynSent=20s,TCPEstablished=1h,TCPFinsSeen=Auto,TCPResetSeen=40s,UDPTimeout=60s,GenericTimeout=10m,ICMPTimeout=5s"`
+	BPFIPFragTimeout                   time.Duration     `config:"seconds;0"`
 	BPFLogFilters                      map[string]string `config:"keyvaluelist;;"`
 	BPFCTLBLogFilter                   string            `config:"oneof(all);;"`
-	BPFDataIfacePattern                *regexp.Regexp    `config:"regexp;^((en|wl|ww|sl|ib)[Popsx].*|(eth|wlan|wwan).*|tunl0$|vxlan.calico$|vxlan-v6.calico$|wireguard.cali$|wg-v6.cali$)"`
+	BPFDataIfacePattern                *regexp.Regexp    `config:"regexp;^((en|wl|ww|sl|ib)[Popsx].*|(eth|wlan|wwan|bond).*)"`
 	BPFL3IfacePattern                  *regexp.Regexp    `config:"regexp;"`
 	BPFConnectTimeLoadBalancingEnabled bool              `config:"bool;;"`
 	BPFConnectTimeLoadBalancing        string            `config:"oneof(TCP,Enabled,Disabled);TCP;non-zero"`
@@ -188,7 +213,7 @@ type Config struct {
 	BPFDSROptoutCIDRs                  []string          `config:"cidr-list;;"`
 	BPFKubeProxyIptablesCleanupEnabled bool              `config:"bool;true"`
 	BPFKubeProxyMinSyncPeriod          time.Duration     `config:"seconds;1"`
-	BPFKubeProxyEndpointSlicesEnabled  bool              `config:"bool;true"`
+	BPFKubeProxyHealthzPort            int               `config:"int;10256"`
 	BPFExtToServiceConnmark            int               `config:"int;0"`
 	BPFPSNATPorts                      numorstring.Port  `config:"portrange;20000:29999"`
 	BPFMapSizeNATFrontend              int               `config:"int;65536;non-zero"`
@@ -196,50 +221,91 @@ type Config struct {
 	BPFMapSizeNATAffinity              int               `config:"int;65536;non-zero"`
 	BPFMapSizeRoute                    int               `config:"int;262144;non-zero"`
 	BPFMapSizeConntrack                int               `config:"int;512000;non-zero"`
+	BPFMapSizePerCPUConntrack          int               `config:"int;0"`
+	BPFMapSizeConntrackScaling         string            `config:"oneof(Disabled,DoubleIfFull);DoubleIfFull;non-zero"`
+	BPFMapSizeConntrackCleanupQueue    int               `config:"int;100000;non-zero"`
 	BPFMapSizeIPSets                   int               `config:"int;1048576;non-zero"`
 	BPFMapSizeIfState                  int               `config:"int;1000;non-zero"`
-	BPFHostConntrackBypass             bool              `config:"bool;true"`
+	BPFHostConntrackBypass             bool              `config:"bool;false"`
+	BPFIPFragmentReassemblyEnabled     bool              `config:"bool;true"`
 	BPFEnforceRPF                      string            `config:"oneof(Disabled,Strict,Loose);Loose;non-zero"`
 	BPFPolicyDebugEnabled              bool              `config:"bool;true"`
 	BPFForceTrackPacketsFromIfaces     []string          `config:"iface-filter-slice;docker+"`
 	BPFDisableGROForIfaces             *regexp.Regexp    `config:"regexp;"`
 	BPFExcludeCIDRsFromNAT             []string          `config:"cidr-list;;"`
+	BPFRedirectToPeer                  string            `config:"oneof(Disabled,Enabled,L2Only);Enabled;non-zero"`
+	BPFAttachType                      string            `config:"oneof(Netkit,TCX,TC);Netkit;non-zero"`
+	BPFExportBufferSizeMB              int               `config:"int;1;non-zero"`
+	BPFProfiling                       string            `config:"oneof(Disabled,Enabled);Disabled;non-zero"`
+
+	// Istio config fields
+	IstioAmbientMode string           `config:"oneof(Disabled,Enabled);Disabled"`
+	IstioDSCPMark    numorstring.DSCP `config:"dscp;23"`
+
+	// CgroupV2Path is not used by Felix, but its init container
+	CgroupV2Path string `config:"string;;"`
 
 	// DebugBPFCgroupV2 controls the cgroup v2 path that we apply the connect-time load balancer to.  Most distros
 	// are configured for cgroup v1, which prevents all but the root cgroup v2 from working so this is only useful
 	// for development right now.
 	DebugBPFCgroupV2 string `config:"string;;local"`
-	// DebugBPFMapRepinEnabled can be used to prevent Felix from repinning its BPF maps at startup.  This is useful for
-	// testing with multiple Felix instances running on one host.
-	DebugBPFMapRepinEnabled bool `config:"bool;false;local"`
 
+	// DatastoreType controls which datastore driver Felix will use.  Typically, this is detected from the environment
+	// and it does not need to be set manually. (For example, if `KUBECONFIG` is set, the kubernetes datastore driver
+	// will be used by default).
 	DatastoreType string `config:"oneof(kubernetes,etcdv3);etcdv3;non-zero,die-on-fail,local"`
 
+	// FelixHostname is the name of this node, used to identify resources in the datastore that belong to this node.
+	// Auto-detected from the node's hostname if not provided.
 	FelixHostname string `config:"hostname;;local,non-zero"`
 
-	EtcdAddr      string   `config:"authority;127.0.0.1:2379;local"`
-	EtcdScheme    string   `config:"oneof(http,https);http;local"`
-	EtcdKeyFile   string   `config:"file(must-exist);;local"`
-	EtcdCertFile  string   `config:"file(must-exist);;local"`
-	EtcdCaFile    string   `config:"file(must-exist);;local"`
+	// EtcdAddr: when using the `etcdv3` datastore driver, the etcd server and port to connect to.  If EtcdEndpoints
+	// is also specified, it takes precedence.
+	EtcdAddr string `config:"authority;127.0.0.1:2379;local"`
+	// EtcdAddr: when using the `etcdv3` datastore driver, the URL scheme to use. If EtcdEndpoints
+	// is also specified, it takes precedence.
+	EtcdScheme string `config:"oneof(http,https);http;local"`
+	// EtcdKeyFile: when using the `etcdv3` datastore driver, path to TLS private key file to use when connecting to
+	// etcd.  If the key file is specified, the other TLS parameters are mandatory.
+	EtcdKeyFile string `config:"file(must-exist);;local"`
+	// EtcdCertFile: when using the `etcdv3` datastore driver, path to TLS certificate file to use when connecting to
+	// etcd.  If the certificate file is specified, the other TLS parameters are mandatory.
+	EtcdCertFile string `config:"file(must-exist);;local"`
+	// EtcdCaFile: when using the `etcdv3` datastore driver, path to TLS CA file to use when connecting to
+	// etcd.  If the CA file is specified, the other TLS parameters are mandatory.
+	EtcdCaFile string `config:"file(must-exist);;local"`
+	// EtcdEndpoints: when using the `etcdv3` datastore driver, comma-delimited list of etcd endpoints to connect to,
+	// replaces EtcdAddr and EtcdScheme.
 	EtcdEndpoints []string `config:"endpoint-list;;local"`
 
-	TyphaAddr           string        `config:"authority;;local"`
-	TyphaK8sServiceName string        `config:"string;;local"`
-	TyphaK8sNamespace   string        `config:"string;kube-system;non-zero,local"`
-	TyphaReadTimeout    time.Duration `config:"seconds;30;local"`
-	TyphaWriteTimeout   time.Duration `config:"seconds;10;local"`
+	// TyphaAddr if set, tells Felix to connect to Typha at the given address and port.  Overrides TyphaK8sServiceName.
+	TyphaAddr string `config:"authority;;local"`
+	// TyphaK8sServiceName if set, tells Felix to connect to Typha by looking up the Endpoints of the given Kubernetes
+	// Service in namespace specified by TyphaK8sNamespace.
+	TyphaK8sServiceName string `config:"string;;local"`
+	// TyphaK8sNamespace namespace to look in when looking for Typha's service (see TyphaK8sServiceName).
+	TyphaK8sNamespace string `config:"string;kube-system;non-zero,local"`
+	// TyphaReadTimeout read timeout when reading from the Typha connection.  If typha sends no data for this long,
+	// Felix will exit and restart.  (Note that Typha sends regular pings so traffic is always expected.)
+	TyphaReadTimeout time.Duration `config:"seconds;30;local"`
+	// TyphaWriteTimeout write timeout when writing data to Typha.
+	TyphaWriteTimeout time.Duration `config:"seconds;10;local"`
 
-	// Client-side TLS config for Felix's communication with Typha.  If any of these are
-	// specified, they _all_ must be - except that either TyphaCN or TyphaURISAN may be left
-	// unset.  Felix will then initiate a secure (TLS) connection to Typha.  Typha must present
-	// a certificate signed by a CA in TyphaCAFile, and with CN matching TyphaCN or URI SAN
-	// matching TyphaURISAN.
-	TyphaKeyFile  string `config:"file(must-exist);;local"`
+	// TyphaKeyFile path to the TLS private key to use when communicating with Typha.  If this parameter is specified,
+	// the other TLS parameters must also be specified.
+	TyphaKeyFile string `config:"file(must-exist);;local"`
+	// TyphaCertFile path to the TLS certificate to use when communicating with Typha.  If this parameter is specified,
+	// the other TLS parameters must also be specified.
 	TyphaCertFile string `config:"file(must-exist);;local"`
-	TyphaCAFile   string `config:"file(must-exist);;local"`
-	TyphaCN       string `config:"string;;local"`
-	TyphaURISAN   string `config:"string;;local"`
+	// TyphaCAFile path to the TLS CA file to use when communicating with Typha.  If this parameter is specified,
+	// the other TLS parameters must also be specified.
+	TyphaCAFile string `config:"file(must-exist);;local"`
+	// TyphaCN Common name to use when authenticating to Typha over TLS. If any TLS parameters are specified then one of
+	// TyphaCN and TyphaURISAN must be set.
+	TyphaCN string `config:"string;;local"`
+	// TyphaURISAN URI SAN to use when authenticating to Typha over TLS. If any TLS parameters are specified then one of
+	// TyphaCN and TyphaURISAN must be set.
+	TyphaURISAN string `config:"string;;local"`
 
 	Ipv6Support bool `config:"bool;true"`
 
@@ -250,41 +316,45 @@ type Config struct {
 	DeviceRouteSourceAddressIPv6       net.IP            `config:"ipv6;"`
 	DeviceRouteProtocol                int               `config:"int;3"`
 	RemoveExternalRoutes               bool              `config:"bool;true"`
+	ProgramClusterRoutes               string            `config:"oneof(Enabled,Disabled,EnabledIPIPOnly,EnabledNoEncapOnly);EnabledIPIPOnly"`
+	IPForwarding                       string            `config:"oneof(Enabled,Disabled);Enabled"`
 	IptablesRefreshInterval            time.Duration     `config:"seconds;180"`
-	IptablesPostWriteCheckIntervalSecs time.Duration     `config:"seconds;5"`
-	IptablesLockFilePath               string            `config:"file;/run/xtables.lock"`
-	IptablesLockTimeoutSecs            time.Duration     `config:"seconds;0"`
-	IptablesLockProbeIntervalMillis    time.Duration     `config:"millis;50"`
+	IptablesPostWriteCheckIntervalSecs time.Duration     `config:"seconds;5"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
+	IptablesLockProbeIntervalMillis    time.Duration     `config:"millis;50"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 	FeatureDetectOverride              map[string]string `config:"keyvaluelist;;"`
 	FeatureGates                       map[string]string `config:"keyvaluelist;;"`
-	IpsetsRefreshInterval              time.Duration     `config:"seconds;10"`
+	IpsetsRefreshInterval              time.Duration     `config:"seconds;90"`
 	MaxIpsetSize                       int               `config:"int;1048576;non-zero"`
 	XDPRefreshInterval                 time.Duration     `config:"seconds;90"`
 
 	PolicySyncPathPrefix string `config:"file;;"`
 
-	NetlinkTimeoutSecs time.Duration `config:"seconds;10"`
+	NetlinkTimeoutSecs time.Duration `config:"seconds;10"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 
 	MetadataAddr string `config:"hostname;127.0.0.1;die-on-fail"`
-	MetadataPort int    `config:"int(0,65535);8775;die-on-fail"`
+	MetadataPort int    `config:"int(0:65535);8775;die-on-fail"`
 
 	OpenstackRegion string `config:"region;;die-on-fail"`
 
 	InterfacePrefix  string           `config:"iface-list;cali;non-zero,die-on-fail"`
 	InterfaceExclude []*regexp.Regexp `config:"iface-list-regexp;kube-ipvs0"`
 
-	ChainInsertMode             string `config:"oneof(insert,append);insert;non-zero,die-on-fail"`
-	DefaultEndpointToHostAction string `config:"oneof(DROP,RETURN,ACCEPT);DROP;non-zero,die-on-fail"`
-	IptablesFilterAllowAction   string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
-	IptablesMangleAllowAction   string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
-	IptablesFilterDenyAction    string `config:"oneof(DROP,REJECT);DROP;non-zero,die-on-fail"`
-	LogPrefix                   string `config:"string;calico-packet"`
+	ChainInsertMode                string `config:"oneof(insert,append);insert;non-zero,die-on-fail"`
+	DefaultEndpointToHostAction    string `config:"oneof(DROP,RETURN,ACCEPT);DROP;non-zero,die-on-fail"`
+	IptablesFilterAllowAction      string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
+	IptablesMangleAllowAction      string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
+	IptablesFilterDenyAction       string `config:"oneof(DROP,REJECT);DROP;non-zero,die-on-fail"`
+	LogPrefix                      string `config:"string;calico-packet"`
+	LogActionRateLimit             string `config:"log-rate;"`
+	LogActionRateLimitBurst        int    `config:"int(0,9999);5"`
+	LogConnectionTransitions       string `config:"oneof(Disabled,FirstResponseAfterLog);Disabled"`
+	LogConnectionTransitionsPrefix string `config:"log-prefix;calico-response"`
 
 	LogFilePath string `config:"file;/var/log/calico/felix.log;die-on-fail"`
 
-	LogSeverityFile   string `config:"oneof(DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
-	LogSeverityScreen string `config:"oneof(DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
-	LogSeveritySys    string `config:"oneof(DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
+	LogSeverityFile   string `config:"oneof(TRACE,DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
+	LogSeverityScreen string `config:"oneof(TRACE,DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
+	LogSeveritySys    string `config:"oneof(TRACE,DEBUG,INFO,WARNING,ERROR,FATAL);INFO"`
 	// LogDebugFilenameRegex controls which source code files have their Debug log output included in the logs.
 	// Only logs from files with names that match the given regular expression are included.  The filter only applies
 	// to Debug level logs.
@@ -293,6 +363,8 @@ type Config struct {
 	// Optional: VXLAN encap is now determined by the existing IP pools (Encapsulation struct)
 	VXLANEnabled         *bool  `config:"*bool;"`
 	VXLANPort            int    `config:"int;4789"`
+	VXLANSrcPortMin      int    `config:"int(0:65535);0"`
+	VXLANSrcPortMax      int    `config:"int(0:65535);0"`
 	VXLANVNI             int    `config:"int;4096"`
 	VXLANMTU             int    `config:"int;0"`
 	VXLANMTUV6           int    `config:"int;0"`
@@ -311,6 +383,18 @@ type Config struct {
 	// IPs are always programmed, regardless of this setting.
 	FloatingIPs string `config:"oneof(Enabled,Disabled);Disabled"`
 
+	// LocalSubnetL2Reachability controls whether Felix automatically responds to
+	// ARP (IPv4) and NDP (IPv6) requests on host interfaces for local pod IPs and
+	// selected LoadBalancer VIPs that overlap the host subnet. [Default: Disabled]
+	LocalSubnetL2Reachability string `config:"oneof(Disabled,PodsAndLoadBalancers);Disabled"`
+
+	// LocalSubnetL2ReachabilityRefreshInterval controls how often Felix re-announces
+	// (gratuitous ARP / unsolicited NA) every IP it proxies ARP/NDP for, keeping
+	// neighbor caches and switch forwarding tables warm even when the set of
+	// proxied IPs is unchanged. Set to 0 to disable periodic re-announcement,
+	// leaving only the one-shot announce when an IP is added. [Default: 120s]
+	LocalSubnetL2ReachabilityRefreshInterval time.Duration `config:"seconds;120"`
+
 	// WindowsManageFirewallRules configures whether or not Felix will program Windows Firewall rules. [Default: Disabled]
 	WindowsManageFirewallRules string `config:"oneof(Enabled,Disabled);Disabled"`
 
@@ -325,46 +409,59 @@ type Config struct {
 
 	WorkloadSourceSpoofing string `config:"oneof(Disabled,Any);Disabled"`
 
-	ReportingIntervalSecs time.Duration `config:"seconds;30"`
-	ReportingTTLSecs      time.Duration `config:"seconds;90"`
+	ReportingIntervalSecs time.Duration `config:"seconds;30"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
+	ReportingTTLSecs      time.Duration `config:"seconds;90"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 
 	EndpointReportingEnabled   bool          `config:"bool;false"`
-	EndpointReportingDelaySecs time.Duration `config:"seconds;1"`
+	EndpointReportingDelaySecs time.Duration `config:"seconds;1"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 
 	// EndpointStatusPathPrefix is the path to the directory
 	// where endpoint status will be written. Endpoint status
-	// file reporting is disabled if field is left empty.
+	// file reporting is disabled if field is empty.
 	//
 	// Chosen directory should match the directory used by the CNI for PodStartupDelay.
-	// [Default: ""]
-	EndpointStatusPathPrefix string `config:"file;;"`
+	// [Default: "/var/run/calico"]
+	EndpointStatusPathPrefix string `config:"file;/var/run/calico"`
 
 	IptablesMarkMask uint32 `config:"mark-bitmask;0xffff0000;non-zero,die-on-fail"`
 
 	DisableConntrackInvalidCheck bool `config:"bool;false"`
 
 	HealthEnabled          bool                     `config:"bool;false"`
-	HealthPort             int                      `config:"int(0,65535);9099"`
+	HealthPort             int                      `config:"int(0:65535);9099"`
 	HealthHost             string                   `config:"host-address;localhost"`
 	HealthTimeoutOverrides map[string]time.Duration `config:"keydurationlist;;"`
 
 	PrometheusMetricsEnabled          bool   `config:"bool;false"`
 	PrometheusMetricsHost             string `config:"host-address;"`
-	PrometheusMetricsPort             int    `config:"int(0,65535);9091"`
+	PrometheusMetricsPort             int    `config:"int(0:65535);9091"`
 	PrometheusGoMetricsEnabled        bool   `config:"bool;true"`
 	PrometheusProcessMetricsEnabled   bool   `config:"bool;true"`
 	PrometheusWireGuardMetricsEnabled bool   `config:"bool;true"`
 
+	PrometheusMetricsCAFile     string `config:"string;"`
+	PrometheusMetricsCertFile   string `config:"string;"`
+	PrometheusMetricsKeyFile    string `config:"string;"`
+	PrometheusMetricsClientAuth string `config:"oneof(RequireAndVerifyClientCert,RequireAnyClientCert,VerifyClientCertIfGiven,NoClientCert);NoClientCert"`
+
 	FailsafeInboundHostPorts  []ProtoPort `config:"port-list;tcp:22,udp:68,tcp:179,tcp:2379,tcp:2380,tcp:5473,tcp:6443,tcp:6666,tcp:6667;die-on-fail"`
 	FailsafeOutboundHostPorts []ProtoPort `config:"port-list;udp:53,udp:67,tcp:179,tcp:2379,tcp:2380,tcp:5473,tcp:6443,tcp:6666,tcp:6667;die-on-fail"`
 
-	KubeNodePortRanges []numorstring.Port `config:"portrange-list;30000:32767"`
-	NATPortRange       numorstring.Port   `config:"portrange;"`
-	NATOutgoingAddress net.IP             `config:"ipv4;"`
+	FlowLogsFlushInterval        time.Duration `config:"seconds;300"`
+	FlowLogsCollectorDebugTrace  bool          `config:"bool;false"`
+	FlowLogsGoldmaneServer       string        `config:"string;"`
+	FlowLogsGoldmaneIncludeIPs   string        `config:"oneof(Enabled,Disabled);Enabled"`
+	FlowLogsLocalReporter        string        `config:"oneof(Enabled,Disabled);Disabled"`
+	FlowLogsPolicyEvaluationMode string        `config:"oneof(None,Continuous);Continuous"`
+
+	KubeNodePortRanges    []numorstring.Port `config:"portrange-list;30000:32767"`
+	NATPortRange          numorstring.Port   `config:"portrange;"`
+	NATOutgoingAddress    net.IP             `config:"ipv4;"`
+	NATOutgoingExclusions string             `config:"oneof(IPPoolsOnly,IPPoolsAndHostIPs);IPPoolsOnly"`
 
 	UsageReportingEnabled          bool          `config:"bool;true"`
-	UsageReportingInitialDelaySecs time.Duration `config:"seconds;300"`
-	UsageReportingIntervalSecs     time.Duration `config:"seconds;86400"`
+	UsageReportingInitialDelaySecs time.Duration `config:"seconds;300"`   //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
+	UsageReportingIntervalSecs     time.Duration `config:"seconds;86400"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 	ClusterGUID                    string        `config:"string;baddecaf"`
 	ClusterType                    string        `config:"string;"`
 	CalicoVersion                  string        `config:"string;"`
@@ -382,7 +479,7 @@ type Config struct {
 	// DebugHost is the host to bind the debug server port to.  Only used if DebugPort is non-zero.
 	DebugHost string `config:"host-address;localhost"`
 	// DebugPort is the port to bind the pprof debug server to or 0 to disable the debug port.
-	DebugPort int `config:"int(0,65535);"`
+	DebugPort int `config:"int(0:65535);"`
 
 	// Configure where Felix gets its routing information.
 	// - workloadIPs: use workload endpoints to construct routes.
@@ -394,6 +491,14 @@ type Config struct {
 	RouteTableRanges  []idalloc.IndexRange `config:"route-table-ranges;;die-on-fail"`
 	RouteSyncDisabled bool                 `config:"bool;false"`
 
+	// Routing priority values.
+	IPv4NormalRoutePriority   int `config:"int(1:2147483646);1024"`
+	IPv4ElevatedRoutePriority int `config:"int(1:2147483646);512"`
+	IPv6NormalRoutePriority   int `config:"int(1:2147483646);1024"`
+	IPv6ElevatedRoutePriority int `config:"int(1:2147483646);512"`
+
+	LiveMigrationRouteConvergenceTime time.Duration `config:"seconds;30"`
+
 	IptablesNATOutgoingInterfaceFilter string `config:"iface-param;"`
 
 	SidecarAccelerationEnabled bool `config:"bool;false"`
@@ -402,11 +507,37 @@ type Config struct {
 
 	Variant string `config:"string;Calico"`
 
+	// GoGCThreshold sets the Go runtime's GC threshold.  It is overridden by the GOGC env var if that is also
+	// specified. A value of -1 disables GC.
+	GoGCThreshold int `config:"int(-1);40"`
+	// GoMemoryLimitMB sets the Go runtime's memory limit.  It is overridden by the GOMEMLIMIT env var if that is
+	// also specified. A value of -1 disables the limit.
+	GoMemoryLimitMB int `config:"int(-1);-1"`
+	// GoMaxProcs sets the Go runtime's GOMAXPROCS.  It is overridden by the GOMAXPROCS env var if that is also
+	// set. A value of -1 disables the override and uses the runtime default.
+	GoMaxProcs int `config:"int(-1);-1"`
+
 	// Configures MTU auto-detection.
 	MTUIfacePattern *regexp.Regexp `config:"regexp;^((en|wl|ww|sl|ib)[Pcopsvx].*|(eth|wlan|wwan).*)"`
 
 	// Encapsulation information calculated from IP Pools and FelixConfiguration (VXLANEnabled and IpInIpEnabled)
 	Encapsulation Encapsulation
+
+	// NFTablesEnabled is the dataplane that NFTablesMode resolves to on this host, decided at
+	// startup because Auto mode depends on runtime detection.
+	NFTablesEnabled bool
+
+	// NftablesRefreshInterval controls the interval at which Felix periodically refreshes the nftables rules. [Default: 180s]
+	NftablesRefreshInterval time.Duration `config:"seconds;180"`
+
+	NftablesFilterAllowAction string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
+	NftablesMangleAllowAction string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
+	NftablesFilterDenyAction  string `config:"oneof(DROP,REJECT);DROP;non-zero,die-on-fail"`
+
+	// MarkMask is the mask that Felix selects its nftables Mark bits from. Should be a 32 bit hexadecimal
+	// number with at least 8 bits set, none of which clash with any other mark bits in use on the system.
+	// [Default: 0xffff0000]
+	NftablesMarkMask uint32 `config:"mark-bitmask;0xffff0000;non-zero,die-on-fail"`
 
 	// State tracking.
 
@@ -422,7 +553,80 @@ type Config struct {
 
 	loadClientConfigFromEnvironment func() (*apiconfig.CalicoAPIConfig, error)
 
-	useNodeResourceUpdates bool
+	RequireMTUFile bool `config:"bool;false"`
+
+	// BPFMaglevMaxEndpointsPerService is the maximum number of endpoints
+	// expected to be part of a single Maglev-enabled service.
+	//
+	// Influences the size of the per-service Maglev lookup-tables generated by Felix
+	// and thus the amount of memory reserved.
+	BPFMaglevMaxEndpointsPerService int `config:"int(1:3000);100"`
+
+	// BPFMaglevMaxServices is the maximum number of expected Maglev-enabled
+	// services that Felix will allocate lookup-tables for.
+	BPFMaglevMaxServices int `config:"int(1:3000);100"`
+}
+
+func (config *Config) FilterAllowAction() string {
+	if config.NFTablesEnabled {
+		return config.NftablesFilterAllowAction
+	}
+	return config.IptablesFilterAllowAction
+}
+
+func (config *Config) MangleAllowAction() string {
+	if config.NFTablesEnabled {
+		return config.NftablesMangleAllowAction
+	}
+	return config.IptablesMangleAllowAction
+}
+
+func (config *Config) FilterDenyAction() string {
+	if config.NFTablesEnabled {
+		return config.NftablesFilterDenyAction
+	}
+	return config.IptablesFilterDenyAction
+}
+
+func (config *Config) MarkMask() uint32 {
+	if config.NFTablesEnabled {
+		return config.NftablesMarkMask
+	}
+	return config.IptablesMarkMask
+}
+
+func (config *Config) TableRefreshInterval() time.Duration {
+	if config.NFTablesEnabled {
+		return config.NftablesRefreshInterval
+	}
+	return config.IptablesRefreshInterval
+}
+
+func (config *Config) FlowLogsLocalReporterEnabled() bool {
+	return config.FlowLogsLocalReporter == "Enabled"
+}
+
+func (config *Config) FlowLogsGoldmaneIncludeIPsEnabled() bool {
+	return config.FlowLogsGoldmaneIncludeIPs == "Enabled"
+}
+
+func (config *Config) FlowLogsEnabled() bool {
+	return config.FlowLogsGoldmaneServer != "" ||
+		config.FlowLogsLocalReporterEnabled()
+}
+
+// ProgramIPIPClusterRoutes returns whether Felix should program the cluster routes for IP Pools
+// with ipipMode Always or CrossSubnet.  When it returns false, confd and BIRD are expected to
+// program those routes instead; that is deprecated as of v3.33.
+func (config *Config) ProgramIPIPClusterRoutes() bool {
+	return config.ProgramClusterRoutes == v3.Enabled || config.ProgramClusterRoutes == v3.EnabledIPIPOnly
+}
+
+// ProgramNoEncapClusterRoutes returns whether Felix should program the cluster routes for
+// unencapsulated IP Pools (ipipMode and vxlanMode both Never).  When it returns false, confd and
+// BIRD are expected to program those routes instead.
+func (config *Config) ProgramNoEncapClusterRoutes() bool {
+	return config.ProgramClusterRoutes == v3.Enabled || config.ProgramClusterRoutes == v3.EnabledNoEncapOnly
 }
 
 // Copy makes a copy of the object.  Internal state is deep copied but config parameters are only shallow copied.
@@ -433,30 +637,27 @@ func (config *Config) Copy() *Config {
 
 	// Copy the internal state over as a deep copy.
 	cp.internalOverrides = map[string]string{}
-	for k, v := range config.internalOverrides {
-		cp.internalOverrides[k] = v
-	}
+	maps.Copy(cp.internalOverrides, config.internalOverrides)
 
 	cp.sourceToRawConfig = map[Source]map[string]string{}
 	for k, v := range config.sourceToRawConfig {
 		cp.sourceToRawConfig[k] = map[string]string{}
-		for k2, v2 := range v {
-			cp.sourceToRawConfig[k][k2] = v2
-		}
+		maps.Copy(cp.sourceToRawConfig[k], v)
 	}
 
 	cp.rawValues = map[string]string{}
-	for k, v := range config.rawValues {
-		cp.rawValues[k] = v
-	}
+	maps.Copy(cp.rawValues, config.rawValues)
 
 	return &cp
 }
 
-type ProtoPort struct {
-	Net      string
-	Protocol string
-	Port     uint16
+// ProtoPort aliases the v3 type so that we pick up its JSON encoding, which is
+// used by the documentation generator.
+type ProtoPort = v3.ProtoPort
+
+type ServerPort struct {
+	IP   string
+	Port uint16
 }
 
 func (config *Config) ToConfigUpdate() *proto.ConfigUpdate {
@@ -465,9 +666,7 @@ func (config *Config) ToConfigUpdate() *proto.ConfigUpdate {
 	buf.SourceToRawConfig = map[uint32]*proto.RawConfig{}
 	for source, c := range config.sourceToRawConfig {
 		kvs := map[string]string{}
-		for k, v := range c {
-			kvs[k] = v
-		}
+		maps.Copy(kvs, c)
 		buf.SourceToRawConfig[uint32(source)] = &proto.RawConfig{
 			Source: source.String(),
 			Config: kvs,
@@ -475,9 +674,7 @@ func (config *Config) ToConfigUpdate() *proto.ConfigUpdate {
 	}
 
 	buf.Config = map[string]string{}
-	for k, v := range config.rawValues {
-		buf.Config[k] = v
-	}
+	maps.Copy(buf.Config, config.rawValues)
 
 	return &buf
 }
@@ -488,9 +685,7 @@ func (config *Config) UpdateFromConfigUpdate(configUpdate *proto.ConfigUpdate) (
 	for sourceInt, c := range configUpdate.GetSourceToRawConfig() {
 		source := Source(sourceInt)
 		config.sourceToRawConfig[source] = map[string]string{}
-		for k, v := range c.GetConfig() {
-			config.sourceToRawConfig[source][k] = v
-		}
+		maps.Copy(config.sourceToRawConfig[source], c.GetConfig())
 	}
 	// Note: the ConfigUpdate also carries the rawValues, but we recalculate those by calling resolve(),
 	// which tells us if anything changed as a result.
@@ -551,11 +746,9 @@ func (config *Config) OpenstackActive() bool {
 		log.Debug("OpenStack metadata port set to non-default, assuming OpenStack active")
 		return true
 	}
-	for _, prefix := range config.InterfacePrefixes() {
-		if prefix == "tap" {
-			log.Debug("Interface prefix list contains 'tap', assuming OpenStack")
-			return true
-		}
+	if slices.Contains(config.InterfacePrefixes(), "tap") {
+		log.Debug("Interface prefix list contains 'tap', assuming OpenStack")
+		return true
 	}
 	log.Debug("No evidence this is an OpenStack deployment; disabling OpenStack special-cases")
 	return false
@@ -564,8 +757,8 @@ func (config *Config) OpenstackActive() bool {
 // KubernetesProvider attempts to parse the kubernetes provider, e.g. AKS out of the ClusterType.
 // The ClusterType is a string which contains a set of comma-separated values in no particular order.
 func (config *Config) KubernetesProvider() Provider {
-	settings := strings.Split(config.ClusterType, ",")
-	for _, s := range settings {
+	settings := strings.SplitSeq(config.ClusterType, ",")
+	for s := range settings {
 		p, err := newProvider(s)
 		if err == nil {
 			log.WithFields(log.Fields{"clusterType": config.ClusterType, "provider": p}).Debug(
@@ -577,6 +770,14 @@ func (config *Config) KubernetesProvider() Provider {
 	log.WithField("clusterType", config.ClusterType).Debug(
 		"failed to detect a known kubernetes provider, defaulting to none")
 	return ProviderNone
+}
+
+func (config *Config) BPFLUTSizeMaglev() int {
+	return int(consistenthash.NextPrimeUint16(config.BPFMaglevMaxEndpointsPerService * consistenthash.MaglevEndpointLUTFactor))
+}
+
+func (config *Config) BPFMapSizeMaglev() int {
+	return int(config.BPFLUTSizeMaglev()) * config.BPFMaglevMaxServices
 }
 
 func (config *Config) applyDefaults() {
@@ -627,14 +828,14 @@ func (config *Config) resolve() (changedFields set.Set[string], err error) {
 			metadata := param.GetMetadata()
 			name := metadata.Name
 			if metadata.Local && !source.Local() {
-				log.Warningf("Ignoring local-only configuration for %v from %v",
-					name, source)
+				log.Warningf("Ignoring local-only configuration %v=%q from %v",
+					name, rawValue, source)
 				continue valueLoop
 			}
 
 			log.Infof("Parsing value for %v: %v (from %v)",
 				name, rawValue, source)
-			var value interface{}
+			var value any
 			if strings.ToLower(rawValue) == "none" {
 				// Special case: we allow a value of "none" to force the value to
 				// the zero value for a field.  The zero value often differs from
@@ -683,9 +884,8 @@ func (config *Config) resolve() (changedFields set.Set[string], err error) {
 		}
 	}
 
-	log.WithField("changedFields", changedFields).Debug("Calculated changed fields.")
 	changedFields = set.New[string]()
-	kind := reflect.TypeOf(Config{})
+	kind := reflect.TypeFor[Config]()
 	for ii := 0; ii < kind.NumField(); ii++ {
 		field := kind.Field(ii)
 		tag := field.Tag.Get("config")
@@ -701,6 +901,7 @@ func (config *Config) resolve() (changedFields set.Set[string], err error) {
 		}
 		changedFields.Add(field.Name)
 	}
+	log.WithField("changedFields", changedFields).Debug("Calculated changed fields.")
 
 	config.rawValues = newRawValues
 	return
@@ -724,7 +925,7 @@ func SafeParamsEqual(a any, b any) bool {
 		if len(a) != len(b) {
 			return false
 		}
-		for i := 0; i < len(a); i++ {
+		for i := range a {
 			if (a[i] == nil) || (b[i] == nil) {
 				if a[i] == b[i] {
 					continue
@@ -746,8 +947,8 @@ func SafeParamsEqual(a any, b any) bool {
 }
 
 func (config *Config) setBy(name string, source Source) bool {
-	_, set := config.sourceToRawConfig[source][name]
-	return set
+	_, isSet := config.sourceToRawConfig[source][name]
+	return isSet
 }
 
 func (config *Config) setByConfigFileOrEnvironment(name string) bool {
@@ -810,7 +1011,7 @@ func (config *Config) DatastoreConfig() apiconfig.CalicoAPIConfig {
 		cfg.Spec.EtcdCACertFile = config.EtcdCaFile
 	}
 
-	if !(config.Encapsulation.IPIPEnabled || config.Encapsulation.VXLANEnabled || config.BPFEnabled) {
+	if !config.Encapsulation.IPIPEnabled && !config.Encapsulation.VXLANEnabled && !config.BPFEnabled {
 		// Polling k8s for node updates is expensive (because we get many superfluous
 		// updates) so disable if we don't need it.
 		log.Info("Encap disabled, disabling node poll (if KDD is in use).")
@@ -822,15 +1023,15 @@ func (config *Config) DatastoreConfig() apiconfig.CalicoAPIConfig {
 // Validate() performs cross-field validation.
 func (config *Config) Validate() (err error) {
 	if config.FelixHostname == "" {
-		err = errors.New("Failed to determine hostname")
+		err = errors.New("failed to determine hostname")
 	}
 
 	if config.DatastoreType == "etcdv3" && len(config.EtcdEndpoints) == 0 {
 		if config.EtcdScheme == "" {
-			err = errors.New("EtcdEndpoints and EtcdScheme both missing")
+			err = errors.New("both EtcdEndpoints and EtcdScheme are missing")
 		}
 		if config.EtcdAddr == "" {
-			err = errors.New("EtcdEndpoints and EtcdAddr both missing")
+			err = errors.New("both EtcdEndpoints and EtcdAddr are missing")
 		}
 	}
 
@@ -846,10 +1047,21 @@ func (config *Config) Validate() (err error) {
 			config.TyphaCertFile == "" ||
 			config.TyphaCAFile == "" ||
 			(config.TyphaCN == "" && config.TyphaURISAN == "") {
-			err = errors.New("If any Felix-Typha TLS config parameters are specified," +
+			err = errors.New("if any Felix-Typha TLS config parameters are specified," +
 				" they _all_ must be" +
-				" - except that either TyphaCN or TyphaURISAN may be left unset.")
+				" - except that either TyphaCN or TyphaURISAN may be left unset")
 		}
+	}
+
+	// VXLAN source-port range: either both ends are unset (use kernel/dataplane
+	// default) or both ends are set with min strictly less than max -- a
+	// single-port "range" is degenerate and is not honoured uniformly across
+	// dataplanes.
+	if (config.VXLANSrcPortMin == 0) != (config.VXLANSrcPortMax == 0) {
+		err = errors.New("VXLANSrcPortMin and VXLANSrcPortMax must both be set or both be unset")
+	} else if config.VXLANSrcPortMin != 0 && config.VXLANSrcPortMin >= config.VXLANSrcPortMax {
+		err = fmt.Errorf("VXLANSrcPortMin (%d) must be strictly less than VXLANSrcPortMax (%d)",
+			config.VXLANSrcPortMin, config.VXLANSrcPortMax)
 	}
 
 	if err != nil {
@@ -858,153 +1070,191 @@ func (config *Config) Validate() (err error) {
 	return
 }
 
-var knownParams map[string]param
+var knownParams map[string]Param
+
+func Params() map[string]Param {
+	if knownParams == nil {
+		loadParams()
+	}
+	return knownParams
+}
+
+var metaRegexp = regexp.MustCompile(`^([^;(]+)(?:\(([^)]*)\))?;` +
+	`([^;]*)(?:;` +
+	`([^;]*))?$`)
+
+func ParamForField(fieldName string, tag string) (param Param, defaultStr, flags string) {
+	captures := metaRegexp.FindStringSubmatch(tag)
+	if len(captures) == 0 {
+		log.Panicf("Failed to parse metadata for config param %v", fieldName)
+	}
+	log.Debugf("%v: metadata captures: %#v", fieldName, captures)
+	kind := captures[1]       // Type: "int|oneof|bool|port-list|..."
+	kindParams := captures[2] // Parameters for the type: e.g. for oneof "http,https"
+	defaultStr = captures[3]  // Default value e.g "1.0"
+	flags = captures[4]
+	switch kind {
+	case "bool":
+		param = &BoolParam{}
+	case "*bool":
+		param = &BoolPtrParam{}
+	case "int":
+		intParam := &IntParam{}
+		for r := range strings.SplitSeq(kindParams, ",") {
+			minAndMax := strings.Split(r, ":")
+			paramMin := mustParseOptionalInt(minAndMax[0], math.MinInt, fieldName)
+			paramMax := math.MaxInt
+			if len(minAndMax) == 2 {
+				paramMax = mustParseOptionalInt(minAndMax[1], math.MaxInt, fieldName)
+			}
+			intParam.Ranges = append(intParam.Ranges, MinMax{Min: paramMin, Max: paramMax})
+		}
+		param = intParam
+	case "int32":
+		param = &Int32Param{}
+	case "mark-bitmask":
+		param = &MarkBitmaskParam{}
+	case "float":
+		param = &FloatParam{}
+	case "seconds":
+		paramMin := math.MinInt
+		paramMax := math.MaxInt
+		var err error
+		if kindParams != "" {
+			minAndMax := strings.Split(kindParams, ":")
+			paramMin, err = strconv.Atoi(minAndMax[0])
+			if err != nil {
+				log.Panicf("Failed to parse min value for %v", fieldName)
+			}
+			paramMax, err = strconv.Atoi(minAndMax[1])
+			if err != nil {
+				log.Panicf("Failed to parse max value for %v", fieldName)
+			}
+		}
+		param = &SecondsParam{Min: paramMin, Max: paramMax}
+	case "millis":
+		param = &MillisParam{}
+	case "iface-list":
+		param = &RegexpParam{
+			Regexp: IfaceListRegexp,
+			Msg:    "invalid Linux interface name",
+		}
+	case "iface-list-regexp":
+		param = &RegexpPatternListParam{
+			NonRegexpElemRegexp: NonRegexpIfaceElemRegexp,
+			RegexpElemRegexp:    RegexpIfaceElemRegexp,
+			Delimiter:           ",",
+			Msg:                 "list contains invalid Linux interface name or regex pattern",
+			Schema:              "Comma-delimited list of Linux interface names/regex patterns. Regex patterns must start/end with `/`.",
+		}
+	case "log-rate":
+		param = &RegexpParam{
+			Regexp: LogActionRateRegexp,
+			Msg:    "invalid log rate limit",
+		}
+	case "log-prefix":
+		param = &RegexpParam{
+			Regexp: LogPrefixRegexp,
+			Msg:    "invalid log prefix",
+		}
+	case "regexp":
+		param = &RegexpPatternParam{
+			Flags: strings.Split(kindParams, ","),
+		}
+	case "iface-param":
+		param = &RegexpParam{
+			Regexp: IfaceParamRegexp,
+			Msg:    "invalid Linux interface parameter",
+		}
+	case "file":
+		param = &FileParam{
+			MustExist:  strings.Contains(kindParams, "must-exist"),
+			Executable: strings.Contains(kindParams, "executable"),
+		}
+	case "authority":
+		param = &RegexpParam{
+			Regexp: AuthorityRegexp,
+			Msg:    "invalid URL authority",
+		}
+	case "ipv4":
+		param = &Ipv4Param{}
+	case "ipv6":
+		param = &Ipv6Param{}
+	case "endpoint-list":
+		param = &EndpointListParam{}
+	case "port-list":
+		param = &PortListParam{}
+	case "portrange":
+		param = &PortRangeParam{}
+	case "portrange-list":
+		param = &PortRangeListParam{}
+	case "hostname":
+		param = &RegexpParam{
+			Regexp: HostnameRegexp,
+			Msg:    "invalid hostname",
+		}
+	case "host-address":
+		param = &RegexpParam{
+			Regexp: HostAddressRegexp,
+			Msg:    "invalid host address",
+		}
+	case "region":
+		param = &RegionParam{}
+	case "oneof":
+		options := strings.Split(kindParams, ",")
+		lowerCaseToCanon := make(map[string]string)
+		for _, option := range options {
+			lowerCaseToCanon[strings.ToLower(option)] = option
+		}
+		param = &OneofListParam{
+			lowerCaseOptionsToCanonical: lowerCaseToCanon,
+		}
+	case "string":
+		param = &RegexpParam{
+			Regexp: StringRegexp,
+			Msg:    "invalid string",
+		}
+	case "cidr-list":
+		param = &CIDRListParam{}
+	case "server-list":
+		param = &ServerListParam{}
+	case "string-slice":
+		param = &StringSliceParam{}
+	case "interface-name-slice":
+		param = &StringSliceParam{ValidationRegex: InterfaceRegex}
+	case "iface-filter-slice":
+		param = &StringSliceParam{ValidationRegex: IfaceParamRegexp}
+	case "route-table-range":
+		param = &RouteTableRangeParam{}
+	case "route-table-ranges":
+		param = &RouteTableRangesParam{}
+	case "keyvaluelist":
+		param = &KeyValueListParam{}
+	case "keydurationlist":
+		param = &KeyDurationListParam{}
+	case "dscp":
+		param = &DSCPParam{}
+	default:
+		log.Panicf("Unknown type of parameter: %v", kind)
+		panic("Unknown type of parameter") // Unreachable, keep the linter happy.
+	}
+	return
+}
 
 func loadParams() {
-	knownParams = make(map[string]param)
+	knownParams = make(map[string]Param)
 	config := Config{}
-	kind := reflect.TypeOf(config)
-	metaRegexp := regexp.MustCompile(`^([^;(]+)(?:\(([^)]*)\))?;` +
-		`([^;]*)(?:;` +
-		`([^;]*))?$`)
+	kind := reflect.TypeFor[Config]()
 	for ii := 0; ii < kind.NumField(); ii++ {
 		field := kind.Field(ii)
 		tag := field.Tag.Get("config")
 		if tag == "" {
 			continue
 		}
-		captures := metaRegexp.FindStringSubmatch(tag)
-		if len(captures) == 0 {
-			log.Panicf("Failed to parse metadata for config param %v", field.Name)
-		}
-		log.Debugf("%v: metadata captures: %#v", field.Name, captures)
-		kind := captures[1]       // Type: "int|oneof|bool|port-list|..."
-		kindParams := captures[2] // Parameters for the type: e.g. for oneof "http,https"
-		defaultStr := captures[3] // Default value e.g "1.0"
-		flags := captures[4]
-		var param param
-		var err error
-		switch kind {
-		case "bool":
-			param = &BoolParam{}
-		case "*bool":
-			param = &BoolPtrParam{}
-		case "int":
-			min := minInt
-			max := maxInt
-			if kindParams != "" {
-				minAndMax := strings.Split(kindParams, ",")
-				min, err = strconv.Atoi(minAndMax[0])
-				if err != nil {
-					log.Panicf("Failed to parse min value for %v", field.Name)
-				}
-				max, err = strconv.Atoi(minAndMax[1])
-				if err != nil {
-					log.Panicf("Failed to parse max value for %v", field.Name)
-				}
-			}
-			param = &IntParam{Min: min, Max: max}
-		case "int32":
-			param = &Int32Param{}
-		case "mark-bitmask":
-			param = &MarkBitmaskParam{}
-		case "float":
-			param = &FloatParam{}
-		case "seconds":
-			param = &SecondsParam{}
-		case "millis":
-			param = &MillisParam{}
-		case "iface-list":
-			param = &RegexpParam{
-				Regexp: IfaceListRegexp,
-				Msg:    "invalid Linux interface name",
-			}
-		case "iface-list-regexp":
-			param = &RegexpPatternListParam{
-				NonRegexpElemRegexp: NonRegexpIfaceElemRegexp,
-				RegexpElemRegexp:    RegexpIfaceElemRegexp,
-				Delimiter:           ",",
-				Msg:                 "list contains invalid Linux interface name or regex pattern",
-			}
-		case "regexp":
-			param = &RegexpPatternParam{
-				Flags: strings.Split(kindParams, ","),
-			}
-		case "iface-param":
-			param = &RegexpParam{
-				Regexp: IfaceParamRegexp,
-				Msg:    "invalid Linux interface parameter",
-			}
-		case "file":
-			param = &FileParam{
-				MustExist:  strings.Contains(kindParams, "must-exist"),
-				Executable: strings.Contains(kindParams, "executable"),
-			}
-		case "authority":
-			param = &RegexpParam{
-				Regexp: AuthorityRegexp,
-				Msg:    "invalid URL authority",
-			}
-		case "ipv4":
-			param = &Ipv4Param{}
-		case "ipv6":
-			param = &Ipv6Param{}
-		case "endpoint-list":
-			param = &EndpointListParam{}
-		case "port-list":
-			param = &PortListParam{}
-		case "portrange":
-			param = &PortRangeParam{}
-		case "portrange-list":
-			param = &PortRangeListParam{}
-		case "hostname":
-			param = &RegexpParam{
-				Regexp: HostnameRegexp,
-				Msg:    "invalid hostname",
-			}
-		case "host-address":
-			param = &RegexpParam{
-				Regexp: HostAddressRegexp,
-				Msg:    "invalid host address",
-			}
-		case "region":
-			param = &RegionParam{}
-		case "oneof":
-			options := strings.Split(kindParams, ",")
-			lowerCaseToCanon := make(map[string]string)
-			for _, option := range options {
-				lowerCaseToCanon[strings.ToLower(option)] = option
-			}
-			param = &OneofListParam{
-				lowerCaseOptionsToCanonical: lowerCaseToCanon,
-			}
-		case "string":
-			param = &RegexpParam{
-				Regexp: StringRegexp,
-				Msg:    "invalid string",
-			}
-		case "cidr-list":
-			param = &CIDRListParam{}
-		case "string-slice":
-			param = &StringSliceParam{}
-		case "interface-name-slice":
-			param = &StringSliceParam{ValidationRegex: InterfaceRegex}
-		case "iface-filter-slice":
-			param = &StringSliceParam{ValidationRegex: IfaceParamRegexp}
-		case "route-table-range":
-			param = &RouteTableRangeParam{}
-		case "route-table-ranges":
-			param = &RouteTableRangesParam{}
-		case "keyvaluelist":
-			param = &KeyValueListParam{}
-		case "keydurationlist":
-			param = &KeyDurationListParam{}
-		default:
-			log.Panicf("Unknown type of parameter: %v", kind)
-		}
-
+		param, defaultStr, flags := ParamForField(field.Name, tag)
 		metadata := param.GetMetadata()
 		metadata.Name = field.Name
+		metadata.Type = field.Type.String()
 		metadata.ZeroValue = reflect.ValueOf(config).FieldByName(field.Name).Interface()
 		if strings.Contains(flags, "non-zero") {
 			metadata.NonZero = true
@@ -1036,19 +1286,23 @@ func loadParams() {
 	}
 }
 
-func (config *Config) SetUseNodeResourceUpdates(b bool) {
-	config.useNodeResourceUpdates = b
-}
-
-func (config *Config) UseNodeResourceUpdates() bool {
-	return config.useNodeResourceUpdates
+// mustParseOptionalInt returns defaultVal if the given value is empty, otherwise parses the value as an int.
+// Panics if the value is not a valid int.
+func mustParseOptionalInt(rawValue string, defaultVal int, fieldName string) int {
+	rawValue = strings.TrimSpace(rawValue)
+	if rawValue == "" {
+		return defaultVal
+	}
+	value, err := strconv.Atoi(rawValue)
+	if err != nil {
+		log.Panicf("Failed to parse value %q for %v", rawValue, fieldName)
+	}
+	return value
 }
 
 func (config *Config) RawValues() map[string]string {
 	cp := map[string]string{}
-	for k, v := range config.rawValues {
-		cp[k] = v
-	}
+	maps.Copy(cp, config.rawValues)
 	return cp
 }
 
@@ -1067,7 +1321,7 @@ func (config *Config) OverrideParam(name, value string) (bool, error) {
 // RouteTableIndices compares provided args for the deprecated RoutTableRange arg
 // and the newer RouteTableRanges arg, giving precedence to the newer arg if it's explicitly-set
 func (config *Config) RouteTableIndices() []idalloc.IndexRange {
-	if config.RouteTableRanges == nil || len(config.RouteTableRanges) == 0 {
+	if len(config.RouteTableRanges) == 0 {
 		if config.RouteTableRange != (idalloc.IndexRange{}) {
 			log.Warn("Proceeding with `RouteTableRange` config option. This field has been deprecated in favor of `RouteTableRanges`.")
 			return []idalloc.IndexRange{
@@ -1077,12 +1331,21 @@ func (config *Config) RouteTableIndices() []idalloc.IndexRange {
 
 		// default RouteTableRanges val
 		return []idalloc.IndexRange{
-			{Min: 1, Max: 250},
+			{Min: clientv3.DefaultFelixRouteTableRangeMin, Max: clientv3.DefaultFelixRouteTableRangeMax},
 		}
 	} else if config.RouteTableRange != (idalloc.IndexRange{}) {
 		log.Warn("Both `RouteTableRanges` and deprecated `RouteTableRange` options are set. `RouteTableRanges` value will be given precedence.")
 	}
-	return config.RouteTableRanges
+	// Clone so that callers cannot mutate our copy of the config.
+	return slices.Clone(config.RouteTableRanges)
+}
+
+func (config *Config) GetBPFAttachType() v3.BPFAttachOption {
+	return v3.BPFAttachOption(config.BPFAttachType)
+}
+
+func (config *Config) IsIstioAmbientModeEnabled() bool {
+	return config.IstioAmbientMode == "Enabled"
 }
 
 func New() *Config {
@@ -1100,14 +1363,25 @@ func New() *Config {
 	return p
 }
 
-type param interface {
+type Param interface {
 	GetMetadata() *Metadata
-	Parse(raw string) (result interface{}, err error)
+	Parse(raw string) (result any, err error)
 	setDefault(*Config)
+	SchemaDescription() string
+}
+
+func FromConfigUpdate(msg *proto.ConfigUpdate) *Config {
+	p := New()
+	_, err := p.UpdateFromConfigUpdate(msg)
+	if err != nil {
+		log.WithError(err).Panic("Failed to convert ConfigUpdate back to Config.")
+	}
+	return p
 }
 
 type Encapsulation struct {
 	IPIPEnabled    bool
 	VXLANEnabled   bool
 	VXLANEnabledV6 bool
+	NoEncapNeeded  bool
 }

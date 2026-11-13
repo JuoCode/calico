@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,11 @@ package calc
 import (
 	"crypto/sha256"
 	"encoding/base64"
-
-	log "github.com/sirupsen/logrus"
+	"maps"
 
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -63,9 +64,9 @@ func fillInRuleIDs(rules []*proto.Rule, ruleIDSeed string) {
 		// library.
 		// TODO(smc) Can we do better than hashing the protobuf?
 		rule.RuleId = ""
-		data, err := rule.Marshal()
+		data, err := googleproto.Marshal(rule)
 		if err != nil {
-			log.WithError(err).WithField("rule", rule).Panic("Failed to marshal rule")
+			log.WithError(err).WithField("rule", rule.String()).Panic("Failed to marshal rule")
 		}
 		_, err = s.Write(data)
 		if err != nil {
@@ -154,7 +155,7 @@ func parsedRuleToProtoRule(in *ParsedRule) *proto.Rule {
 				protoMatch := &proto.HTTPMatch_PathMatch_Prefix{Prefix: pathMatch.Prefix}
 				paths = append(paths, &proto.HTTPMatch_PathMatch{PathMatch: protoMatch})
 			} else {
-				log.Error("Ignoring unknown patch match type", pathMatch)
+				log.Error("Ignoring unknown path match type", pathMatch)
 			}
 		}
 		if len(paths) > 0 {
@@ -169,9 +170,7 @@ func parsedRuleToProtoRule(in *ParsedRule) *proto.Rule {
 	if in.Metadata != nil {
 		if in.Metadata.Annotations != nil {
 			out.Metadata = &proto.RuleMetadata{Annotations: make(map[string]string)}
-			for k, v := range in.Metadata.Annotations {
-				out.Metadata.Annotations[k] = v
-			}
+			maps.Copy(out.Metadata.Annotations, in.Metadata.Annotations)
 		}
 	}
 

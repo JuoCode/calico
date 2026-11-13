@@ -16,12 +16,14 @@ package labelindex_test
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
@@ -29,12 +31,14 @@ import (
 
 	"github.com/projectcalico/calico/felix/ip"
 	. "github.com/projectcalico/calico/felix/labelindex"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
+	"github.com/projectcalico/calico/lib/logrusr"
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	calinet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 var (
@@ -359,24 +363,24 @@ var (
 				},
 				"hasAHTTP": {
 					Selector: "has(a)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasAAndBHTTP": {
 					// This gives more than one ScanStrategy to evaluate.
 					Selector: "has(a) && has(b)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasBHTTP": {
 					Selector: "has(b)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasBAndParentAHTTP": {
 					// This compares a parent and an endpoint ScanStrategy.
 					Selector: "has(b) && has(parentLabelA)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 			},
@@ -535,24 +539,24 @@ var (
 				},
 				"hasAHTTP": {
 					Selector: "has(a)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasAAndBHTTP": {
 					// This gives more than one ScanStrategy to evaluate.
 					Selector: "has(a) && has(b)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasBHTTP": {
 					Selector: "has(b)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 				"hasBAndParentAHTTP": {
 					// This compares a parent and an endpoint ScanStrategy.
 					Selector: "has(b) && has(parentLabelA)",
-					Protocol: ProtocolTCP,
+					Protocol: ipsetmember.ProtocolTCP,
 					Port:     "http",
 				},
 			},
@@ -910,13 +914,14 @@ var (
 )
 
 func TestNamedPortIndex(t *testing.T) {
+	logrusr.ConfigureLoggingForTestingT(t)
 	log.SetLevel(log.DebugLevel)
 
 	for _, state := range baseTests {
 		// First run each base test as-is: just apply its inputs and
 		// check that we get the right output.
-		t.Run(state.Name, func(t *testing.T) {
-			idx := NewSelectorAndNamedPortIndex()
+		t.Run("Base "+state.Name, func(t *testing.T) {
+			idx := NewSelectorAndNamedPortIndex(false)
 			RegisterTestingT(t)
 			rec := newRecorder()
 			idx.OnMemberAdded = rec.OnMemberAdded
@@ -937,27 +942,30 @@ func TestNamedPortIndex(t *testing.T) {
 	}
 
 	for _, applyStrategy := range applyStrategies {
-		for _, states := range generatedTests {
-			var names []string
-			for _, s := range states {
-				names = append(names, s.Name)
-			}
-			t.Run(fmt.Sprintf("%s (%s)", strings.Join(names, " THEN "), applyStrategy),
-				func(t *testing.T) {
-					RegisterTestingT(t)
-					idx := NewSelectorAndNamedPortIndex()
-					rec := newRecorder()
-					idx.OnMemberAdded = rec.OnMemberAdded
-					idx.OnMemberRemoved = rec.OnMemberRemoved
+		t.Run(applyStrategy, func(t *testing.T) {
+			for _, states := range generatedTests {
+				var names []string
+				for _, s := range states {
+					names = append(names, s.Name)
+				}
+				t.Run(strings.Join(names, " THEN "),
+					func(t *testing.T) {
+						logrusr.ConfigureLoggingForTestingT(t)
+						RegisterTestingT(t)
+						idx := NewSelectorAndNamedPortIndex(false)
+						rec := newRecorder()
+						idx.OnMemberAdded = rec.OnMemberAdded
+						idx.OnMemberRemoved = rec.OnMemberRemoved
 
-					lastState := emptyState
-					for _, state := range states {
-						applyStateTransition(idx, rec, lastState, state, applyStrategy)
-						lastState = state
-						state.CheckRecordedState(t, rec)
-					}
-				})
-		}
+						lastState := emptyState
+						for _, state := range states {
+							applyStateTransition(idx, rec, lastState, state, applyStrategy)
+							lastState = state
+							state.CheckRecordedState(t, rec)
+						}
+					})
+			}
+		})
 	}
 }
 
@@ -978,11 +986,13 @@ type namedPortState struct {
 
 func (s namedPortState) CheckRecordedState(t *testing.T, rec *testRecorder) {
 	t.Helper()
-	for setName, expected := range s.ExpectedIPSetOutputs {
+	log.Infof("TEST HARNESS: Checking recorded state (%s)", s.Name)
+	for _, setName := range slices.Sorted(maps.Keys(s.ExpectedIPSetOutputs)) {
+		expected := s.ExpectedIPSetOutputs[setName]
 		setName := "s:" + setName
 		memberStrings := set.New[string]()
 		for m := range rec.ipsets[setName] {
-			memberStrings.Add(memberToProto(m))
+			memberStrings.Add(m.ToProtobufFormat())
 		}
 		ExpectWithOffset(1, memberStrings).To(Equal(set.FromArray(expected)),
 			fmt.Sprintf("%s: expected IP set %s to have entries: %v, not %v, all: %v", s.Name, setName, expected, memberStrings.Slice(), rec.ipsets))
@@ -993,22 +1003,7 @@ func (s namedPortState) CheckRecordedState(t *testing.T, rec *testRecorder) {
 		}
 		ExpectWithOffset(1, members).To(HaveLen(0), "Unexpected IP set: "+setName)
 	}
-}
-
-// Copied from event sequencer.
-func memberToProto(member IPSetMember) string {
-	switch member.Protocol {
-	case ProtocolNone:
-		return member.CIDR.String()
-	case ProtocolTCP:
-		return fmt.Sprintf("%s,tcp:%d", member.CIDR.Addr(), member.PortNumber)
-	case ProtocolUDP:
-		return fmt.Sprintf("%s,udp:%d", member.CIDR.Addr(), member.PortNumber)
-	case ProtocolSCTP:
-		return fmt.Sprintf("%s,sctp:%d", member.CIDR.Addr(), member.PortNumber)
-	}
-	log.WithField("member", member).Panic("Unknown IP set member type")
-	return ""
+	log.Infof("TEST HARNESS: Recorded state looks good.")
 }
 
 // mockEndpoint represents an abstract endpoint or network set.
@@ -1032,11 +1027,11 @@ type mockParent struct {
 
 type ipSet struct {
 	Selector string
-	Protocol IPSetPortProtocol
+	Protocol ipsetmember.Protocol
 	Port     string
 }
 
-func (s ipSet) ParsedSelector() selector.Selector {
+func (s ipSet) ParsedSelector() *selector.Selector {
 	sel, err := selector.Parse(s.Selector)
 	Expect(err).NotTo(HaveOccurred())
 	return sel
@@ -1061,12 +1056,14 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 	for k, ep := range s2.Endpoints {
 		if reflect.DeepEqual(s1.Endpoints[k], ep) {
 			// No change
+			log.Infof("TEST HARNESS: Skip updating unchanged endpoint/set %v", k)
 			continue
 		}
 		k := k
 		ep := ep
 		ops = append(ops, func() {
-			idx.UpdateEndpointOrSet(k, ep.Labels, ep.CIDRs(), ep.Ports, ep.Parents)
+			log.Infof("TEST HARNESS: Updating endpoint/set %v", k)
+			idx.UpdateEndpointOrSet(k, uniquelabels.Make(ep.Labels), ep.CIDRs(), ep.Ports, ep.Parents)
 		})
 	}
 	for k := range s1.Endpoints {
@@ -1075,6 +1072,7 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 		}
 		k := k
 		ops = append(ops, func() {
+			log.Infof("TEST HARNESS: Deleting endpoint/set %v", k)
 			idx.DeleteEndpoint(k)
 		})
 	}
@@ -1089,10 +1087,12 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 		k := k
 		p := p
 		ops = append(ops, func() {
+			log.Infof("TEST HARNESS: Updating parent labels %v -> %v", k, p.Labels)
 			idx.UpdateParentLabels(k, p.Labels)
 		})
 		if !dupeDone {
 			ops = append(ops, func() {
+				log.Infof("TEST HARNESS: Updating parent labels (dupe) %v -> %v", k, p.Labels)
 				idx.UpdateParentLabels(k, p.Labels)
 			})
 			dupeDone = true
@@ -1104,6 +1104,7 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 		}
 		k := k
 		ops = append(ops, func() {
+			log.Infof("TEST HARNESS: Delete parent labels %v", k)
 			idx.DeleteParentLabels(k)
 		})
 	}
@@ -1119,11 +1120,13 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 		s := s
 		ipSetID := "s:" + k
 		ops = append(ops, func() {
+			log.Infof("TEST HARNESS: Update IP set %v -> %s", k, s.Selector)
 			idx.UpdateIPSet(ipSetID, s.ParsedSelector(), s.Protocol, s.Port)
 		})
 		if !dupeDone {
 			// For coverage of "unchanged IP set" case.
 			ops = append(ops, func() {
+				log.Infof("TEST HARNESS: Update IP set (dupe) %v -> %s", k, s.Selector)
 				idx.UpdateIPSet(ipSetID, s.ParsedSelector(), s.Protocol, s.Port)
 			})
 			dupeDone = true
@@ -1137,10 +1140,12 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 		k := k
 		ipSetID := "s:" + k
 		ops = append(ops, func() {
+			log.Infof("TEST HARNESS: Delete IP set %v", ipSetID)
 			idx.DeleteIPSet(ipSetID)
 		})
 		if !dupeDone {
 			ops = append(ops, func() {
+				log.Infof("TEST HARNESS: Delete IP set (dupe) %v", ipSetID)
 				idx.DeleteIPSet(ipSetID)
 			})
 			dupeDone = true
@@ -1170,12 +1175,140 @@ func applyStateTransition(idx *SelectorAndNamedPortIndex, rec *testRecorder, s1,
 	}
 }
 
+var _ = Describe("MemberDeduplicator", func() {
+	var d OverlapSuppressor
+	BeforeEach(func() {
+		d = NewMemberOverlapSuppressor()
+	})
+
+	It("should handle adding, masking, and removing members in the same IP set", func() {
+		// Add an IP.
+		By("Adding an IP")
+		ip1 := ip.MustParseCIDROrIP("10.0.0.1/32")
+		add, removes := d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+
+		// Add the same IP again - it should have no effect.
+		add, removes = d.Add("setA", ip1)
+		Expect(add).To(BeNil())
+		Expect(removes).To(HaveLen(0))
+
+		// Add a second IP in a different CIDR, as well as another IP within the CIDR.
+		ip2 := ip.MustParseCIDROrIP("10.0.0.2/32")
+		add, removes = d.Add("setA", ip2)
+		Expect(add).To(Equal(ip2))
+		Expect(removes).To(HaveLen(0))
+
+		ip3 := ip.MustParseCIDROrIP("11.0.0.2/32")
+		add, removes = d.Add("setA", ip3)
+		Expect(add).To(Equal(ip3))
+		Expect(removes).To(HaveLen(0))
+
+		// Mask the IP - we expect the new CIDR to be advertised,
+		// and the old IPs in the CIDR to be withdrawn since it is covered by the new CIDR.
+		By("Masking the IP")
+		maskingCIDR := ip.MustParseCIDROrIP("10.0.0.0/24")
+		add, removes = d.Add("setA", maskingCIDR)
+		Expect(add).To(Equal(maskingCIDR))
+		Expect(removes).To(ConsistOf(ip1, ip2))
+
+		// Add another IP within the CIDR - it should not be added, since it is masked.
+		ip4 := ip.MustParseCIDROrIP("10.0.0.3/32")
+		add, removes = d.Add("setA", ip4)
+		Expect(add).To(BeNil())
+		Expect(removes).To(HaveLen(0))
+
+		// Remove the CIDR - expect the previously masked IPs to be re-added.
+		remove, adds := d.Remove("setA", maskingCIDR)
+		Expect(remove).To(Equal(maskingCIDR))
+		Expect(adds).To(ConsistOf(ip1, ip2, ip4))
+	})
+
+	It("should support dual stack IP sets", func() {
+		ip1 := ip.MustParseCIDROrIP("10.0.0.1/32")
+		ip2 := ip.MustParseCIDROrIP("fe80:dead:beef::0/122")
+		add, removes := d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+		add, removes = d.Add("setA", ip2)
+		Expect(add).To(Equal(ip2))
+		Expect(removes).To(HaveLen(0))
+	})
+
+	It("should support deleting an IP set", func() {
+		ip1 := ip.MustParseCIDROrIP("10.0.0.1/32")
+		add, removes := d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+		d.DeleteIPSet("setA")
+		add, removes = d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+	})
+
+	It("should handle multiple IP set with overlapping members", func() {
+		ip1 := ip.MustParseCIDROrIP("10.0.0.1/32")
+		ip2 := ip.MustParseCIDROrIP("10.0.0.2/32")
+		maskingCIDR := ip.MustParseCIDROrIP("10.0.0.0/24")
+
+		// Add each IP to a different IP set.
+		add, removes := d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+		add, removes = d.Add("setB", ip2)
+		Expect(add).To(Equal(ip2))
+		Expect(removes).To(HaveLen(0))
+
+		// Mask setA. It should only recall ip1.
+		add, removes = d.Add("setA", maskingCIDR)
+		Expect(add).To(Equal(maskingCIDR))
+		Expect(removes).To(ConsistOf(ip1))
+
+		// Mask setB.
+		add, removes = d.Add("setB", maskingCIDR)
+		Expect(add).To(Equal(maskingCIDR))
+		Expect(removes).To(ConsistOf(ip2))
+	})
+
+	It("should handle descendants on different tiers of the underlying trie", func() {
+		ip1 := ip.MustParseCIDROrIP("10.0.1.1/32")         // End of the trie
+		ip2 := ip.MustParseCIDROrIP("10.0.2.1/32")         // End of the trie
+		ip3 := ip.MustParseCIDROrIP("10.0.1.0/24")         // Masks ip1
+		maskingCIDR := ip.MustParseCIDROrIP("10.0.0.0/16") // Masks all of the above.
+
+		// Add each IP to the same set.
+		add, removes := d.Add("setA", ip1)
+		Expect(add).To(Equal(ip1))
+		Expect(removes).To(HaveLen(0))
+		add, removes = d.Add("setA", ip2)
+		Expect(add).To(Equal(ip2))
+		Expect(removes).To(HaveLen(0))
+		add, removes = d.Add("setA", ip3)
+		Expect(add).To(Equal(ip3))
+		Expect(removes).To(ConsistOf(ip1)) // ip1 is masked by ip3.
+		add, removes = d.Add("setA", maskingCIDR)
+		Expect(add).To(Equal(maskingCIDR))
+		Expect(removes).To(ConsistOf(ip2, ip3)) // ip2 and ip3 are masked by maskingCIDR, ip1 is already masked.
+
+		// Removing the masking CIDR should bring back ip2 and ip3.
+		remove, adds := d.Remove("setA", maskingCIDR)
+		Expect(remove).To(Equal(maskingCIDR))
+		Expect(adds).To(ConsistOf(ip2, ip3))
+
+		// Removing ip3 should bring back ip1.
+		remove, adds = d.Remove("setA", ip3)
+		Expect(remove).To(Equal(ip3))
+		Expect(adds).To(ConsistOf(ip1))
+	})
+})
+
 var _ = Describe("SelectorAndNamedPortIndex", func() {
 	var uut *SelectorAndNamedPortIndex
 	var recorder *testRecorder
 
 	BeforeEach(func() {
-		uut = NewSelectorAndNamedPortIndex()
+		uut = NewSelectorAndNamedPortIndex(false)
 		recorder = newRecorder()
 		uut.OnMemberAdded = recorder.OnMemberAdded
 		uut.OnMemberRemoved = recorder.OnMemberRemoved
@@ -1193,7 +1326,7 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 								Mask: net.IPMask{255, 255, 0, 0},
 							}},
 						},
-						Labels: map[string]string{"villain": "ghost"},
+						Labels: uniquelabels.Make(map[string]string{"villain": "ghost"}),
 					},
 				},
 			})
@@ -1207,13 +1340,13 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 								Mask: net.IPMask{255, 255, 0, 0},
 							}},
 						},
-						Labels: map[string]string{"villain": "ghost"},
+						Labels: uniquelabels.Make(map[string]string{"villain": "ghost"}),
 					},
 				},
 			})
 			s, err := selector.Parse("villain == 'ghost'")
 			Expect(err).ToNot(HaveOccurred())
-			uut.UpdateIPSet("villains", s, ProtocolNone, "")
+			uut.UpdateIPSet("villains", s, ipsetmember.ProtocolNone, "")
 			set, ok := recorder.ipsets["villains"]
 			Expect(ok).To(BeTrue())
 			Expect(set).To(HaveLen(1))
@@ -1242,14 +1375,14 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 								Mask: net.IPMask{255, 255, 0, 0},
 							}},
 						},
-						Labels:     map[string]string{"villain": "ghost"},
+						Labels:     uniquelabels.Make(map[string]string{"villain": "ghost"}),
 						ProfileIDs: []string{"doo"},
 					},
 				},
 			})
 			s, err := selector.Parse("villain == 'ghost' && superhero == 'scooby'")
 			Expect(err).ToNot(HaveOccurred())
-			uut.UpdateIPSet("scoobydoobydoo", s, ProtocolNone, "")
+			uut.UpdateIPSet("scoobydoobydoo", s, ipsetmember.ProtocolNone, "")
 			set, ok := recorder.ipsets["scoobydoobydoo"]
 			Expect(ok).To(BeTrue())
 			Expect(set).To(HaveLen(1))
@@ -1261,9 +1394,9 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 				Name:              "eth0",
 				ExpectedIPv4Addrs: []calinet.IP{calinet.MustParseIP("1.2.3.4")},
 				ExpectedIPv6Addrs: []calinet.IP{calinet.MustParseIP("aa:bb::cc:dd")},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					"label2": "",
-				},
+				}),
 				ProfileIDs: []string{"profile1"},
 			}
 			hepKVP := model.KVPair{
@@ -1275,16 +1408,16 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			// The new ipset should have 2 IPs.
-			uut.UpdateIPSet("heptest", s, ProtocolNone, "")
+			uut.UpdateIPSet("heptest", s, ipsetmember.ProtocolNone, "")
 			set, ok := recorder.ipsets["heptest"]
 			Expect(ok).To(BeTrue())
 			Expect(set).To(HaveLen(2))
 
 			// Update the hostendpoint labels so they are not matched by the
 			// selector.
-			hep.Labels = map[string]string{
+			hep.Labels = uniquelabels.Make(map[string]string{
 				"label1": "value1",
-			}
+			})
 			uut.OnUpdate(api.Update{KVPair: hepKVP})
 
 			// Expect the ipset to be empty (OnMemberRemoved will have been
@@ -1296,24 +1429,71 @@ var _ = Describe("SelectorAndNamedPortIndex", func() {
 	})
 })
 
+// nftables interval sets reject overlapping members, so in nftables mode the calc graph
+// enables the overlap suppressor (suppressOverlaps=true) to coalesce overlapping CIDRs
+// before they reach the dataplane. Without it, Felix livelocks and panics (#12851).
+var _ = Describe("SelectorAndNamedPortIndex overlap suppression", func() {
+	// Three covering CIDRs: 12.0.0.0/8 covers 12.1.0.0/16 covers 12.1.2.142/32.
+	feedOverlappingNetworkSet := func(uut *SelectorAndNamedPortIndex) *testRecorder {
+		rec := newRecorder()
+		uut.OnMemberAdded = rec.OnMemberAdded
+		uut.OnMemberRemoved = rec.OnMemberRemoved
+		uut.OnUpdate(api.Update{
+			KVPair: model.KVPair{
+				Key: model.NetworkSetKey{Name: "netset-overlap"},
+				Value: &model.NetworkSet{
+					Nets: []calinet.IPNet{
+						calinet.MustParseNetwork("12.1.2.142/32"),
+						calinet.MustParseNetwork("12.1.0.0/16"),
+						calinet.MustParseNetwork("12.0.0.0/8"),
+					},
+					Labels: uniquelabels.Make(map[string]string{"a": "b"}),
+				},
+			},
+		})
+		s, err := selector.Parse("a == 'b'")
+		Expect(err).ToNot(HaveOccurred())
+		uut.UpdateIPSet("overlap", s, ipsetmember.ProtocolNone, "")
+		return rec
+	}
+
+	members := func(rec *testRecorder) []string {
+		var out []string
+		for m := range rec.ipsets["overlap"] {
+			out = append(out, m.ToProtobufFormat())
+		}
+		return out
+	}
+
+	It("coalesces overlapping CIDRs to the covering CIDR when enabled", func() {
+		rec := feedOverlappingNetworkSet(NewSelectorAndNamedPortIndex(true))
+		Expect(members(rec)).To(ConsistOf("12.0.0.0/8"))
+	})
+
+	It("keeps overlapping CIDRs when disabled", func() {
+		rec := feedOverlappingNetworkSet(NewSelectorAndNamedPortIndex(false))
+		Expect(members(rec)).To(ConsistOf("12.0.0.0/8", "12.1.0.0/16", "12.1.2.142/32"))
+	})
+})
+
 func newRecorder() *testRecorder {
-	return &testRecorder{ipsets: make(map[string]map[IPSetMember]bool)}
+	return &testRecorder{ipsets: make(map[string]map[ipsetmember.IPSetMember]bool)}
 }
 
 type testRecorder struct {
-	ipsets map[string]map[IPSetMember]bool
+	ipsets map[string]map[ipsetmember.IPSetMember]bool
 }
 
-func (t *testRecorder) OnMemberAdded(ipSetID string, member IPSetMember) {
+func (t *testRecorder) OnMemberAdded(ipSetID string, member ipsetmember.IPSetMember) {
 	s := t.ipsets[ipSetID]
 	if s == nil {
-		s = make(map[IPSetMember]bool)
+		s = make(map[ipsetmember.IPSetMember]bool)
 		t.ipsets[ipSetID] = s
 	}
 	s[member] = true
 }
 
-func (t *testRecorder) OnMemberRemoved(ipSetID string, member IPSetMember) {
+func (t *testRecorder) OnMemberRemoved(ipSetID string, member ipsetmember.IPSetMember) {
 	s := t.ipsets[ipSetID]
 	delete(s, member)
 	if len(s) == 0 {

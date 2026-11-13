@@ -15,6 +15,7 @@
 package environment
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -64,11 +65,8 @@ func MustParseVersion(v string) *Version {
 func (v *Version) Compare(other *Version) int {
 	vlen := len(v.versionSlice)
 	olen := len(other.versionSlice)
-	compLen := vlen
-	if compLen > olen {
-		compLen = olen
-	}
-	for index := 0; index < compLen; index++ {
+	compLen := min(vlen, olen)
+	for index := range compLen {
 		if v.versionSlice[index] == other.versionSlice[index] {
 			continue
 		}
@@ -94,8 +92,7 @@ func convertVersionToIntSlice(s string) ([]int, error) {
 	for index, element := range parts {
 		val, err := strconv.Atoi(element)
 		if err != nil {
-			return nil, fmt.Errorf(
-				"Error parsing version: %s", err)
+			return nil, fmt.Errorf("error parsing version: %s", err)
 		}
 		intSlice[index] = val
 	}
@@ -110,9 +107,9 @@ func GetVersionFromString(s string) (*Version, error) {
 	log.WithField("rawVersion", s).Debug("Raw kernel version")
 	matches := kernelVersionRegexp.FindStringSubmatch(s)
 	if len(matches) == 0 {
-		msg := "Failed to parse kernel version string"
+		msg := "failed to parse kernel version string"
 		log.WithField("rawVersion", s).Warn(msg)
-		return nil, fmt.Errorf("%s", msg)
+		return nil, errors.New(msg)
 	}
 	parsedVersion, err := NewVersion(matches[1])
 	log.WithField("version", parsedVersion).Debug("Parsed kernel version")

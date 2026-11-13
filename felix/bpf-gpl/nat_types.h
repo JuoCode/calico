@@ -5,13 +5,15 @@
 #ifndef __CALI_NAT_TYPES_H__
 #define __CALI_NAT_TYPES_H__
 
-#include "bpf.h"
+#include "cali_bpf.h"
+#include "ip_addr.h"
 
 typedef enum calico_nat_lookup_result {
 	NAT_LOOKUP_ALLOW,
 	NAT_FE_LOOKUP_DROP,
 	NAT_NO_BACKEND,
 	NAT_EXCLUDE,
+	NAT_MAGLEV,
 } nat_lookup_result;
 
 
@@ -44,11 +46,6 @@ struct __attribute__((__packed__)) calico_nat_key {
 // This is used as a special ID along with count=0 to drop a packet at nat level1 lookup
 #define NAT_FE_DROP_COUNT  0xffffffff
 
-union calico_nat_lpm_key {
-        struct bpf_lpm_trie_key lpm;
-        struct calico_nat_key key;
-};
-
 struct calico_nat_value {
 	__u32 id;
 	__u32 count;
@@ -60,6 +57,7 @@ struct calico_nat_value {
 #define NAT_FLG_EXTERNAL_LOCAL	0x1
 #define NAT_FLG_INTERNAL_LOCAL	0x2
 #define NAT_FLG_NAT_EXCLUDE	0x4
+#define NAT_FLG_MAGLEV		0X8
 
 #ifdef IPVER6
 CALI_MAP_NAMED(cali_v6_nat_fe, cali_nat_fe, 3,
@@ -67,7 +65,7 @@ CALI_MAP_NAMED(cali_v6_nat_fe, cali_nat_fe, 3,
 CALI_MAP_NAMED(cali_v4_nat_fe, cali_nat_fe, 3,
 #endif
 		BPF_MAP_TYPE_LPM_TRIE,
-		union calico_nat_lpm_key, struct calico_nat_value,
+		struct calico_nat_key, struct calico_nat_value,
 		64*1024, BPF_F_NO_PREALLOC)
 
 
@@ -121,4 +119,25 @@ struct vxlanhdr {
 	__be32 flags;
 	__be32 vni;
 };
+
+#ifndef CALI_VXLAN_VNI
+#define CALI_VXLAN_VNI 0xca11c0
+#endif
+
+#define vxlan_udp_csum_ok(udp) ((udp)->check == 0)
+
+struct cali_maglev_key {
+	__u32 sid;
+	__u32 ordinal; // should always be a value of [0..M-1], where M is a very large prime number. -Alex
+};
+
+#ifdef IPVER6
+CALI_MAP_NAMED(cali_v6_mglv, cali_maglev,2,
+#else
+CALI_MAP_NAMED(cali_v4_mglv, cali_maglev,2,
+#endif
+		BPF_MAP_TYPE_HASH,
+		struct cali_maglev_key, struct calico_nat_dest,
+		1009, BPF_F_NO_PREALLOC)
+
 #endif /*  __CALI_NAT_TYPES_H__ */

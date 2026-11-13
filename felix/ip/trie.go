@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ type CIDRTrie struct {
 type CIDRNode struct {
 	cidr     CIDR
 	children [2]*CIDRNode
-	data     interface{}
+	data     any
 }
 
 func NewCIDRTrie() *CIDRTrie {
@@ -94,10 +94,10 @@ func deleteInternal(n *CIDRNode, cidr CIDR) *CIDRNode {
 
 type CIDRTrieEntry struct {
 	CIDR CIDR
-	Data interface{}
+	Data any
 }
 
-func (t *CIDRTrie) Get(cidr CIDR) interface{} {
+func (t *CIDRTrie) Get(cidr CIDR) any {
 	return t.root.get(cidr)
 }
 
@@ -111,15 +111,11 @@ func (t *CIDRTrie) LookupPath(buffer []CIDRTrieEntry, cidr CIDR) []CIDRTrieEntry
 }
 
 // LPM does a longest prefix match on the trie
-func (t *CIDRTrie) LPM(cidr CIDR) (CIDR, interface{}) {
+func (t *CIDRTrie) LPM(cidr CIDR) (CIDR, any) {
 	n := t.root
 	var match *CIDRNode
 
-	for {
-		if n == nil {
-			break
-		}
-
+	for n != nil {
 		if !n.cidr.Contains(cidr.Addr()) {
 			break
 		}
@@ -184,7 +180,18 @@ func (n *CIDRNode) lookupPath(buffer []CIDRTrieEntry, cidr CIDR) []CIDRTrieEntry
 	return child.lookupPath(buffer, cidr)
 }
 
-func (n *CIDRNode) get(cidr CIDR) interface{} {
+func (n *CIDRNode) get(cidr CIDR) any {
+	node := n.getNode(cidr, false)
+	if node == nil {
+		return nil
+	}
+	return node.data
+}
+
+// getNode returns the CIDRNode that contains the given CIDR.  If includeIntermediates is true then it will return
+// any intermediate nodes that don't have data associated with them.  If includeIntermediates is false then it will
+// only return nodes that have data associated with them.
+func (n *CIDRNode) getNode(cidr CIDR, includeIntermediates bool) *CIDRNode {
 	if n == nil {
 		return nil
 	}
@@ -199,18 +206,18 @@ func (n *CIDRNode) get(cidr CIDR) interface{} {
 	}
 
 	if cidr == n.cidr {
-		if n.data == nil {
+		if !includeIntermediates && n.data == nil {
 			// CIDR is an intermediate node with no data so CIDR isn't actually in the trie.
 			return nil
 		}
-		return n.data
+		return n
 	}
 
 	// If we get here, then this node is a parent of the CIDR we're looking for.
 	// Figure out which child to recurse on.
 	childIdx := cidr.Addr().NthBit(uint(n.cidr.Prefix() + 1))
 	child := n.children[childIdx]
-	return child.get(cidr)
+	return child.getNode(cidr, includeIntermediates)
 }
 
 func (t *CIDRTrie) CoveredBy(cidr CIDR) bool {
@@ -242,6 +249,12 @@ func (n *CIDRNode) covers(cidr CIDR) bool {
 	childIdx := cidr.Addr().NthBit(uint(n.cidr.Prefix() + 1))
 	child := n.children[childIdx]
 	return child.covers(cidr)
+}
+
+// Overlaps returns true if the trie holds a CIDR that intersects the given one, in either
+// direction of containment.
+func (t *CIDRTrie) Overlaps(cidr CIDR) bool {
+	return t.Covers(cidr) || t.Intersects(cidr)
 }
 
 func (t *CIDRTrie) Intersects(cidr CIDR) bool {
@@ -288,7 +301,7 @@ func (n *CIDRNode) appendTo(s []CIDRTrieEntry) []CIDRTrieEntry {
 	return s
 }
 
-func (n *CIDRNode) visit(f func(cidr CIDR, data interface{}) bool) bool {
+func (n *CIDRNode) visit(f func(cidr CIDR, data any) bool) bool {
 	if n == nil {
 		return true
 	}
@@ -310,11 +323,60 @@ func (t *CIDRTrie) ToSlice() []CIDRTrieEntry {
 	return t.root.appendTo(nil)
 }
 
-func (t *CIDRTrie) Visit(f func(cidr CIDR, data interface{}) bool) {
+func (t *CIDRTrie) Visit(f func(cidr CIDR, data any) bool) {
 	t.root.visit(f)
 }
 
-func (t *CIDRTrie) Update(cidr CIDR, value interface{}) {
+// ClosestDescendants returns a list of CIDRs representing the closest descendants of the given CIDR in the trie that
+// have data associated with them. It does not return a full list of all descendants - only any descendants that are tied for
+// being the closest to the given CIDR.
+//
+// For example, given the following trie, where * indicates an intermediate node with no data associated with it:
+//
+//	       10.0.0.0/16
+//	            |
+//	   +----------------+
+//	   |                |
+//
+//	10.0.1.0/24    10.0.2.0/24*
+//
+//	   |                |
+//
+//	10.0.1.1/32     10.0.2.1/32
+//
+// ClosestDescendants(10.0.0.0/16) => [10.0.1.0/24, 10.0.2.1/32]
+// ClosestDescendants(10.0.1.0/24) => [10.0.1.1/32]
+// ClosestDescendants(10.0.2.0/24) => [10.0.2.1/32]
+//
+// The caller may pass in a buffer to store the results, which will be appended to and returned. If the buffer is nil, a new
+// slice will be created and returned.
+func (t *CIDRTrie) ClosestDescendants(buf []CIDR, parent CIDR) []CIDR {
+	// Get the node representing this CIDR. Include the node even if it has no associated data, so that
+	// we can traverse it to find the closest descendants.
+	node := t.root.getNode(parent, true)
+	if node == nil {
+		return nil
+	}
+
+	// For each sub-node, add it to the list of children.
+	for _, child := range node.children {
+		if child == nil {
+			continue
+		}
+
+		if child.data != nil {
+			// This is a "real" child node.
+			buf = append(buf, child.cidr)
+		} else {
+			// This is an aggregate node that exists only to hold other nodes. Skip it, and
+			// instead recursively check its children until we find a hit.
+			buf = t.ClosestDescendants(buf, child.cidr)
+		}
+	}
+	return buf
+}
+
+func (t *CIDRTrie) Update(cidr CIDR, value any) {
 	if value == nil {
 		logrus.Panic("Can't store nil in a CIDRTrie")
 	}
@@ -399,24 +461,13 @@ func CommonPrefix(a, b CIDR) CIDR {
 }
 
 func V4CommonPrefix(a, b V4CIDR) V4CIDR {
-	var result V4CIDR
-	var maxLen uint8
-	if b.prefix < a.prefix {
-		maxLen = b.prefix
-	} else {
-		maxLen = a.prefix
-	}
-
 	a32 := a.addr.AsUint32()
 	b32 := b.addr.AsUint32()
 
 	xored := a32 ^ b32 // Has a zero bit wherever the two values are the same.
 	commonPrefixLen := uint8(bits.LeadingZeros32(xored))
-	if commonPrefixLen > maxLen {
-		result.prefix = maxLen
-	} else {
-		result.prefix = commonPrefixLen
-	}
+	var result V4CIDR
+	result.prefix = min(commonPrefixLen, min(b.prefix, a.prefix))
 
 	mask := uint32(0xffffffff) << (32 - result.prefix)
 	commonPrefix32 := mask & a32
@@ -426,15 +477,6 @@ func V4CommonPrefix(a, b V4CIDR) V4CIDR {
 }
 
 func V6CommonPrefix(a, b V6CIDR) V6CIDR {
-	var result V6CIDR
-	var maxLen uint8
-
-	if b.prefix < a.prefix {
-		maxLen = b.prefix
-	} else {
-		maxLen = a.prefix
-	}
-
 	a_h, a_l := a.addr.AsUint64Pair()
 	b_h, b_l := b.addr.AsUint64Pair()
 
@@ -443,17 +485,15 @@ func V6CommonPrefix(a, b V6CIDR) V6CIDR {
 
 	commonPrefixLen := uint8(bits.LeadingZeros64(xored_h))
 
+	var result V6CIDR
+	maxLen := min(b.prefix, a.prefix)
 	if xored_h == 0 {
 		// This means a_h == b_h and commonPrefixLen will be > 64. The first
 		// 8 bytes of the result will be equal to a_h (and b_h), last 8 will
 		// be the common prefix of a_l and b_l.
 		commonPrefixLen = 64 + uint8(bits.LeadingZeros64(xored_l))
 		binary.BigEndian.PutUint64(result.addr[:8], a_h)
-		if commonPrefixLen > maxLen {
-			result.prefix = maxLen
-		} else {
-			result.prefix = commonPrefixLen
-		}
+		result.prefix = min(commonPrefixLen, maxLen)
 		mask := uint64(0xffffffffffffffff) << (128 - result.prefix)
 		commonPrefix64 := mask & a_l
 		binary.BigEndian.PutUint64(result.addr[8:], commonPrefix64)
@@ -461,11 +501,7 @@ func V6CommonPrefix(a, b V6CIDR) V6CIDR {
 		// This means commonPrefixLen will be < 64. Just the first 8 bytes of
 		// the result will be filled with the common prefix of a_h and b_h,
 		// last 8 will be 0.
-		if commonPrefixLen > maxLen {
-			result.prefix = maxLen
-		} else {
-			result.prefix = commonPrefixLen
-		}
+		result.prefix = min(commonPrefixLen, maxLen)
 		mask := uint64(0xffffffffffffffff) << (64 - result.prefix)
 		commonPrefix64 := mask & a_h
 		binary.BigEndian.PutUint64(result.addr[:8], commonPrefix64)

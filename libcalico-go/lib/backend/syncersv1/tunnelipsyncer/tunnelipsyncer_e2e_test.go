@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,12 @@ package tunnelipsyncer_test
 
 import (
 	"context"
+	"net/netip"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -95,18 +95,21 @@ var _ = testutils.E2eDatastoreDescribe("Tunnel IP allocation syncer tests", test
 			)
 			Expect(err).NotTo(HaveOccurred())
 			// The pool will add as single entry ( +1 )
-			poolKeyV1 := model.IPPoolKey{CIDR: net.MustParseCIDR("192.124.0.0/21")}
+			poolKeyV1 := model.IPPoolKey{CIDR: netip.MustParsePrefix("192.124.0.0/21")}
 			expectedCacheSize += 1
 			syncTester.ExpectCacheSize(expectedCacheSize)
 			syncTester.ExpectData(model.KVPair{
 				Key: poolKeyV1,
 				Value: &model.IPPool{
-					CIDR:          poolCIDRNet,
-					IPIPInterface: "tunl0",
-					IPIPMode:      encap.CrossSubnet,
-					Masquerade:    true,
-					IPAM:          true,
-					Disabled:      false,
+					CIDR:           poolCIDRNet,
+					IPIPInterface:  "tunl0",
+					IPIPMode:       encap.CrossSubnet,
+					Masquerade:     true,
+					IPAM:           true,
+					Disabled:       false,
+					AssignmentMode: apiv3.Automatic,
+					AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+					NodeSelector:   "all()",
 				},
 				Revision: pool.ResourceVersion,
 			})

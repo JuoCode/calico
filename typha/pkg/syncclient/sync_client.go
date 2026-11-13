@@ -22,23 +22,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/snappy"
 	log "github.com/sirupsen/logrus"
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/readlogger"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 	"github.com/projectcalico/calico/typha/pkg/discovery"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 	"github.com/projectcalico/calico/typha/pkg/tlsutils"
 )
 
-var nextID uint64 = 1 // Non-zero so we can tell whether it's set at all.
+var nextID atomic.Uint64
+
+func init() {
+	// ID is used as a correlator in the Typha logs.  Put some entropy in
+	// it so it's easy to grep for.
+	nextID.Store(rand.Uint64() << 32)
+}
+
+func allocateConnID() uint64 {
+	return nextID.Add(1)
+}
 
 const (
 	defaultReadtimeout  = 30 * time.Second
@@ -63,9 +76,17 @@ type Options struct {
 	// DebugLogReads tells the client to wrap each connection with a Reader that
 	// logs every read.  Intended only for use in tests!
 	DebugLogReads bool
+
 	// DebugDiscardKVUpdates discards all KV updates from typha without decoding them.
 	// Useful for load testing Typha without having to run a "full" client.
 	DebugDiscardKVUpdates bool
+
+	// PreferredCompressionAlgorithmOrder overrides the set of compression
+	// algorithms advertised to the server.  The server makes the final choice
+	// based on its own preference order.  Nil means advertise all supported
+	// algorithms; an empty (non-nil) slice disables compression.  Intended
+	// for tests that need to pin the negotiated algorithm.
+	PreferredCompressionAlgorithmOrder []syncproto.CompressionAlgorithm
 }
 
 func (o *Options) readTimeout() time.Duration {
@@ -98,9 +119,9 @@ func (o *Options) validate() (err error) {
 			o.CertFile == "" ||
 			o.CAFile == "" ||
 			(o.ServerCN == "" && o.ServerURISAN == "") {
-			err = errors.New("If any Felix-Typha TLS options are specified," +
+			err = errors.New("if any Felix-Typha TLS options are specified," +
 				" they _all_ must be" +
-				" - except that either ServerCN or ServerURISAN may be left unset.")
+				" - except that either ServerCN or ServerURISAN may be left unset")
 		}
 	}
 	return
@@ -115,87 +136,133 @@ func New(
 	if err := options.validate(); err != nil {
 		log.WithField("options", options).WithError(err).Fatal("Invalid options")
 	}
-	id := nextID
-	nextID++
 	if options == nil {
 		options = &Options{}
 	}
-	cbskn, ok := cbs.(callbacksWithKeysKnown)
-	if !ok {
-		cbskn = callbacksWithKeysKnownAdapter{cbs}
-	}
-	return &SyncerClient{
-		ID: id,
+	sc := &SyncerClient{
 		logCxt: log.WithFields(log.Fields{
-			"myID": id,
 			"type": options.SyncerType,
 		}),
-		callbacks:  cbskn,
-		discoverer: discoverer,
+		callbacks:          cbs,
+		discoverer:         discoverer,
+		connAttemptTracker: discovery.NewConnAttemptTracker(discoverer),
 
 		myVersion:  myVersion,
 		myHostname: myHostname,
 		myInfo:     myInfo,
 
 		options: options,
-		handshakeStatus: &handshakeStatus{
-			helloReceivedChan: make(chan struct{}, 1),
-		},
 	}
+	sc.refreshConnID()
+	return sc
+}
+
+func (s *SyncerClient) refreshConnID() {
+	s.connID = allocateConnID()
+	s.logCxt.Data["myID"] = s.connID
 }
 
 type SyncerClient struct {
-	ID                            uint64
 	logCxt                        *log.Entry
 	discoverer                    *discovery.Discoverer
+	connAttemptTracker            *discovery.ConnectionAttemptTracker
 	connInfo                      *discovery.Typha
 	myHostname, myVersion, myInfo string
 	options                       *Options
 
-	connection                  net.Conn
-	connR                       io.Reader
-	encoder                     *gob.Encoder
-	decoder                     *gob.Decoder
-	handshakeStatus             *handshakeStatus
-	supportsNodeResourceUpdates bool
+	connection net.Conn
+	connID     uint64
+	connR      io.Reader
+	encoder    *gob.Encoder
+	decoder    *gob.Decoder
+	// decompressor is the (possibly pass-through) reader that the decoder
+	// reads from; it wraps connR.  Replaced together with the decoder at
+	// each decoder restart.
+	decompressor syncproto.Decompressor
 
-	callbacks callbacksWithKeysKnown
+	// advertisedCompressionAlgs is the set of compression algorithms we
+	// offered in our hello message, plus syncproto.CompressionNone, which
+	// the server may always fall back to.  A MsgDecoderRestart naming any
+	// other algorithm is a protocol violation and drops the connection.
+	// Only touched by the loop goroutine.
+	advertisedCompressionAlgs set.Set[syncproto.CompressionAlgorithm]
+
+	// negotiatedCompression holds the syncproto.CompressionAlgorithm the
+	// server selected for the current connection (CompressionNone if
+	// uncompressed).
+	negotiatedCompression atomic.Value
+
+	callbacks api.SyncerCallbacks
 	Finished  sync.WaitGroup
 }
 
-type callbacksWithKeysKnown interface {
+// NegotiatedCompressionAlgorithm returns the compression algorithm the server
+// selected for the current connection, or "" if the stream is uncompressed
+// (or compression has not been negotiated yet).  Safe to call from any
+// goroutine; intended for tests and diagnostics.
+func (s *SyncerClient) NegotiatedCompressionAlgorithm() syncproto.CompressionAlgorithm {
+	alg, _ := s.negotiatedCompression.Load().(syncproto.CompressionAlgorithm)
+	return alg
+}
+
+type RestartAwareCallbacks interface {
 	api.SyncerCallbacks
-	OnUpdatesKeysKnown(updates []api.Update, keys []string)
-}
-
-type callbacksWithKeysKnownAdapter struct {
-	api.SyncerCallbacks
-}
-
-func (c callbacksWithKeysKnownAdapter) OnUpdatesKeysKnown(updates []api.Update, keys []string) {
-	c.OnUpdates(updates)
-}
-
-type handshakeStatus struct {
-	helloReceivedChan chan struct{}
-	complete          bool
+	OnTyphaConnectionRestarted()
 }
 
 func (s *SyncerClient) Start(cxt context.Context) error {
 	// Connect synchronously so that we can return an error early if we can't connect at all.
 	s.logCxt.Info("Starting Typha client...")
 
+	var connectionFinishedWG sync.WaitGroup
+	err := s.startOneConnection(cxt, &connectionFinishedWG)
+	if err != nil {
+		return err
+	}
+
+	// Start a background goroutine to try to restart the connection if it fails.
+	// We can only do that if the client is restart-aware.
+	s.Finished.Add(1)
+	go func() {
+		defer func() {
+			s.logCxt.Info("Typha client shutting down.")
+			s.Finished.Done()
+		}()
+
+		for cxt.Err() == nil {
+			connectionFinishedWG.Wait()
+			if rac, ok := s.callbacks.(RestartAwareCallbacks); ok {
+				log.Info("Typha connection failed but client callback is restart-aware.  Restarting connection...")
+				s.refreshConnID()
+				rac.OnTyphaConnectionRestarted()
+				s.callbacks.OnStatusUpdated(api.WaitForDatastore)
+			} else {
+				log.Info("Typha client callback is not restart-aware. Exiting...")
+				return
+			}
+			err := s.startOneConnection(cxt, &connectionFinishedWG)
+			if err != nil {
+				log.WithError(err).Error("Failed to restart Typha client. Exiting...")
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (s *SyncerClient) startOneConnection(cxt context.Context, connFinished *sync.WaitGroup) error {
 	// Defensive: in case there's a bug in NextAddr() and it never stops returning values,
 	// set a sanity limit on the number of tries.
+	startTime := time.Now()
 	maxTries := s.calculateConnectionAttemptLimit(len(s.discoverer.CachedTyphaAddrs()))
 	remainingTries := maxTries
-	cat := discovery.NewConnAttemptTracker(s.discoverer)
 	for {
 		remainingTries--
 		if remainingTries < 0 {
 			return fmt.Errorf("failed to connect to Typha after %d tries", maxTries)
 		}
-		addr, err := cat.NextAddr()
+		addr, err := s.connAttemptTracker.NextAddr()
 		if err != nil {
 			return fmt.Errorf("failed to load next Typha address to try: %w", err)
 		}
@@ -205,25 +272,23 @@ func (s *SyncerClient) Start(cxt context.Context) error {
 			s.logCxt.WithError(err).Warnf("Failed to connect to typha endpoint %s.  Will try another if available...", addr.Addr)
 			time.Sleep(100 * time.Millisecond) // Avoid tight loop.
 		} else {
-			s.logCxt.Infof("Successfully connected to Typha at %s.", addr.Addr)
+			s.logCxt.Infof("Successfully connected to Typha at %s after %v.", addr.Addr, time.Since(startTime))
 			break
 		}
 	}
 
 	// Then start our background goroutines.  We start the main loop and a second goroutine to
 	// manage shutdown.
-	cxt, cancelFn := context.WithCancel(cxt)
-	s.Finished.Add(1)
-	go s.loop(cxt, cancelFn)
+	connCtx, cancelFn := context.WithCancel(cxt)
+	connFinished.Add(1)
+	go s.loop(connCtx, cancelFn, connFinished)
 
-	s.Finished.Add(1)
-	go func() {
+	connFinished.Go(func() {
 		// Broadcast that we're finished.
-		defer s.Finished.Done()
 
 		// Wait for the context to finish, either due to external cancel or our own loop
 		// exiting.
-		<-cxt.Done()
+		<-connCtx.Done()
 		s.logCxt.Info("Typha client Context asked us to exit, closing connection...")
 		// Close the connection.  This will trigger the main loop to exit if it hasn't
 		// already.
@@ -231,42 +296,20 @@ func (s *SyncerClient) Start(cxt context.Context) error {
 		if err != nil {
 			log.WithError(err).Warn("Ignoring error from Close during shut-down of client.")
 		}
-	}()
+	})
 	return nil
 }
 
 func (s *SyncerClient) calculateConnectionAttemptLimit(numDiscoveredTyphas int) int {
-	expectedNumTyphas := numDiscoveredTyphas
-	if expectedNumTyphas < 3 {
+	expectedNumTyphas := max(numDiscoveredTyphas,
 		// Most clusters have at least 3 Typha instances so, if we discovered fewer instances,
 		// assume that there may be more starting up.
-		expectedNumTyphas = 3
-	}
+		3)
 	// During upgrade, we expect all Typha instances to be replaced one by one so, for a safe
 	// upper bound on the number of potential connection attempts, assume that we try to connect
 	// to double the number of instances that we detected.
 	maxTries := expectedNumTyphas * 2
 	return maxTries
-}
-
-// SupportsNodeResourceUpdates waits for the Typha server to send a hello and returns true if
-// the server supports node resource updates. If the given timeout is reached, an error is returned.
-func (s *SyncerClient) SupportsNodeResourceUpdates(timeout time.Duration) (bool, error) {
-	// If a previous call has already marked the handshake as complete, then just return the value.
-	if s.handshakeStatus.complete {
-		return s.supportsNodeResourceUpdates, nil
-	}
-
-	select {
-	case <-s.handshakeStatus.helloReceivedChan:
-		s.logCxt.Debug("Received MsgServerHello from server")
-		s.handshakeStatus.complete = true
-		return s.supportsNodeResourceUpdates, nil
-	case <-time.After(timeout):
-		// fallthrough
-	}
-
-	return false, fmt.Errorf("Timed out waiting for handshake to complete")
 }
 
 func (s *SyncerClient) connect(cxt context.Context, typhaAddr discovery.Typha) error {
@@ -281,7 +324,10 @@ func (s *SyncerClient) connect(cxt context.Context, typhaAddr discovery.Typha) e
 			log.WithError(err).Error("Failed to load certificate and key")
 			return err
 		}
-		tlsConfig := calicotls.NewTLSConfig()
+		tlsConfig, err := calicotls.NewTLSConfig()
+		if err != nil {
+			return fmt.Errorf("failed to create TLS Config: %w", err)
+		}
 		tlsConfig.Certificates = []tls.Certificate{cert}
 		// Typha API is a private binary API so we can enforce a recent TLS variant without
 		// worrying about back-compatibility with old browsers (for example).
@@ -301,7 +347,7 @@ func (s *SyncerClient) connect(cxt context.Context, typhaAddr discovery.Typha) e
 		ok := tlsConfig.RootCAs.AppendCertsFromPEM(caPEMBlock)
 		if !ok {
 			log.Error("Failed to add CA data to pool")
-			return errors.New("Failed to add CA data to pool")
+			return errors.New("failed to add CA data to pool")
 		}
 		tlsConfig.VerifyPeerCertificate = tlsutils.CertificateVerifier(
 			logCxt,
@@ -400,26 +446,43 @@ func (s *SyncerClient) logConnectionFailure(cxt context.Context, logCxt *log.Ent
 	logCxt.WithError(err).Errorf("Failed to %s", operation)
 }
 
-func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
-	defer s.Finished.Done()
+func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc, connFinished *sync.WaitGroup) {
+	defer connFinished.Done()
 	defer cancelFn()
+	defer func() {
+		if s.decompressor != nil {
+			s.decompressor.Close()
+			s.decompressor = nil
+		}
+	}()
 
 	logCxt := s.logCxt.WithField("connection", s.connInfo)
 	logCxt.Info("Started Typha client main loop")
+	s.callbacks.OnStatusUpdated(api.ResyncInProgress)
 
 	// Always start with basic gob encoding for the handshake.  We may upgrade to a compressed version below.
 	s.encoder = gob.NewEncoder(s.connection)
-	s.decoder = gob.NewDecoder(s.connR)
+	if err := s.swapDecompressor(syncproto.CompressionNone); err != nil {
+		logCxt.WithError(err).Error("Failed to create decoder")
+		return
+	}
 
 	ourSyncerType := s.options.SyncerType
 	if ourSyncerType == "" {
 		ourSyncerType = syncproto.SyncerTypeFelix
 	}
-	compAlgs := []syncproto.CompressionAlgorithm{syncproto.CompressionSnappy}
+	compAlgs := s.options.PreferredCompressionAlgorithmOrder
+	if compAlgs == nil {
+		compAlgs = slices.Clone(syncproto.AllCompressionAlgorithms[:])
+	}
 	if s.options.DisableDecoderRestart {
 		// Compression requires decoder restart.
 		compAlgs = nil
 	}
+	// An uncompressed stream needs no support from us, so it is always in
+	// the set, whatever we advertise.
+	s.advertisedCompressionAlgs = set.From(compAlgs...)
+	s.advertisedCompressionAlgs.Add(syncproto.CompressionNone)
 	err := s.sendMessageToServer(cxt, logCxt, "send hello to server",
 		syncproto.MsgClientHello{
 			Hostname:                       s.myHostname,
@@ -427,8 +490,9 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 			Info:                           s.myInfo,
 			SyncerType:                     ourSyncerType,
 			SupportsDecoderRestart:         !s.options.DisableDecoderRestart,
+			SupportsModernPolicyKeys:       true,
 			SupportedCompressionAlgorithms: compAlgs,
-			ClientConnID:                   s.ID,
+			ClientConnID:                   s.connID,
 		},
 	)
 	if err != nil {
@@ -450,12 +514,13 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 	}
 	logCxt.WithField("serverMsg", serverHello).Info("ServerHello message received")
 
-	// Check whether Typha supports node resource updates.
+	// Abort if it looks like we're talking to an ancient Typha.  We used to
+	// allow the connection and inform the client, but that's not easy to
+	// do now that we reconnect to Typha on failure.
 	if !serverHello.SupportsNodeResourceUpdates {
-		logCxt.Info("Server responded without support for node resource updates, assuming older Typha")
+		logCxt.Warn("Server responded without support for node resource updates, disconnecting.")
+		return
 	}
-	s.supportsNodeResourceUpdates = serverHello.SupportsNodeResourceUpdates
-	s.handshakeStatus.helloReceivedChan <- struct{}{}
 
 	// Check the SyncerType reported by the server.  If the server is too old to support SyncerType then
 	// the message will have an empty string in place of the SyncerType.  In that case we only proceed if
@@ -495,7 +560,6 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 			logCxt.Debug("Pong sent to Typha")
 		case syncproto.MsgKVs:
 			updates := make([]api.Update, 0, len(msg.KVs))
-			keys := make([]string, 0, len(msg.KVs))
 			if s.options.DebugDiscardKVUpdates {
 				// For simulating lots of clients in tests, just throw away the data.
 				continue
@@ -513,9 +577,8 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 					}).Debug("Decoded update from Typha")
 				}
 				updates = append(updates, update)
-				keys = append(keys, kv.Key)
 			}
-			s.callbacks.OnUpdatesKeysKnown(updates, keys)
+			s.callbacks.OnUpdates(updates)
 		case syncproto.MsgDecoderRestart:
 			if s.options.DisableDecoderRestart {
 				log.Error("Server sent MsgDecoderRestart but we signalled no support.")
@@ -534,16 +597,27 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 }
 
 func (s *SyncerClient) restartDecoder(cxt context.Context, logCxt *log.Entry, msg syncproto.MsgDecoderRestart) error {
-	logCxt.WithField("msg", msg).Info("Server asked us to restart our decoder")
-	// Check if we should enable compression.
-	switch msg.CompressionAlgorithm {
-	case syncproto.CompressionSnappy:
-		logCxt.Info("Server selected snappy compression.")
-		r := snappy.NewReader(s.connR)
-		s.decoder = gob.NewDecoder(r)
-	case "":
-		logCxt.Info("Server selected no compression.")
-		s.decoder = gob.NewDecoder(s.connR)
+	logCxt.WithFields(log.Fields{
+		"msg":         msg,
+		"compression": msg.CompressionAlgorithm,
+	}).Info("Server asked us to restart our decoder")
+	// The server must pick from the algorithms we advertised.  Anything
+	// else is a protocol violation; don't decode with an algorithm we never
+	// offered.
+	if !s.advertisedCompressionAlgs.Contains(msg.CompressionAlgorithm) {
+		logCxt.WithField("compression", msg.CompressionAlgorithm).Error(
+			"Server selected a compression algorithm that we didn't advertise.")
+		return fmt.Errorf("server selected compression algorithm %q, which we didn't advertise",
+			msg.CompressionAlgorithm)
+	}
+	// The restart message is the last data in the old stream and the server
+	// closed the stream right after it, so the old decompressor has consumed
+	// exactly the old stream's bytes from the connection.  Discard it and
+	// start a fresh one for the new stream; syncproto.Decompressor
+	// guarantees no read-ahead across the boundary.
+	if err := s.swapDecompressor(msg.CompressionAlgorithm); err != nil {
+		logCxt.WithError(err).Error("Failed to restart decoder")
+		return err
 	}
 	// Server requires an ack of the MsgDecoderRestart before it can send data in the new format.
 	err := s.sendMessageToServer(cxt, logCxt, "send ACK to server",
@@ -552,9 +626,28 @@ func (s *SyncerClient) restartDecoder(cxt context.Context, logCxt *log.Entry, ms
 	return err
 }
 
+// swapDecompressor closes the current decompressor (if any) and installs a
+// fresh one reading from the connection, along with a fresh gob decoder.
+func (s *SyncerClient) swapDecompressor(algorithm syncproto.CompressionAlgorithm) error {
+	// Close the old decompressor first so that at most one decompressor ever
+	// holds the connection's reader.
+	if s.decompressor != nil {
+		s.decompressor.Close()
+		s.decompressor = nil
+	}
+	d, err := syncproto.NewDecompressor(algorithm, s.connR)
+	if err != nil {
+		return err
+	}
+	s.decompressor = d
+	s.decoder = gob.NewDecoder(d)
+	s.negotiatedCompression.Store(algorithm)
+	return nil
+}
+
 // sendMessageToServer sends a single value-type MsgXYZ object to the server.  It updates the connection's
 // write deadline to ensure we don't block forever.  Logs errors via logConnectionFailure.
-func (s *SyncerClient) sendMessageToServer(cxt context.Context, logCxt *log.Entry, op string, message interface{}) error {
+func (s *SyncerClient) sendMessageToServer(cxt context.Context, logCxt *log.Entry, op string, message any) error {
 	err := s.connection.SetWriteDeadline(time.Now().Add(s.options.writeTimeout()))
 	if err != nil {
 		s.logConnectionFailure(cxt, logCxt, err, "set timeout before "+op)
@@ -572,7 +665,7 @@ func (s *SyncerClient) sendMessageToServer(cxt context.Context, logCxt *log.Entr
 
 // readMessageFromServer reads a single value-type MsgXYZ object from the server.  It updates the connection's
 // read deadline to ensure we don't block forever.  Logs errors via logConnectionFailure.
-func (s *SyncerClient) readMessageFromServer(cxt context.Context, logCxt *log.Entry) (interface{}, error) {
+func (s *SyncerClient) readMessageFromServer(cxt context.Context, logCxt *log.Entry) (any, error) {
 	var envelope syncproto.Envelope
 	// Update the read deadline before we try to read, otherwise we could block for a very long time if the
 	// TCP connection was severed without being cleanly shut down.  Typha sends regular pings so we should receive

@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,36 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+	log "github.com/sirupsen/logrus"
 
 	. "github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
 
-var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
+var _ = infrastructure.DatastoreDescribe("IPv6 iptables/nftables tests", []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
 	if BPFMode() {
 		return
 	}
@@ -58,7 +51,7 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 		options = infrastructure.DefaultTopologyOptions()
 		options.EnableIPv6 = true
 		options.FelixLogSeverity = "Debug"
-		options.IPIPEnabled = false
+		options.IPIPMode = api.IPIPModeNever
 
 		iOpts := []infrastructure.CreateOption{
 			infrastructure.K8sWithIPv6(),
@@ -74,36 +67,7 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 		}
 	})
 
-	JustAfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			for _, felix := range tc.Felixes {
-				felix.Exec("conntrack", "-L")
-				felix.Exec("ip6tables-save", "-c")
-				felix.Exec("ip", "-6", "link")
-				felix.Exec("ip", "-6", "addr")
-				felix.Exec("ip", "-6", "rule")
-				felix.Exec("ip", "-6", "route")
-				felix.Exec("ip", "-6", "route", "show", "table", "1")
-				felix.Exec("ip", "-6", "neigh")
-			}
-		}
-	})
-
-	AfterEach(func() {
-		log.Info("AfterEach starting")
-		for _, f := range tc.Felixes {
-			f.Stop()
-		}
-		log.Info("AfterEach done")
-	})
-
-	AfterEach(func() {
-		infra.Stop()
-	})
-
-	var (
-		w [2][2]*workload.Workload
-	)
+	var w [2][2]*workload.Workload
 
 	setupCluster := func() {
 		tc, calicoClient = infrastructure.StartNNodeTopology(2, options, infra)
@@ -115,6 +79,7 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 
 			wIP := net.ParseIP(fmt.Sprintf("dead:beef::%d:%d", ii, wi+2)).String()
 			wName := fmt.Sprintf("w%d%d", ii, wi)
+			infrastructure.AssignIP(wName, wIP, tc.Felixes[ii].Hostname, calicoClient)
 
 			w := workload.New(tc.Felixes[ii], wName, "default",
 				wIP, strconv.Itoa(port), "tcp")
@@ -123,23 +88,10 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 
 			w.WorkloadEndpoint.Labels = labels
 			if run {
-				err := w.Start()
+				err := w.Start(infra)
 				Expect(err).NotTo(HaveOccurred())
 				w.ConfigureInInfra(infra)
 			}
-			if options.UseIPPools {
-				// Assign the workload's IP in IPAM, this will trigger calculation of routes.
-				err := calicoClient.IPAM().AssignIP(context.Background(), ipam.AssignIPArgs{
-					IP:       cnet.MustParseIP(wIP),
-					HandleID: &w.Name,
-					Attrs: map[string]string{
-						ipam.AttributeNode: tc.Felixes[ii].Hostname,
-					},
-					Hostname: tc.Felixes[ii].Hostname,
-				})
-				Expect(err).NotTo(HaveOccurred())
-			}
-
 			return w
 		}
 
@@ -198,11 +150,16 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 
 			pol = createPolicy(pol)
 
+			listCmd := []string{"iptables-save", "-t", "filter"}
+			if NFTMode() {
+				listCmd = []string{"nft", "list", "table", "calico"}
+			}
+
 			By("Syncing with policy that blocks ICMPv6")
 			rulesProgrammed := func() bool {
-				out0, err := tc.Felixes[0].ExecOutput("iptables-save", "-t", "filter")
+				out0, err := tc.Felixes[0].ExecOutput(listCmd...)
 				Expect(err).NotTo(HaveOccurred())
-				out1, err := tc.Felixes[1].ExecOutput("iptables-save", "-t", "filter")
+				out1, err := tc.Felixes[1].ExecOutput(listCmd...)
 				Expect(err).NotTo(HaveOccurred())
 				if strings.Count(out0, pol.Name) == 0 {
 					return false
@@ -212,8 +169,7 @@ var _ = infrastructure.DatastoreDescribe("IPv6 iptables tests", []apiconfig.Data
 				}
 				return true
 			}
-			Eventually(rulesProgrammed, "10s", "1s").Should(BeTrue(),
-				"Expected iptables rules to appear on the correct felix instances")
+			Eventually(rulesProgrammed, "10s", "1s").Should(BeTrue(), "Expected rules to appear on the correct felix instances")
 
 			By("Testing connectivity - it requires some ICMPv6")
 			cc.ExpectSome(w[0][1], w[0][0])

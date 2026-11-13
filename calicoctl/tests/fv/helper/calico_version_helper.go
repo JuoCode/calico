@@ -21,10 +21,9 @@ import (
 
 	"github.com/docopt/docopt-go"
 
-	clientv3 "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
+	clientv3 "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
 
 var VERSION string
@@ -52,7 +51,7 @@ Description:
 	}
 
 	if context := parsedArgs["--context"]; context != nil {
-		os.Setenv("K8S_CURRENT_CONTEXT", context.(string))
+		_ = os.Setenv("K8S_CURRENT_CONTEXT", context.(string))
 	}
 
 	cf, _ := parsedArgs["--config"].(string)

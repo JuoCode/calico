@@ -5,6 +5,8 @@
 #ifndef __CALI_RULE_COUNTERS_H__
 #define __CALI_RULE_COUNTERS_H__
 
+#include "cali_bpf.h"
+#include "log.h"
 #include "types.h"
 
 CALI_MAP(cali_rule_ctrs, 2,
@@ -26,7 +28,7 @@ static CALI_BPF_INLINE void update_rule_counters(struct cali_tc_ctx *ctx) {
 		} else {
 			ret = cali_rule_ctrs_update_elem(&ruleId, &value, 0);
 			if (ret != 0) {
-				CALI_DEBUG("error creating rule counter map entry 0x%x\n", ruleId);
+				CALI_DEBUG("error creating rule counter map entry 0x%x", ruleId);
 			}
 		}
 	}

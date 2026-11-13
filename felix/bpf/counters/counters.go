@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	MaxCounterNumber    int = 14
+	MaxCounterNumber    int = 29
 	counterMapKeySize   int = 8
 	counterMapValueSize int = 8
 )
@@ -72,6 +72,25 @@ const (
 	DroppedFailedDecap
 	DroppedUnauthSource
 	DroppedUnknownRoute
+	DroppedBlackholeRoute
+	SourceCollisionHit
+	SourceCollisionResolutionFailed
+	ConntrackCreateFailed
+	Redirect
+	RedirectNeigh
+	RedirectPeer
+	DroppedFragWait
+	DroppedFragReorder
+	DroppedFragUnsupported
+	DroppedQoS
+	Reserved1 // Calico Enterprise: AcceptedByEgressGW
+	DroppedMaglevNoBackend
+	DroppedNoHostIP
+	Reserved2 // Calico Enterprise: DroppedL2UnsupportedVLAN
+	DroppedRPF
+	// Add counters above this
+	AcceptedByXDP
+	WEPNotReady
 )
 
 type Description struct {
@@ -150,6 +169,62 @@ var descriptions DescList = DescList{
 		Counter:  DroppedUnknownRoute,
 		Category: "Dropped", Caption: "packets with unknown route",
 	},
+	{
+		Counter:  DroppedBlackholeRoute,
+		Category: "Dropped", Caption: "packets hitting blackhole route",
+	},
+	{
+		Counter:  SourceCollisionHit,
+		Category: "Other", Caption: "packets hitting NAT source collision",
+	},
+	{
+		Counter:  ConntrackCreateFailed,
+		Category: "Dropped", Caption: "failed to create conntrack",
+	},
+	{
+		Counter:  SourceCollisionResolutionFailed,
+		Category: "Dropped", Caption: "NAT source collision resolution failed",
+	},
+	{
+		Counter:  Redirect,
+		Category: "Redirect", Caption: "plain",
+	},
+	{
+		Counter:  RedirectNeigh,
+		Category: "Redirect", Caption: "neigh",
+	},
+	{
+		Counter:  RedirectPeer,
+		Category: "Redirect", Caption: "peer",
+	},
+	{
+		Counter:  DroppedFragWait,
+		Category: "Dropped", Caption: "fragment of yet incomplete packet",
+	},
+	{
+		Counter:  DroppedFragReorder,
+		Category: "Dropped", Caption: "fragment out of order within host",
+	},
+	{
+		Counter:  DroppedFragUnsupported,
+		Category: "Dropped", Caption: "fragments not supported",
+	},
+	{
+		Counter:  DroppedQoS,
+		Category: "Dropped", Caption: "QoS control limit",
+	},
+	{
+		Counter:  DroppedMaglevNoBackend,
+		Category: "Dropped", Caption: "Maglev lookup found no backends for service IP",
+	},
+	{
+		Counter:  DroppedNoHostIP,
+		Category: "Dropped", Caption: "VXLAN encap when host IP unknown",
+	},
+	{
+		Counter:  DroppedRPF,
+		Category: "Dropped", Caption: "by workload RPF check",
+	},
 }
 
 func Descriptions() DescList {
@@ -186,7 +261,7 @@ func EnsureExists(m maps.Map, ifindex int, hook hook.Hook) error {
 	err := m.(maps.MapWithUpdateWithFlags).
 		UpdateWithFlags(NewKey(ifindex, hook).AsBytes(), zeroVal, unix.BPF_NOEXIST)
 	if err != nil && !os.IsExist(err) {
-		return fmt.Errorf("failed to ensure counters map. err=%v", err)
+		return fmt.Errorf("failed to create zero counters for ifindex %d hook %s. err=%v", ifindex, hook, err)
 	}
 	return nil
 }

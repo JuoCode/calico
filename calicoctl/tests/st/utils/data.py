@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
+# Copyright (c) 2015-2025 Tigera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,12 +26,13 @@
 # resource).
 import netaddr
 
-from utils import API_VERSION
+from .utils import API_VERSION
 
 # Large list of CIDRs for testing truncation of certain fields.
 many_nets = []
-for i in xrange(10000):
+for i in range(10000):
     many_nets.append("10.%s.%s.0/28" % (i >> 8, i % 256))
+
 
 #
 # IPPools
@@ -48,6 +49,7 @@ ippool_name1_rev1_v4 = {
         'vxlanMode': 'Never',
         'blockSize': 27,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "foo == 'bar'",
     }
 }
@@ -58,8 +60,8 @@ ippool_name1_rev1_table = (
 )
 
 ippool_name1_rev1_wide_table = (
-    "NAME           CIDR          NAT     IPIPMODE   VXLANMODE   DISABLED   DISABLEBGPEXPORT   SELECTOR       \n"
-    "ippool-name1   10.0.1.0/24   false   Always     Never       false      false              foo == 'bar'"
+    "NAME           CIDR          NAT     IPIPMODE   VXLANMODE   DISABLED   DISABLEBGPEXPORT   SELECTOR       ASSIGNMENTMODE   \n"
+    "ippool-name1   10.0.1.0/24   false   Always     Never       false      false              foo == 'bar'   Automatic"
 )
 
 ippool_name1_rev2_v4 = {
@@ -125,6 +127,7 @@ ippool_name1_rev1_split1_v4 = {
         'vxlanMode': 'Never',
         'blockSize': 27,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "foo == 'bar'",
     }
 }
@@ -141,6 +144,7 @@ ippool_name1_rev1_split2_v4 = {
         'vxlanMode': 'Never',
         'blockSize': 27,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "foo == 'bar'",
     }
 }
@@ -157,6 +161,7 @@ ippool_name1_rev1_split3_v4 = {
         'vxlanMode': 'Never',
         'blockSize': 27,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "foo == 'bar'",
     }
 }
@@ -173,6 +178,7 @@ ippool_name1_rev1_split4_v4 = {
         'vxlanMode': 'Never',
         'blockSize': 27,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "foo == 'bar'",
     }
 }
@@ -189,6 +195,7 @@ ippool_name2_rev1_v6 = {
         'vxlanMode': 'Never',
         'blockSize': 123,
         'allowedUses': ["Workload", "Tunnel"],
+        'assignmentMode': 'Automatic',
         'nodeSelector': "all()",
     }
 }
@@ -223,6 +230,28 @@ ipresv_name1_rev1_v4_long = {
         'reservedCIDRs': many_nets,
     }
 }
+
+#
+# BGP filters
+#
+
+bgpfilter_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'BGPFilter',
+    'metadata': {
+        'name': 'bgpfilter-name1'
+    },
+    'spec': {
+        'exportv4': [
+            {
+                'cidr': '10.0.0.0/16',
+                'matchOperator': 'Equal',
+                'action': 'Accept',
+            },
+        ],
+    }
+}
+
 
 #
 # BGPPeers
@@ -304,16 +333,43 @@ bgppeer_multiple_invalid = [{
 }]
 
 #
+# Tier1
+#
+
+tier_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'Tier',
+    'metadata': {
+        'name': 'admin',
+    },
+    'spec': {
+        'Order': 10000,
+    },
+}
+
+tier_name2_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'Tier',
+    'metadata': {
+        'name': 'before',
+    },
+    'spec': {
+        'Order': 100,
+    },
+}
+
+#
 # Network Policy
 #
 networkpolicy_name1_rev1 = {
     'apiVersion': API_VERSION,
     'kind': 'NetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy1',
+        'name': 'default.policy-mypolicy1',
         'namespace': 'default'
     },
     'spec': {
+        'tier': 'default',
         'order': 100,
         'selector': "type=='database'",
         'types': ['Ingress', 'Egress'],
@@ -355,10 +411,11 @@ networkpolicy_name1_rev2 = {
     'apiVersion': API_VERSION,
     'kind': 'NetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy1',
+        'name': 'default.policy-mypolicy1',
         'namespace': 'default'
     },
     'spec': {
+        'tier': "default",
         'order': 100000,
         'selector': "type=='sql'",
         'types': ['Ingress', 'Egress'],
@@ -381,7 +438,7 @@ networkpolicy_name2_rev1 = {
     'apiVersion': API_VERSION,
     'kind': 'NetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy2',
+        'name': 'default.policy-mypolicy2',
         'namespace': 'default',
         'generateName': 'test-policy-',
         'deletionTimestamp': '2006-01-02T15:04:07Z',
@@ -403,6 +460,7 @@ networkpolicy_name2_rev1 = {
         'creationTimestamp': '2006-01-02T15:04:05Z',
     },
     'spec': {
+        'tier': "default",
         'order': 100000,
         'selector': "type=='sql'",
         'types': ['Ingress', 'Egress'],
@@ -421,14 +479,46 @@ networkpolicy_name2_rev1 = {
     }
 }
 
-networkpolicy_name3_rev1 = {
+networkpolicy_tiered_name2_rev1 = {
     'apiVersion': API_VERSION,
     'kind': 'NetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy3',
-        'namespace': 'test',
+        'name': 'admin.mypolicy2',
+        'namespace': 'default'
     },
     'spec': {
+        'tier': 'admin',
+        'order': 100000,
+        'selector': "type=='sql'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+#
+# Staged Network Policy
+#
+stagednetworkpolicy_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedNetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mystagedpolicy1',
+        'namespace': 'default'
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'tier': 'default',
         'order': 100,
         'selector': "type=='database'",
         'types': ['Ingress', 'Egress'],
@@ -466,6 +556,178 @@ networkpolicy_name3_rev1 = {
     }
 }
 
+stagednetworkpolicy_name1_rev2 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedNetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mystagedpolicy1',
+        'namespace': 'default'
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'tier': "default",
+        'order': 100000,
+        'selector': "type=='sql'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+stagednetworkpolicy_name2_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedNetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mystagedpolicy2',
+        'namespace': 'default',
+        'generateName': 'test-policy-',
+        'deletionTimestamp': '2006-01-02T15:04:07Z',
+        'deletionGracePeriodSeconds': 30,
+        'ownerReferences': [{
+            'apiVersion': 'extensions/v1beta1',
+            'blockOwnerDeletion': True,
+            'controller': True,
+            'kind': 'DaemonSet',
+            'name': 'endpoint1',
+            'uid': 'test-uid-change',
+        }],
+        'labels': {'label1': 'l1', 'label2': 'l2'},
+        'annotations': {'key': 'value'},
+        'selfLink': 'test-self-link',
+        'uid': 'test-uid-change',
+        'generation': 3,
+        'finalizers': ['finalizer1', 'finalizer2'],
+        'creationTimestamp': '2006-01-02T15:04:05Z',
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'tier': "default",
+        'order': 100000,
+        'selector': "type=='sql'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+stagednetworkpolicy_tiered_name2_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedNetworkPolicy',
+    'metadata': {
+        'name': 'admin.mystagedpolicy2',
+        'namespace': 'default'
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'tier': 'admin',
+        'order': 100000,
+        'selector': "type=='sql'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+#
+# Staged Kubernetes Network Policy
+#
+stagedk8snetworkpolicy_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedKubernetesNetworkPolicy',
+    'metadata': {
+        'name': 'mystagedk8spolicy1',
+        'namespace': 'default'
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'podSelector': {
+            'matchLabels': {"role": 'db',}
+        },
+        'ingress': [
+            {
+                'from': [
+                    {
+                        'namespaceSelector': {
+                            'matchLabels': {"project": 'test',},
+                        },
+                        'podSelector': {
+                            'matchLabels': {"role": 'frontend',},
+                        },
+                    },
+                ],
+                'ports': [
+                    {
+                        'port': 6379,
+                        'protocol': 'TCP',
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+stagedk8snetworkpolicy_name1_rev2 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedKubernetesNetworkPolicy',
+    'metadata': {
+        'name': 'mystagedk8spolicy1',
+        'namespace': 'default'
+    },
+    'spec': {
+        'stagedAction': 'Set',
+        'podSelector': {
+            'matchLabels': {"role": 'db',}
+        },
+        'ingress': [
+            {
+                'from': [
+                    {
+                        'namespaceSelector': {
+                            'matchLabels': {"project": 'test',},
+                        },
+                    },
+                ],
+                'ports': [
+                    {
+                        'port': 6379,
+                        'protocol': 'TCP',
+                    },
+                ],
+            },
+        ],
+    }
+}
+
 #
 # Global Network Policy
 #
@@ -473,9 +735,10 @@ globalnetworkpolicy_name1_rev1 = {
     'apiVersion': API_VERSION,
     'kind': 'GlobalNetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy1',
+        'name': 'default.policy-mypolicy1',
     },
     'spec': {
+        'tier': "default",
         'order': 100,
         'selector': "type=='database'",
         'types': ['Ingress', 'Egress'],
@@ -517,9 +780,192 @@ globalnetworkpolicy_name1_rev2 = {
     'apiVersion': API_VERSION,
     'kind': 'GlobalNetworkPolicy',
     'metadata': {
-        'name': 'policy-mypolicy1',
+        'name': 'default.policy-mypolicy1',
     },
     'spec': {
+        'tier': "default",
+        'order': 100000,
+        'selector': "type=='sql'",
+        'doNotTrack': True,
+        'applyOnForward': True,
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+globalnetworkpolicy_tiered_name2_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'GlobalNetworkPolicy',
+    'metadata': {
+        'name': 'admin.mypolicy2',
+    },
+    'spec': {
+        'tier': 'admin',
+        'order': 100000,
+        'selector': "type=='sql'",
+        'doNotTrack': True,
+        'applyOnForward': True,
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+networkpolicy_name3_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'NetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mypolicy3',
+        'namespace': 'test',
+    },
+    'spec': {
+        'tier': "default",
+        'order': 100,
+        'selector': "type=='database'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Allow',
+                'source': {
+                    'selector': "type=='application'"},
+            },
+        ],
+        'ingress': [
+            {
+                'ipVersion': 4,
+                'action': 'Deny',
+                'destination': {
+                    'notNets': ['10.3.0.0/16'],
+                    'notPorts': ['110:1050'],
+                    'notSelector': "type=='apples'",
+                    'nets': ['10.2.0.0/16'],
+                    'ports': ['100:200'],
+                    'selector': "type=='application'",
+                },
+                'protocol': 'TCP',
+                'source': {
+                    'notNets': ['10.1.0.0/16'],
+                    'notPorts': [1050],
+                    'notSelector': "type=='database'",
+                    'nets': ['10.0.0.0/16'],
+                    'ports': [1234, '10:1024'],
+                    'selector': "type=='application'",
+                    'namespaceSelector': 'has(role)',
+                }
+            }
+        ],
+    }
+}
+
+
+#
+# Staged Global Network Policy
+#
+stagedglobalnetworkpolicy_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedGlobalNetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mystagedpolicy1',
+    },
+    'spec': {
+        'stagedAction': "Set",
+        'tier': "default",
+        'order': 100,
+        'selector': "type=='database'",
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Allow',
+                'source': {
+                    'selector': "type=='application'"},
+            },
+        ],
+        'ingress': [
+            {
+                'ipVersion': 4,
+                'action': 'Deny',
+                'destination': {
+                    'notNets': ['10.3.0.0/16'],
+                    'notPorts': ['110:1050'],
+                    'notSelector': "type=='apples'",
+                    'nets': ['10.2.0.0/16'],
+                    'ports': ['100:200'],
+                    'selector': "type=='application'",
+                },
+                'protocol': 'TCP',
+                'source': {
+                    'notNets': ['10.1.0.0/16'],
+                    'notPorts': [1050],
+                    'notSelector': "type=='database'",
+                    'nets': ['10.0.0.0/16'],
+                    'ports': [1234, '10:1024'],
+                    'selector': "type=='application'",
+                    'namespaceSelector': 'has(role)',
+                }
+            }
+        ],
+    }
+}
+
+stagedglobalnetworkpolicy_name1_rev2 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedGlobalNetworkPolicy',
+    'metadata': {
+        'name': 'default.policy-mystagedpolicy1',
+    },
+    'spec': {
+        'stagedAction': "Set",
+        'tier': "default",
+        'order': 100000,
+        'selector': "type=='sql'",
+        'doNotTrack': True,
+        'applyOnForward': True,
+        'types': ['Ingress', 'Egress'],
+        'egress': [
+            {
+                'action': 'Deny',
+                'protocol': 'TCP',
+            },
+        ],
+        'ingress': [
+            {
+                'action': 'Allow',
+                'protocol': 'UDP',
+            },
+        ],
+    }
+}
+
+stagedglobalnetworkpolicy_tiered_name2_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'StagedGlobalNetworkPolicy',
+    'metadata': {
+        'name': 'admin.mystagedpolicy2',
+    },
+    'spec': {
+        'stagedAction': "Set",
+        'tier': 'admin',
         'order': 100000,
         'selector': "type=='sql'",
         'doNotTrack': True,
@@ -557,7 +1003,7 @@ globalnetworkset_name1_rev1 = {
             "11.0.0.0/16",
             "feed:beef::1",
             "dead:beef::96",
-        ]
+        ],
     }
 }
 
@@ -620,7 +1066,7 @@ networkset_name2_rev1 = {
 # - Kubernetes' gRPC API has a 4MB message size limit.
 # - etcdv3 has a 1MB value size limit.
 many_nets = []
-for i in xrange(10000):
+for i in range(10000):
     many_nets.append("10.%s.%s.0/28" % (i >> 8, i % 256))
 networkset_name1_rev1_large = {
     'apiVersion': API_VERSION,
@@ -898,6 +1344,8 @@ bgpconfig_name1_rev1 = {
         'logSeverityScreen': 'Info',
         'nodeToNodeMeshEnabled': True,
         'asNumber': 6512,
+        'serviceLoadBalancerAggregation': 'Enabled',
+        'programClusterRoutes': 'EnabledNoEncapOnly',
     }
 }
 
@@ -911,6 +1359,7 @@ bgpconfig_name1_rev2 = {
         'logSeverityScreen': 'Info',
         'nodeToNodeMeshEnabled': False,
         'asNumber': 6511,
+        'serviceLoadBalancerAggregation': 'Enabled',
     }
 }
 
@@ -922,6 +1371,7 @@ bgpconfig_name2_rev1 = {
     },
     'spec': {
         'logSeverityScreen': 'Info',
+        'serviceLoadBalancerAggregation': 'Enabled',
     }
 }
 
@@ -933,6 +1383,7 @@ bgpconfig_name2_rev2 = {
     },
     'spec': {
         'logSeverityScreen': 'Debug',
+        'serviceLoadBalancerAggregation': 'Enabled',
     }
 }
 
@@ -945,6 +1396,7 @@ bgpconfig_name2_rev3 = {
     'spec': {
         'logSeverityScreen': 'Debug',
         'nodeToNodeMeshEnabled': True,
+        'serviceLoadBalancerAggregation': 'Enabled',
     }
 }
 
@@ -956,6 +1408,8 @@ bgpconfig_name3_rev1 = {
     },
     'spec': {
         'logSeverityScreen': 'Debug',
+        'serviceLoadBalancerAggregation': 'Enabled',
+        'programClusterRoutes': 'EnabledNoEncapOnly',
     }
 }
 
@@ -967,6 +1421,7 @@ bgpconfig_name4_rev1 = {
     },
     'spec': {
         'logSeverityScreen': 'Debug',
+        'serviceLoadBalancerAggregation': 'Enabled',
     }
 }
 
@@ -993,9 +1448,7 @@ felixconfig_name1_rev1 = {
         'ipipMTU': 1521,
         'ipsetsRefreshInterval': '44s',
         'iptablesFilterAllowAction': 'Return',
-        'iptablesLockFilePath': '/run/fun',
         'iptablesLockProbeInterval': '500ms',
-        'iptablesLockTimeout': '22s',
         'iptablesMangleAllowAction': 'Accept',
         'iptablesMarkMask': 0xff0000,
         'iptablesPostWriteCheckInterval': '12s',
@@ -1068,9 +1521,7 @@ felixconfig_name2_rev1 = {
         'ipipMTU': 1521,
         'ipsetsRefreshInterval': '44s',
         'iptablesFilterAllowAction': 'Return',
-        'iptablesLockFilePath': '/run/fun',
         'iptablesLockProbeInterval': '500ms',
-        'iptablesLockTimeout': '22s',
         'iptablesMangleAllowAction': 'Accept',
         'iptablesMarkMask': 0xff0000,
         'iptablesPostWriteCheckInterval': '12s',
@@ -1114,9 +1565,7 @@ felixconfig_name3_rev1 = {
         'ipipMTU': 1521,
         'ipsetsRefreshInterval': '44s',
         'iptablesFilterAllowAction': 'Return',
-        'iptablesLockFilePath': '/run/fun',
         'iptablesLockProbeInterval': '500ms',
-        'iptablesLockTimeout': '22s',
         'iptablesMangleAllowAction': 'Accept',
         'iptablesMarkMask': 0xff0000,
         'iptablesPostWriteCheckInterval': '12s',
@@ -1168,7 +1617,6 @@ clusterinfo_name1_rev2 = {
     }
 }
 
-#
 # KubeControllersConfiguration
 #
 kubecontrollersconfig_name1_rev1 = {

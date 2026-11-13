@@ -53,6 +53,9 @@ bin_allow_list_patterns=(
   '/arp$'       # Used to add arp entries
   '/conntrack$' # Used to remove conntrack entries.
   '/ip$' # iproute2; used to add/manipulate routes etc.
+  # Not used by Felix; `calicoctl cluster diags` execs it to dump bridge
+  # state (VLAN membership, port flags, FDB), which `ip` does not expose.
+  '/bridge$'
   bpftool
 
   # iptables/ip sets
@@ -60,6 +63,10 @@ bin_allow_list_patterns=(
   iptables
   ip6tables
   ipset
+
+  # nftables
+  nftables
+  nft
 
   # kmod is a multi-binary backing depmod/insmod/etc; used by iptables
   kmod depmod insmod modinfo modprobe rmmod lsmod
@@ -108,7 +115,7 @@ bin_allow_list_patterns=(
   '/test$'
   ulimit
   uniq
-  wait
+  '/wait$'
   which
   whoami
   yes
@@ -221,16 +228,6 @@ while read -r path; do
     libs_to_keep[$path]=true
     continue
   fi
-  # These libraries and hmac files under /usr/lib64 are needed when ubi container
-  # is running in FIPS mode. They are not directly linked by the allowed binaries.
-  # * /usr/lib64/.libcrypto.so.x.y.z.hmac
-  # * /usr/lib64/.libssl.so.x.y.z.hmac
-  # * /usr/lib64/libssl.so.x.y.z
-  if [[ "$path" =~ .libcrypto|.libssl|libssl ]]; then
-    echo "FIPS PLUGIN: $path"
-    libs_to_keep[$path]=true
-    continue
-  fi
 done < <(find /usr/lib64 \( -type f -or -type l \))
 
 # Now remove all but a keep-list of RPM packages.  Cleaning up packages with rpm itself updates the
@@ -255,6 +252,7 @@ packages_to_keep=(
   langpacks
   libacl
   libattr
+  libbpf
   libcap
   libcrypto
   libelf
@@ -268,11 +266,14 @@ packages_to_keep=(
   libnss
   libpcap
   libpwquality
+  libreadline
   libselinux
+  libsigsegv # used by grep in ubi9
   libzstd
   libz
   ncurses
   net-tools
+  nftables
   openssl-libs
   p11-kit-trust
   pcre
@@ -315,10 +316,30 @@ packages_to_remove=$(microdnf repoquery --installed |
 
 
 echo "Removing ${packages_to_remove}"
-# Removing one of the packages deletes rc.local, move it out of the way.
-mv /etc/rc.local /etc/rc.local.bak
+
+# Removing one of the packages deletes some files that shouldn't be removed.
+# Move them out of the way first, then restore them.
+files_to_save=(
+  /etc/rc.local
+
+  # These are all used by the nft binary.
+  /usr/lib64/libreadline.so.*
+  /usr/lib64/libgmp.so.*
+  /usr/lib64/libjansson.so.*
+)
+for file in "${files_to_save[@]}"; do
+  fn=$(basename ${file})
+  echo "Moving ${file} -> /etc/${fn}.bak"
+  mv $file /etc/$fn.bak
+done
+
 rpm -e --nodeps $packages_to_remove
-mv /etc/rc.local.bak /etc/rc.local
+
+for file in "${files_to_save[@]}"; do
+  fn=$(basename ${file})
+  echo "Restoring /etc/${fn}.bak -> ${file}"
+  mv /etc/$fn.bak $file
+done
 
 # Sanity check that we didn't remove anything we want to keep.
 for path in "${!binaries_to_keep[@]}"; do

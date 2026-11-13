@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,16 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
 	"github.com/projectcalico/calico/felix/config"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/nftables/nftrender"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 const (
@@ -34,6 +36,7 @@ const (
 	// the end to reduce clashes with other apps.  Our OpenStack DHCP agent uses prefix
 	// 'calico-dhcp-', for example.
 	ChainNamePrefix = "cali-"
+
 	// IPSetNamePrefix: similarly for IP sets, we use the following prefix; the IP sets layer
 	// adds its own "-" so it isn't included here.
 	IPSetNamePrefix = ipsets.IPSetNamePrefix
@@ -50,6 +53,12 @@ const (
 	ChainFailsafeIn  = ChainNamePrefix + "failsafe-in"
 	ChainFailsafeOut = ChainNamePrefix + "failsafe-out"
 
+	ChainConnStateLog = ChainNamePrefix + "log-conn"
+
+	// ChainFlowOffload holds the nftables flow-offload rule and the exclusions
+	// that keep ineligible endpoints off the fast path.
+	ChainFlowOffload = ChainNamePrefix + "flow-offload"
+
 	ChainNATPrerouting  = ChainNamePrefix + "PREROUTING"
 	ChainNATPostrouting = ChainNamePrefix + "POSTROUTING"
 	ChainNATOutput      = ChainNamePrefix + "OUTPUT"
@@ -58,12 +67,20 @@ const (
 	ChainManglePrerouting  = ChainNamePrefix + "PREROUTING"
 	ChainManglePostrouting = ChainNamePrefix + "POSTROUTING"
 
-	IPSetIDNATOutgoingAllPools  = "all-ipam-pools"
+	ChainEgressDSCP      = ChainNamePrefix + "egress-dscp"
+	IPSetIDDSCPEndpoints = "dscp-src-net"
+
+	// IPSetIDNoFlowOffload holds the IPs of endpoints whose traffic must not take the
+	// nftables flowtable fast path.
+	IPSetIDNoFlowOffload = "no-flow-offload"
+
+	IPSetIDNetworkPools         = "network-ip-pools"
 	IPSetIDNATOutgoingMasqPools = "masq-ipam-pools"
 
 	IPSetIDAllHostNets        = "all-hosts-net"
 	IPSetIDAllVXLANSourceNets = "all-vxlan-net"
 	IPSetIDThisHostIPs        = "this-host"
+	IPSetIDAllIstioWEPs       = "all-istio-weps"
 
 	ChainFIPDnat = ChainNamePrefix + "fip-dnat"
 	ChainFIPSnat = ChainNamePrefix + "fip-snat"
@@ -81,6 +98,13 @@ const (
 	ChainWorkloadToHost       = ChainNamePrefix + "wl-to-host"
 	ChainFromWorkloadDispatch = ChainNamePrefix + "from-wl-dispatch"
 	ChainToWorkloadDispatch   = ChainNamePrefix + "to-wl-dispatch"
+
+	NftablesToWorkloadDispatchMap   = ChainNamePrefix + "to-wl-dispatch"
+	NftablesFromWorkloadDispatchMap = ChainNamePrefix + "from-wl-dispatch"
+
+	WorkloadARPPfx         = ChainNamePrefix + "arp-"
+	NftablesARPDispatchMap = ChainNamePrefix + "arp-dispatch"
+	ChainARPDispatch       = ChainNamePrefix + "arp-dispatch"
 
 	ChainDispatchToHostEndpoint          = ChainNamePrefix + "to-host-endpoint"
 	ChainDispatchFromHostEndpoint        = ChainNamePrefix + "from-host-endpoint"
@@ -109,7 +133,15 @@ const (
 
 	RPFChain = ChainNamePrefix + "rpf"
 
-	RuleHashPrefix = "cali:"
+	// NFLOGPrefixMaxLength is NFLOG max prefix length which is 64 characters.
+	// Ref: http://ipset.netfilter.org/iptables-extensions.man.html#lbDI
+	NFLOGPrefixMaxLength = 64
+
+	// NFLOG groups. 1 for inbound and 2 for outbound.  3 for
+	// snooping DNS response for domain information.
+	NFLOGInboundGroup  uint16 = 1
+	NFLOGOutboundGroup uint16 = 2
+	NFLOGDomainGroup   uint16 = 3
 
 	// HistoricNATRuleInsertRegex is a regex pattern to match to match
 	// special-case rules inserted by old versions of felix.  Specifically,
@@ -133,6 +165,67 @@ const (
 	PolicyDirectionOutbound PolicyDirection = "outbound" // AKA egress
 )
 
+type RuleAction byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleActionAllow RuleAction = 'A'
+	RuleActionDeny  RuleAction = 'D'
+	// Pass onto the next tier
+	RuleActionPass RuleAction = 'P'
+)
+
+func (r RuleAction) String() string {
+	switch r {
+	case RuleActionAllow:
+		return "Allow"
+	case RuleActionDeny:
+		return "Deny"
+	case RuleActionPass:
+		return "Pass"
+	}
+	return ""
+}
+
+type RuleDir byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleDirIngress RuleDir = 'I'
+	RuleDirEgress  RuleDir = 'E'
+)
+
+func (r RuleDir) String() string {
+	switch r {
+	case RuleDirIngress:
+		return "Ingress"
+	case RuleDirEgress:
+		return "Egress"
+	}
+	return ""
+}
+
+type RuleOwnerType byte
+
+const (
+	// We define these with specific byte values as we write this value directly into the NFLOG
+	// prefix.
+	RuleOwnerTypePolicy  RuleOwnerType = 'P'
+	RuleOwnerTypeProfile RuleOwnerType = 'R'
+)
+
+func (r RuleOwnerType) String() string {
+	switch r {
+	case RuleOwnerTypePolicy:
+		return "Policy"
+	case RuleOwnerTypeProfile:
+		return "Profile"
+	}
+	return ""
+}
+
 // Typedefs to prevent accidentally passing the wrong prefix to the Policy/ProfileChainName()
 type (
 	PolicyChainNamePrefix  string
@@ -140,27 +233,8 @@ type (
 )
 
 var (
-	// AllHistoricChainNamePrefixes lists all the prefixes that we've used for chains.  Keeping
-	// track of the old names lets us clean them up.
-	AllHistoricChainNamePrefixes = []string{
-		// Current.
-		"cali-",
-
-		// Early RCs of Felix 2.1 used "cali" as the prefix for some chains rather than
-		// "cali-".  This led to name clashes with the DHCP agent, which uses "calico-" as
-		// its prefix.  We need to explicitly list these exceptions.
-		"califw-",
-		"calitw-",
-		"califh-",
-		"calith-",
-		"calipi-",
-		"calipo-",
-
-		// Pre Felix v2.1.
-		"felix-",
-	}
-	// AllHistoricIPSetNamePrefixes, similarly contains all the prefixes we've ever used for IP
-	// sets.
+	// AllHistoricIPSetNamePrefixes contains all the prefixes we've ever used for IP sets, so that
+	// we can clean up the old ones.
 	AllHistoricIPSetNamePrefixes = []string{"felix-", "cali"}
 	// LegacyV4IPSetNames contains some extra IP set names that were used in older versions of
 	// Felix and don't fit our versioned pattern.
@@ -181,92 +255,133 @@ var (
 )
 
 type RuleRenderer interface {
-	StaticFilterTableChains(ipVersion uint8) []*iptables.Chain
-	StaticNATTableChains(ipVersion uint8) []*iptables.Chain
-	StaticNATPostroutingChains(ipVersion uint8) []*iptables.Chain
-	StaticRawTableChains(ipVersion uint8) []*iptables.Chain
-	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack bool) []*iptables.Chain
-	StaticMangleTableChains(ipVersion uint8) []*iptables.Chain
-	StaticFilterForwardAppendRules() []iptables.Rule
+	StaticFilterTableChains(ipVersion uint8) []*generictables.Chain
+	// FlowOffloadChain renders the flow-offload chain. Only meaningful under
+	// nftables flowtable offload; the caller checks that.
+	FlowOffloadChain(ipVersion uint8) *generictables.Chain
+	StaticNATTableChains(ipVersion uint8) []*generictables.Chain
+	StaticNATPostroutingChains(ipVersion uint8) []*generictables.Chain
+	StaticRawTableChains(ipVersion uint8) []*generictables.Chain
+	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack bool) []*generictables.Chain
+	StaticMangleTableChains(ipVersion uint8) []*generictables.Chain
+	StaticFilterForwardAppendRules() []generictables.Rule
 
-	WorkloadDispatchChains(map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
-	WorkloadEndpointToIptablesChains(ifaceName string, epMarkMapper EndpointMarkMapper, adminUp bool, ingressPolicies []*PolicyGroup, egressPolicies []*PolicyGroup, profileIDs []string) []*iptables.Chain
-	PolicyGroupToIptablesChains(group *PolicyGroup) []*iptables.Chain
+	DispatchMappings(map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) (map[string][]string, map[string][]string)
+	WorkloadDispatchChains(map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
+	WorkloadEndpointToIptablesChains(
+		ifaceName string,
+		epMarkMapper EndpointMarkMapper,
+		adminUp bool,
+		tiers []TierPolicyGroups,
+		profileIDs []string,
+		qosControls *proto.QoSControls,
+	) []*generictables.Chain
+	PolicyGroupToIptablesChains(group *PolicyGroup) []*generictables.Chain
 
-	WorkloadInterfaceAllowChains(endpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
+	WorkloadInterfaceAllowChains(endpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
 
 	EndpointMarkDispatchChains(
 		epMarkMapper EndpointMarkMapper,
-		wlEndpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint,
-		hepEndpoints map[string]proto.HostEndpointID,
-	) []*iptables.Chain
+		wlEndpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint,
+		hepEndpoints map[string]types.HostEndpointID,
+	) []*generictables.Chain
 
-	HostDispatchChains(map[string]proto.HostEndpointID, string, bool) []*iptables.Chain
-	FromHostDispatchChains(map[string]proto.HostEndpointID, string) []*iptables.Chain
-	ToHostDispatchChains(map[string]proto.HostEndpointID, string) []*iptables.Chain
+	HostDispatchChains(map[string]types.HostEndpointID, string, bool) []*generictables.Chain
+	FromHostDispatchChains(map[string]types.HostEndpointID, string) []*generictables.Chain
+	ToHostDispatchChains(map[string]types.HostEndpointID, string) []*generictables.Chain
 	HostEndpointToFilterChains(
 		ifaceName string,
+		tiers []TierPolicyGroups,
+		forwardTiers []TierPolicyGroups,
 		epMarkMapper EndpointMarkMapper,
-		ingressPolicies []*PolicyGroup,
-		egressPolicies []*PolicyGroup,
-		ingressForwardPolicies []*PolicyGroup,
-		egressForwardPolicies []*PolicyGroup,
 		profileIDs []string,
-	) []*iptables.Chain
+	) []*generictables.Chain
 	HostEndpointToMangleEgressChains(
 		ifaceName string,
-		egressPolicies []*PolicyGroup,
+		tiers []TierPolicyGroups,
 		profileIDs []string,
-	) []*iptables.Chain
+	) []*generictables.Chain
 	HostEndpointToRawEgressChain(
 		ifaceName string,
-		egressPolicies []*PolicyGroup,
-	) *iptables.Chain
+		untrackedTiers []TierPolicyGroups,
+	) *generictables.Chain
 	HostEndpointToRawChains(
 		ifaceName string,
-		ingressPolicies []*PolicyGroup,
-		egressPolicies []*PolicyGroup,
-	) []*iptables.Chain
+		untrackedTiers []TierPolicyGroups,
+	) []*generictables.Chain
 	HostEndpointToMangleIngressChains(
 		ifaceName string,
-		preDNATPolicies []*PolicyGroup,
-	) []*iptables.Chain
+		preDNATTiers []TierPolicyGroups,
+	) []*generictables.Chain
 
-	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain
-	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *iptables.Chain)
-	ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []iptables.Rule
+	PolicyToIptablesChains(policyID *types.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain
+	ProfileToIptablesChains(profileID *types.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain)
+	ProtoRuleToIptablesRules(
+		pRule *proto.Rule,
+		ipVersion uint8,
+		owner RuleOwnerType,
+		dir RuleDir,
+		idx int,
+		id types.IDMaker,
+		tier string,
+		untracked bool,
+	) []generictables.Rule
 
-	MakeNatOutgoingRule(protocol string, action iptables.Action, ipVersion uint8) iptables.Rule
-	NATOutgoingChain(active bool, ipVersion uint8) *iptables.Chain
+	NATOutgoingChain(active bool, ipVersion uint8) *generictables.Chain
 
-	DNATsToIptablesChains(dnats map[string]string) []*iptables.Chain
-	SNATsToIptablesChains(snats map[string]string) []*iptables.Chain
-	BlockedCIDRsToIptablesChains(cidrs []string, ipVersion uint8) []*iptables.Chain
+	EgressDSCPChain(policies []*DSCPRule) *generictables.Chain
 
-	WireguardIncomingMarkChain() *iptables.Chain
+	DNATsToIptablesChains(dnats map[string]string) []*generictables.Chain
+	SNATsToIptablesChains(snats map[string]string) []*generictables.Chain
+	BlockedCIDRsToIptablesChains(cidrs []string, ipVersion uint8) []*generictables.Chain
 
-	IptablesFilterDenyAction() iptables.Action
+	WireguardIncomingMarkChain() *generictables.Chain
+
+	IptablesFilterDenyAction() generictables.Action
+
+	FilterInputChainAllowWG(ipVersion uint8, c Config, allowAction generictables.Action) []generictables.Rule
+	ICMPv6Filter(action generictables.Action) []generictables.Rule
 }
 
 type DefaultRuleRenderer struct {
+	generictables.ActionFactory
+
 	Config
-	inputAcceptActions       []iptables.Action
-	filterAllowAction        iptables.Action
-	mangleAllowAction        iptables.Action
-	blockCIDRAction          iptables.Action
-	iptablesFilterDenyAction iptables.Action
+
+	inputAcceptActions       []generictables.Action
+	filterAllowAction        generictables.Action
+	mangleAllowAction        generictables.Action
+	blockCIDRAction          generictables.Action
+	iptablesFilterDenyAction generictables.Action
+
+	NewMatch       func() generictables.MatchCriteria
+	CombineMatches func(m1, m2 generictables.MatchCriteria) generictables.MatchCriteria
+
+	// wildcard is the symbol to use for wildcard matches.
+	wildcard string
+
+	// maxNameLength is the maximum length of a chain name.
+	maxNameLength int
+
+	// matchCapabilities is how many CIDRs and ports one rule's match can hold before
+	// the policy renderer has to split them across a mark-bit match block.
+	matchCapabilities generictables.MatchCapabilities
+
+	// nft is true if we are generating NFTables rules.
+	nft bool
 }
 
-func (r *DefaultRuleRenderer) IptablesFilterDenyAction() iptables.Action {
+func (r *DefaultRuleRenderer) IptablesFilterDenyAction() generictables.Action {
 	return r.iptablesFilterDenyAction
 }
 
 func (r *DefaultRuleRenderer) ipSetConfig(ipVersion uint8) *ipsets.IPVersionConfig {
-	if ipVersion == 4 {
+	switch ipVersion {
+	case 4:
 		return r.IPSetConfigV4
-	} else if ipVersion == 6 {
+	case 6:
 		return r.IPSetConfigV6
-	} else {
+	default:
 		log.WithField("version", ipVersion).Panic("Unknown IP version")
 		return nil
 	}
@@ -278,14 +393,15 @@ type Config struct {
 
 	WorkloadIfacePrefixes []string
 
-	IptablesMarkAccept   uint32
-	IptablesMarkPass     uint32
-	IptablesMarkScratch0 uint32
-	IptablesMarkScratch1 uint32
-	IptablesMarkEndpoint uint32
-	// IptablesMarkNonCaliEndpoint is an endpoint mark which is reserved
+	MarkAccept   uint32
+	MarkPass     uint32
+	MarkDrop     uint32
+	MarkScratch0 uint32
+	MarkScratch1 uint32
+	MarkEndpoint uint32
+	// MarkNonCaliEndpoint is an endpoint mark which is reserved
 	// to mark non-calico (workload or host) endpoint.
-	IptablesMarkNonCaliEndpoint uint32
+	MarkNonCaliEndpoint uint32
 
 	KubeNodePortRanges     []numorstring.Port
 	KubeIPVSSupportEnabled bool
@@ -315,17 +431,33 @@ type Config struct {
 	WireguardEnabledV6          bool
 	WireguardInterfaceName      string
 	WireguardInterfaceNameV6    string
-	WireguardIptablesMark       uint32
+	WireguardMark               uint32
 	WireguardListeningPort      int
 	WireguardListeningPortV6    int
 	WireguardEncryptHostTraffic bool
 	RouteSource                 string
 
-	IptablesLogPrefix         string
-	EndpointToHostAction      string
-	IptablesFilterAllowAction string
-	IptablesMangleAllowAction string
-	IptablesFilterDenyAction  string
+	LogPrefix               string
+	LogActionRateLimit      string
+	LogActionRateLimitBurst int
+
+	// LogConnectionTransitions is set when the LogConnectionTransitions config param is
+	// FirstResponseAfterLog (and the dataplane supports it).
+	LogConnectionTransitions bool
+	// LogConnectionTransitionsPrefix is the log prefix for connection transition logs; the
+	// transition suffix ("-est" etc.) is appended to it.  Used verbatim: unlike LogPrefix,
+	// %-specifiers are not substituted (the rules are shared by all policies).
+	LogConnectionTransitionsPrefix string
+	// MarkConnStateLog is the connmark bit used when LogConnectionTransitions is
+	// enabled; it means "connection matched a Log rule but no response has been seen yet".
+	// Only allocated when the feature is enabled; validate() has an explicit exception
+	// allowing it to be zero otherwise.
+	MarkConnStateLog uint32
+
+	EndpointToHostAction string
+	FilterAllowAction    string
+	MangleAllowAction    string
+	FilterDenyAction     string
 
 	FailsafeInboundHostPorts  []config.ProtoPort
 	FailsafeOutboundHostPorts []config.ProtoPort
@@ -336,16 +468,26 @@ type Config struct {
 	IptablesNATOutgoingInterfaceFilter string
 
 	NATOutgoingAddress             net.IP
+	NATOutgoingExclusions          string
 	BPFEnabled                     bool
+	BPFOverlayIPOnDevice           bool
 	BPFForceTrackPacketsFromIfaces []string
 	ServiceLoopPrevention          string
+
+	NFTablesMode             string
+	NFTablesEnabled          bool
+	NFTablesFlowTableOffload bool
+	FlowLogsEnabled          bool
+
+	IstioAmbientModeEnabled bool
+	IstioDSCPMark           uint8
 }
 
 var unusedBitsInBPFMode = map[string]bool{
-	"IptablesMarkPass":            true,
-	"IptablesMarkScratch1":        true,
-	"IptablesMarkEndpoint":        true,
-	"IptablesMarkNonCaliEndpoint": true,
+	"MarkPass":            true,
+	"MarkScratch1":        true,
+	"MarkEndpoint":        true,
+	"MarkNonCaliEndpoint": true,
 }
 
 func (c *Config) validate() {
@@ -357,19 +499,23 @@ func (c *Config) validate() {
 	usedBits := uint32(0)
 	for i := 0; i < myValue.NumField(); i++ {
 		fieldName := myType.Field(i).Name
-		if strings.HasPrefix(fieldName, "IptablesMark") && fieldName != "IptablesMarkNonCaliEndpoint" {
+		if strings.HasPrefix(fieldName, "Mark") && fieldName != "MarkNonCaliEndpoint" {
 			if c.BPFEnabled && unusedBitsInBPFMode[fieldName] {
 				log.WithField("field", fieldName).Debug("Ignoring unused field in BPF mode.")
+				continue
+			}
+			if fieldName == "MarkConnStateLog" && !c.LogConnectionTransitions {
+				// Only allocated when connection transition logging is enabled.
 				continue
 			}
 			bits := myValue.Field(i).Interface().(uint32)
 			if bits == 0 {
 				log.WithField("field", fieldName).Panic(
-					"IptablesMarkXXX field not set.")
+					"MarkXXX field not set.")
 			}
 			if usedBits&bits > 0 {
 				log.WithField("field", fieldName).Panic(
-					"IptablesMarkXXX field overlapped with another's bits.")
+					"MarkXXX field overlapped with another's bits.")
 			}
 			usedBits |= bits
 			found++
@@ -377,81 +523,122 @@ func (c *Config) validate() {
 	}
 	if found == 0 {
 		// Check the reflection found something we were expecting.
-		log.Panic("Didn't find any IptablesMarkXXX fields.")
+		log.Panic("Didn't find any MarkXXX fields.")
 	}
 }
 
-func NewRenderer(config Config) RuleRenderer {
+func NewRenderer(config Config, nft bool) RuleRenderer {
 	log.WithField("config", config).Info("Creating rule renderer.")
 	config.validate()
 
+	actions := iptables.Actions()
+	var reject generictables.Action = iptables.RejectAction{}
+	var accept generictables.Action = iptables.AcceptAction{}
+	var drop generictables.Action = iptables.DropAction{}
+	var ret generictables.Action = iptables.ReturnAction{}
+
+	if nft {
+		actions = nftrender.Actions()
+		reject = nftrender.RejectAction{}
+		accept = nftrender.AcceptAction{}
+		drop = nftrender.DropAction{}
+		ret = nftrender.ReturnAction{}
+	}
+
+	newMatchFn := func() generictables.MatchCriteria {
+		if nft {
+			return nftrender.Match()
+		}
+		return iptables.Match()
+	}
+	combineMatches := iptables.Combine
+	if nft {
+		combineMatches = nftrender.Combine
+	}
+
 	// First, what should we do when packets are not accepted.
-	var iptablesFilterDenyAction iptables.Action
-	switch config.IptablesFilterDenyAction {
+	var iptablesFilterDenyAction generictables.Action
+	switch config.FilterDenyAction {
 	case "REJECT":
 		log.Info("packets that are not passed by any policy or profile will be rejected.")
-		iptablesFilterDenyAction = iptables.RejectAction{}
+		iptablesFilterDenyAction = reject
 	default:
 		log.Info("packets that are not passed by any policy or profile will be dropped.")
-		iptablesFilterDenyAction = iptables.DropAction{}
+		iptablesFilterDenyAction = drop
 	}
 
 	// Convert configured actions to rule slices.
 	// First, what should we do with packets that come from workloads to the host itself.
-	var inputAcceptActions []iptables.Action
+	var inputAcceptActions []generictables.Action
 	switch config.EndpointToHostAction {
 	case "DROP":
 		log.Info("Workload to host packets will be dropped.")
-		inputAcceptActions = []iptables.Action{iptables.DropAction{}}
+		inputAcceptActions = []generictables.Action{drop}
 	case "REJECT":
 		log.Info("Workload to host packets will be rejected.")
-		inputAcceptActions = []iptables.Action{iptables.RejectAction{}}
+		inputAcceptActions = []generictables.Action{reject}
 	case "ACCEPT":
 		log.Info("Workload to host packets will be accepted.")
-		inputAcceptActions = []iptables.Action{iptables.AcceptAction{}}
+		inputAcceptActions = []generictables.Action{accept}
 	default:
 		log.Info("Workload to host packets will be returned to INPUT chain.")
-		inputAcceptActions = []iptables.Action{iptables.ReturnAction{}}
+		inputAcceptActions = []generictables.Action{ret}
 	}
 
 	// What should we do with packets that are accepted in the forwarding chain
-	var filterAllowAction, mangleAllowAction iptables.Action
-	switch config.IptablesFilterAllowAction {
+	var filterAllowAction, mangleAllowAction generictables.Action
+	switch config.FilterAllowAction {
 	case "RETURN":
 		log.Info("filter table allowed packets will be returned to FORWARD chain.")
-		filterAllowAction = iptables.ReturnAction{}
+		filterAllowAction = ret
 	default:
 		log.Info("filter table allowed packets will be accepted immediately.")
-		filterAllowAction = iptables.AcceptAction{}
+		filterAllowAction = accept
 	}
-	switch config.IptablesMangleAllowAction {
+	switch config.MangleAllowAction {
 	case "RETURN":
 		log.Info("mangle table allowed packets will be returned to PREROUTING chain.")
-		mangleAllowAction = iptables.ReturnAction{}
+		mangleAllowAction = ret
 	default:
 		log.Info("mangle table allowed packets will be accepted immediately.")
-		mangleAllowAction = iptables.AcceptAction{}
+		mangleAllowAction = accept
 	}
 
 	// How should we block CIDRs for loop prevention?
-	var blockCIDRAction iptables.Action
+	var blockCIDRAction generictables.Action
 	switch config.ServiceLoopPrevention {
 	case "Drop":
 		log.Info("Packets to unknown service IPs will be dropped")
-		blockCIDRAction = iptables.DropAction{}
+		blockCIDRAction = drop
 	case "Reject":
 		log.Info("Packets to unknown service IPs will be rejected")
-		blockCIDRAction = iptables.RejectAction{}
+		blockCIDRAction = reject
 	default:
 		log.Info("Packets to unknown service IPs will be allowed to loop")
 	}
 
+	maxNameLength := iptables.MaxChainNameLength
+	wildcard := iptables.Wildcard
+	matchCapabilities := iptables.MatchCapabilities
+	if nft {
+		wildcard = nftrender.Wildcard
+		maxNameLength = nftrender.MaxChainNameLength
+		matchCapabilities = nftrender.MatchCapabilities
+	}
+
 	return &DefaultRuleRenderer{
 		Config:                   config,
+		ActionFactory:            actions,
+		NewMatch:                 newMatchFn,
 		inputAcceptActions:       inputAcceptActions,
 		filterAllowAction:        filterAllowAction,
 		mangleAllowAction:        mangleAllowAction,
 		blockCIDRAction:          blockCIDRAction,
 		iptablesFilterDenyAction: iptablesFilterDenyAction,
+		wildcard:                 wildcard,
+		maxNameLength:            maxNameLength,
+		matchCapabilities:        matchCapabilities,
+		CombineMatches:           combineMatches,
+		nft:                      nft,
 	}
 }

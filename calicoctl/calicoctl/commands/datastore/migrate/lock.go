@@ -17,52 +17,21 @@ package migrate
 import (
 	"context"
 	"fmt"
-	"strings"
-
-	"github.com/docopt/docopt-go"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
-func Lock(args []string) error {
-	doc := `Usage:
-  <BINARY_NAME> datastore migrate lock [--config=<CONFIG>] [--allow-version-mismatch]
-
-Options:
-  -h --help                    Show this screen.
-  -c --config=<CONFIG>         Path to the file containing connection
-                               configuration in YAML or JSON format.
-                               [default: ` + constants.DefaultConfigPath + `]
-     --allow-version-mismatch  Allow client and cluster versions mismatch.
-
-Description:
-  Lock the datastore to prepare it for migration. This prevents any new
-  Calico resources from affecting the cluster but does not prevent updating
-  or creating new Calico resources.
-`
-	// Replace all instances of BINARY_NAME with the name of the binary.
-	name, _ := util.NameAndDescription()
-	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", name)
-
-	parsedArgs, err := docopt.ParseArgs(doc, args, "")
-	if err != nil {
-		return fmt.Errorf("Invalid option: 'calicoctl %s'. Use flag '--help' to read about a specific subcommand.", strings.Join(args, " "))
-	}
-	if len(parsedArgs) == 0 {
-		return nil
-	}
-
-	err = common.CheckVersionMismatch(parsedArgs["--config"], parsedArgs["--allow-version-mismatch"])
-	if err != nil {
+// Lock locks the datastore to prepare it for migration. This prevents any new
+// Calico resources from affecting the cluster but does not prevent updating or
+// creating new Calico resources.
+func Lock(config string, allowVersionMismatch bool) error {
+	if err := common.CheckVersionMismatch(config, allowVersionMismatch); err != nil {
 		return err
 	}
 
-	cf := parsedArgs["--config"].(string)
-	client, err := clientmgr.NewClient(cf)
+	client, err := clientmgr.NewClient(config)
 	if err != nil {
 		return err
 	}
@@ -70,13 +39,13 @@ Description:
 	// Ensure that the cluster information resource is initialized.
 	ctx := context.Background()
 	if err := client.EnsureInitialized(ctx, "", ""); err != nil {
-		return fmt.Errorf("Unable to initialize cluster information for the datastore migration: %s", err)
+		return fmt.Errorf("unable to initialize cluster information for the datastore migration: %s", err)
 	}
 
 	// Get the cluster information resource
 	clusterinfo, err := client.ClusterInformation().Get(ctx, "default", options.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("Error retrieving ClusterInformation for locking: %s", err)
+		return fmt.Errorf("error retrieving ClusterInformation for locking: %s", err)
 	}
 
 	// Change the Datastore to not ready in order to lock it.
@@ -86,7 +55,7 @@ Description:
 	// Update the cluster information resource
 	_, err = client.ClusterInformation().Update(ctx, clusterinfo, options.SetOptions{})
 	if err != nil {
-		return fmt.Errorf("Error updating ClusterInformation for locking: %s", err)
+		return fmt.Errorf("error updating ClusterInformation for locking: %s", err)
 	}
 
 	fmt.Print("Datastore locked.\n")

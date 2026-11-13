@@ -117,6 +117,7 @@ func (crw *k8sWatcherConverter) processK8sEvents() {
 			}
 
 			for _, e := range events {
+				crw.logCxt.Debugf("Sending event: %s", e)
 				select {
 				case crw.resultChan <- *e:
 					crw.logCxt.Debug("Kubernetes event converted and sent to backend watcher")
@@ -166,14 +167,23 @@ func (crw *k8sWatcherConverter) convertEvent(kevent kwatch.Event) []*api.WatchEv
 		}
 
 		return crw.buildEventsFromKVPs(kvps, kevent.Type)
-
+	case kwatch.Bookmark:
+		// For bookmarks we send an empty KVPair with the current resource
+		// version only.
+		k8sRes := kevent.Object.(Resource)
+		revision := k8sRes.GetObjectMeta().GetResourceVersion()
+		return []*api.WatchEvent{{
+			Type: api.WatchBookmark,
+			New: &model.KVPair{
+				Revision: revision,
+			},
+		}}
 	default:
 		return []*api.WatchEvent{{
 			Type:  api.WatchError,
 			Error: fmt.Errorf("unhandled Kubernetes watcher event type: %v", kevent.Type),
 		}}
 	}
-
 }
 
 func (crw *k8sWatcherConverter) buildEventsFromKVPs(kvps []*model.KVPair, t kwatch.EventType) []*api.WatchEvent {

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ package conversion
 const (
 	NamespaceLabelPrefix            = "pcns."
 	NamespaceProfileNamePrefix      = "kns."
-	K8sNetworkPolicyNamePrefix      = "knp.default."
 	ServiceAccountLabelPrefix       = "pcsa."
 	ServiceAccountProfileNamePrefix = "ksa."
 
@@ -41,7 +40,38 @@ const (
 	// on older Pods.
 	AnnotationContainerID = "cni.projectcalico.org/containerID"
 
+	// AnnotationPodNetns stores the path of the pod's network namespace.
+	AnnotationPodNetns = "cni.projectcalico.org/podNetns"
+
+	// AnnotationNetworkStatus stores the network, VLAN and MAC of the pod's default interface. Other
+	// interfaces carry the same annotation as "cni.projectcalico.org/<ifname>" + AnnotationNetworkStatusSuffix.
+	AnnotationNetworkStatus       = "cni.projectcalico.org/network-status"
+	AnnotationNetworkStatusSuffix = ".network-status"
+
 	// NameLabel is a label that can be used to match a serviceaccount or namespace
 	// name exactly.
 	NameLabel = "projectcalico.org/name"
+
+	// AdminPolicyRuleNameLabel is a label that show a rule's name before conversion to Calico data model.
+	// As an example, it holds an admin network policy rule name before conversion to GNPs.
+	K8sCNPRuleNameLabel = "name"
+
+	// QoSControls related annotations
+	AnnotationK8sQoSIngressBandwidth   = "kubernetes.io/ingress-bandwidth"
+	AnnotationK8sQoSEgressBandwidth    = "kubernetes.io/egress-bandwidth"
+	AnnotationQoSIngressBandwidth      = "qos.projectcalico.org/ingressBandwidth"
+	AnnotationQoSEgressBandwidth       = "qos.projectcalico.org/egressBandwidth"
+	AnnotationQoSIngressBurst          = "qos.projectcalico.org/ingressBurst"
+	AnnotationQoSEgressBurst           = "qos.projectcalico.org/egressBurst"
+	AnnotationQoSIngressPeakrate       = "qos.projectcalico.org/ingressPeakrate"
+	AnnotationQoSEgressPeakrate        = "qos.projectcalico.org/egressPeakrate"
+	AnnotationQoSIngressMinburst       = "qos.projectcalico.org/ingressMinburst"
+	AnnotationQoSEgressMinburst        = "qos.projectcalico.org/egressMinburst"
+	AnnotationQoSIngressPacketRate     = "qos.projectcalico.org/ingressPacketRate"
+	AnnotationQoSEgressPacketRate      = "qos.projectcalico.org/egressPacketRate"
+	AnnotationQoSIngressPacketBurst    = "qos.projectcalico.org/ingressPacketBurst"
+	AnnotationQoSEgressPacketBurst     = "qos.projectcalico.org/egressPacketBurst"
+	AnnotationQoSIngressMaxConnections = "qos.projectcalico.org/ingressMaxConnections"
+	AnnotationQoSEgressMaxConnections  = "qos.projectcalico.org/egressMaxConnections"
+	AnnotationQoSEgressDSCP            = "qos.projectcalico.org/dscp"
 )

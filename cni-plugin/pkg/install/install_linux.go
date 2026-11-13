@@ -19,7 +19,7 @@ package install
 func defaultNetConf() string {
 	netconf := `{
   "name": "k8s-pod-network",
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "plugins": [
     {
       "type": "calico",
@@ -30,7 +30,9 @@ func defaultNetConf() string {
       "mtu": __CNI_MTU__,
       "ipam": {"type": "calico-ipam"},
       "policy": {"type": "k8s"},
-      "kubernetes": {"kubeconfig": "__KUBECONFIG_FILEPATH__"}
+      "kubernetes": {"kubeconfig": "__KUBECONFIG_FILEPATH__"},
+      "require_mtu_file": __REQUIRE_MTU_FILE__,
+      "calico_api_group": "__CALICO_API_GROUP__"
     },
     {
       "type": "portmap",

@@ -23,22 +23,19 @@ import (
 	"time"
 
 	"github.com/containernetworking/plugins/plugins/ipam/host-local/backend/disk"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	corev1 "k8s.io/api/core/v1"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
@@ -46,20 +43,14 @@ const (
 	ipAllocPath = "/var/lib/cni/networks/k8s-pod-network"
 )
 
-var (
-	binariesToDisable = []string{
-		"/host/opt/cni/bin/calico",
-		"/host/opt/cni/bin/host-local",
-	}
-)
-
-type accessor interface {
-	Backend() bapi.Client
+var binariesToDisable = []string{
+	"/host/opt/cni/bin/calico",
+	"/host/opt/cni/bin/host-local",
 }
 
 func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 	// k8sClient directly calls the k8s apiserver.
-	k8sClient := c.(accessor).Backend().(*k8s.KubeClient).ClientSet
+	k8sClient := c.(bapi.BackendAccessor).Backend().(*k8s.KubeClient).ClientSet
 
 	// Check to see if the system is still using host-local
 	// by checking the existence of the path.
@@ -95,12 +86,12 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 			// first IP in the CIDR to match the behavior used by Calico when using host-local IPAM.
 			tunIp := ip.To4()
 			if tunIp == nil {
-				return fmt.Errorf("Cannot pick an IPv4 tunnel address from the given CIDR: %s", k8sNode.Spec.PodCIDR)
+				return fmt.Errorf("cannot pick an IPv4 tunnel address from the given CIDR: %s", k8sNode.Spec.PodCIDR)
 			}
 			tunIp[3]++
 
 			// Assign the address via Calico IPAM.
-			ipipTunnelAddr := cnet.ParseIP(tunIp.String())
+			ipipTunnelAddr := net.ParseIP(tunIp.String())
 			handle := fmt.Sprintf("ipip-tunnel-addr-%s", nodename)
 			if err = c.IPAM().AssignIP(ctxt, ipam.AssignIPArgs{
 				IP:       *ipipTunnelAddr,
@@ -119,13 +110,13 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 
 			// Implemented retry on conflict, because we get stuck if the upgrade-ipam
 			// container fails here and retries assigning an IP which is already assigned
-			for i := uint(0); i < 5; i++ {
+			for range uint(5) {
 				node, err := c.Nodes().Get(ctxt, nodename, options.GetOptions{})
 				if err != nil {
 					return fmt.Errorf("failed to get calico node resource: %s", err)
 				}
 				if node.Spec.BGP == nil {
-					node.Spec.BGP = &libapiv3.NodeBGPSpec{}
+					node.Spec.BGP = &internalapi.NodeBGPSpec{}
 				}
 				node.Spec.BGP.IPv4IPIPTunnelAddr = tunIp.String()
 				if _, err = c.Nodes().Update(ctxt, node, options.SetOptions{}); err != nil {
@@ -179,7 +170,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 	// Disable cni by setting DatastoreReady to false.
 	log.Info("setting datastore readiness to false")
 	var clusterInfo *apiv3.ClusterInformation
-	for i := uint(0); i < 5; i++ {
+	for range uint(5) {
 		clusterInfo, err = c.ClusterInformation().Get(ctxt, "default", options.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to fetch cluster information: %s", err)
@@ -279,7 +270,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 		}
 
 		// The name of the file is its IP address.
-		ip, _, err := cnet.ParseCIDR(fmt.Sprintf("%s/32", f.Name()))
+		ip, _, err := net.ParseCIDR(fmt.Sprintf("%s/32", f.Name()))
 		if err != nil {
 			return fmt.Errorf("failed to parse IP %s: %s", f.Name(), err)
 		}
@@ -315,7 +306,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 				ipam.AttributeNamespace: pod.Namespace,
 			},
 		}); err != nil {
-			if _, ok := err.(errors.ErrorResourceAlreadyExists); !(ok || strings.Contains(err.Error(), "already assigned")) {
+			if _, ok := err.(errors.ErrorResourceAlreadyExists); !ok && !strings.Contains(err.Error(), "already assigned") {
 				return fmt.Errorf("failed to assign IP to calico backend: %s", err)
 			}
 			// Pod IP already assigned - likely failed to remove the file on the last attempt.

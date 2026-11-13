@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,9 +25,10 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/windows"
-	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/accounting"
 )
 
 func getOSType() string {
@@ -44,7 +45,7 @@ func ipv6Supported() bool {
 }
 
 // configureCloudOrchRef does not do anything for windows
-func configureCloudOrchRef(node *api.Node) {
+func configureCloudOrchRef(node *internalapi.Node) {
 	logrus.Debug("configureCloudOrchRef called on Windows; nothing to do.")
 }
 
@@ -57,7 +58,7 @@ func ensureNetworkForOS(ctx context.Context, c client.Interface, nodeName string
 		rsvdAttrWindows := &ipam.HostReservedAttr{
 			StartOfBlock: 3,
 			EndOfBlock:   1,
-			Handle:       ipam.WindowsReservedHandle,
+			Handle:       accounting.WindowsReservedHandle,
 			Note:         "windows host rsvd",
 		}
 

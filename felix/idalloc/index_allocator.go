@@ -15,10 +15,9 @@
 package idalloc
 
 import (
+	"cmp"
 	"errors"
-	"sort"
-
-	"github.com/golang-collections/collections/stack"
+	"slices"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
@@ -31,34 +30,22 @@ func (r IndexRange) contains(a int) bool {
 	return r.Min <= a && r.Max >= a
 }
 
-// ByMaxIndex sorts collections of IndexRange structs in order of their starting/lower index
-type ByMaxIndex []IndexRange
-
-// Len is the number of indexranges in the collection
-func (i ByMaxIndex) Len() int { return len(i) }
-
-// Less reports whether the element with index a
-// must sort before the element with index b.
-func (i ByMaxIndex) Less(a, b int) bool { return i[a].Max < i[b].Max }
-
-// Swap swaps the elements with indexes a and b.
-func (i ByMaxIndex) Swap(a, b int) { i[a], i[b] = i[b], i[a] }
-
 type IndexAllocator struct {
-	indexStack *stack.Stack
+	indexStack *stack
 	exclusions []IndexRange
 }
 
 // NewIndexAllocator returns an index allocator from the provided indexRanges
 // any indices falling within the specified exclusions will not be returned, even if designated by indexRanges
 func NewIndexAllocator(indexRanges []IndexRange, exclusions []IndexRange) *IndexAllocator {
-	// sort index ranges in descending order of their Max bound
-	if len(indexRanges) > 1 {
-		sort.Sort(sort.Reverse(ByMaxIndex(indexRanges)))
-	}
+	// Sort in descending order of Max bound.  Using Sorted... (not Sort...) to
+	// avoid mutating caller's slice.
+	indexRanges = slices.SortedFunc(slices.Values(indexRanges), func(a, b IndexRange) int {
+		return cmp.Compare(b.Max, a.Max)
+	})
 
 	r := &IndexAllocator{
-		indexStack: stack.New(),
+		indexStack: &stack{},
 		exclusions: exclusions,
 	}
 
@@ -91,10 +78,10 @@ func NewIndexAllocator(indexRanges []IndexRange, exclusions []IndexRange) *Index
 }
 
 func (r *IndexAllocator) GrabIndex() (int, error) {
-	if r.indexStack.Len() == 0 {
+	if r.indexStack.IsEmpty() {
 		return 0, errors.New("no more indices available")
 	}
-	return r.indexStack.Pop().(int), nil
+	return r.indexStack.Pop(), nil
 }
 
 func (r *IndexAllocator) ReleaseIndex(index int) {
@@ -104,7 +91,7 @@ func (r *IndexAllocator) ReleaseIndex(index int) {
 // GrabBlock tries to grab a contiguous block of indices from the stack
 func (r *IndexAllocator) GrabBlock(len int) (set.Set[int], error) {
 	indices := set.New[int]()
-	for i := 0; i < len; i++ {
+	for range len {
 		idx, err := r.GrabIndex()
 		if err != nil {
 			return indices, err
@@ -112,4 +99,37 @@ func (r *IndexAllocator) GrabBlock(len int) (set.Set[int], error) {
 		indices.Add(idx)
 	}
 	return indices, nil
+}
+
+type (
+	// stack is an implementation of the stack data structure.
+	// Adapted from https://github.com/golang-collections/collections/blob/604e922904d35e97f98a774db7881f049cd8d970/stack/stack.go.
+	stack struct {
+		top *node
+	}
+	node struct {
+		value int
+		prev  *node
+	}
+)
+
+// IsEmpty returns true if the stack is empty.
+func (s *stack) IsEmpty() bool {
+	return s.top == nil
+}
+
+// Pop the top item of the stack and return it
+func (s *stack) Pop() int {
+	if s.IsEmpty() {
+		return 0
+	}
+
+	n := s.top
+	s.top = n.prev
+	return n.value
+}
+
+// Push a value onto the top of the stack
+func (s *stack) Push(value int) {
+	s.top = &node{value, s.top}
 }

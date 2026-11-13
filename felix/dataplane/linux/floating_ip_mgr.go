@@ -17,13 +17,13 @@ package intdataplane
 import (
 	"reflect"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 // A floating IP is an IP that can be used to reach a particular workload endpoint, but that the
@@ -70,19 +70,19 @@ type floatingIPManager struct {
 	ipVersion uint8
 
 	// Our dependencies.
-	natTable     IptablesTable
+	natTable     Table
 	ruleRenderer rules.RuleRenderer
 
 	// Internal state.
-	activeDNATChains []*iptables.Chain
-	activeSNATChains []*iptables.Chain
-	natInfo          map[proto.WorkloadEndpointID][]*proto.NatInfo
+	activeDNATChains []*generictables.Chain
+	activeSNATChains []*generictables.Chain
+	natInfo          map[types.WorkloadEndpointID][]*proto.NatInfo
 	dirtyNATInfo     bool
 	enabled          bool
 }
 
 func newFloatingIPManager(
-	natTable IptablesTable,
+	natTable Table,
 	ruleRenderer rules.RuleRenderer,
 	ipVersion uint8,
 	enabled bool,
@@ -92,31 +92,33 @@ func newFloatingIPManager(
 		ruleRenderer: ruleRenderer,
 		ipVersion:    ipVersion,
 
-		activeDNATChains: []*iptables.Chain{},
-		activeSNATChains: []*iptables.Chain{},
-		natInfo:          map[proto.WorkloadEndpointID][]*proto.NatInfo{},
+		activeDNATChains: []*generictables.Chain{},
+		activeSNATChains: []*generictables.Chain{},
+		natInfo:          map[types.WorkloadEndpointID][]*proto.NatInfo{},
 		dirtyNATInfo:     true,
 		enabled:          enabled,
 	}
 }
 
-func (m *floatingIPManager) OnUpdate(protoBufMsg interface{}) {
+func (m *floatingIPManager) OnUpdate(protoBufMsg any) {
 	switch msg := protoBufMsg.(type) {
 	case *proto.WorkloadEndpointUpdate:
 		// We only program NAT mappings if the FloatingIPs feature is globally enabled, or
 		// if the requested mapping comes from OpenStack.
+		id := types.ProtoToWorkloadEndpointID(msg.GetId())
 		if m.enabled || msg.Id.OrchestratorId == apiv3.OrchestratorOpenStack {
 			if m.ipVersion == 4 {
-				m.natInfo[*msg.Id] = msg.Endpoint.Ipv4Nat
+				m.natInfo[id] = msg.Endpoint.Ipv4Nat
 			} else {
-				m.natInfo[*msg.Id] = msg.Endpoint.Ipv6Nat
+				m.natInfo[id] = msg.Endpoint.Ipv6Nat
 			}
 		} else {
-			delete(m.natInfo, *msg.Id)
+			delete(m.natInfo, id)
 		}
 		m.dirtyNATInfo = true
 	case *proto.WorkloadEndpointRemove:
-		delete(m.natInfo, *msg.Id)
+		id := types.ProtoToWorkloadEndpointID(msg.GetId())
+		delete(m.natInfo, id)
 		m.dirtyNATInfo = true
 	}
 }

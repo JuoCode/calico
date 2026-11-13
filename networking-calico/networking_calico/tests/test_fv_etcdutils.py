@@ -21,23 +21,47 @@ Tests for etcdutils with a real etcd server.
 
 from __future__ import print_function
 
-import logging
+# These are functional-verification tests: they need a real etcd binary on
+# disk and use eventlet's cooperative I/O.  Running them under the standard
+# tox / subunit unit-test discovery is problematic for two reasons:
+#
+#  - ``eventlet.monkey_patch()`` at module import time patches socket /
+#    threading globally for the test process, even if these tests are
+#    skipped, which interacts badly with subunit's runner and hangs the run.
+#  - Other unit tests in the same process suddenly find themselves under a
+#    monkey-patched interpreter, which can change their behaviour subtly.
+#
+# So this entire file is opt-in via the CALICO_RUN_FV_TESTS=1 environment
+# variable.  Without it, the module imports cleanly (no monkey_patch) and
+# the test class is marked skipped at class-decoration time by
+# @unittest.skipUnless -- no setUpClass needs to run.  See the eventlet docs:
+# https://eventlet.readthedocs.io/en/latest/patching.html
 import os
-import shutil
-import subprocess
-import unittest
+
+_FV_ENABLED = os.environ.get("CALICO_RUN_FV_TESTS") == "1"
 
 import eventlet
-eventlet.monkey_patch()
 
-from networking_calico.common import config as calico_config
-from networking_calico.compat import cfg
+if _FV_ENABLED:
+    eventlet.monkey_patch()
+
+import base64  # noqa: I100
+import logging
+import shutil
+import subprocess
+import time
+import unittest
+
+from oslo_config import cfg
+
 from networking_calico import etcdutils
 from networking_calico import etcdv3
+from networking_calico.common import config as calico_config
 
 _log = logging.getLogger(__name__)
 
 
+@unittest.skipUnless(_FV_ENABLED, "set CALICO_RUN_FV_TESTS=1 to run FV tests")
 class TestFVEtcdutils(unittest.TestCase):
     def setUp(self):
         super(TestFVEtcdutils, self).setUp()
@@ -46,7 +70,7 @@ class TestFVEtcdutils(unittest.TestCase):
 
         # Add in an invalid API path so as to make sure to test the failure
         # handling logic even when most installations support '/v3/'.
-        etcdv3._possible_etcd_api_paths = ['/invalid/'] + self.normal_api_paths
+        etcdv3._possible_etcd_api_paths = ["/invalid/"] + self.normal_api_paths
 
     def tearDown(self):
         # Restore normal etcd API paths in case they are relevant to other test
@@ -61,11 +85,17 @@ class TestFVEtcdutils(unittest.TestCase):
     def start_etcd_server(self):
         shutil.rmtree(".default.etcd", ignore_errors=True)
         shutil.rmtree("default.etcd", ignore_errors=True)
-        self.etcd = subprocess.Popen([
-            "/usr/local/bin/etcd",
-            "--advertise-client-urls", "http://127.0.0.1:2379",
-            "--listen-client-urls", "http://0.0.0.0:2379"
-        ])
+        self.etcd = subprocess.Popen(
+            [
+                "/usr/local/bin/etcd",
+                "--advertise-client-urls",
+                "http://127.0.0.1:2379",
+                "--listen-client-urls",
+                "http://0.0.0.0:2379",
+                "--log-level",
+                "error",
+            ]
+        )
         self.etcd_server_running = True
 
     def wait_etcd_ready(self):
@@ -107,12 +137,83 @@ class TestFVEtcdutils(unittest.TestCase):
         self.assertTrue(succeeded)
 
         # Try again with MUST_UPDATE; should now succeed.
-        succeeded = etcdv3.put("/testkey", "testvalue2", mod_revision=etcdv3.MUST_UPDATE)
+        succeeded = etcdv3.put(
+            "/testkey", "testvalue2", mod_revision=etcdv3.MUST_UPDATE
+        )
         self.assertTrue(succeeded)
 
         # Try again with mod_revision 0; should now fail.
         succeeded = etcdv3.put("/testkey", "testvalue2", mod_revision=0)
         self.assertFalse(succeeded)
+
+        # Kill the etcd server.
+        self.stop_etcd_server()
+
+    def test_auth_non_admin_user(self):
+        # Start a real local etcd server.
+        self.start_etcd_server()
+        calico_config.register_options(cfg.CONF)
+        self.wait_etcd_ready()
+
+        # Enable auth, with a non-admin user that can only read and write under
+        # /calico/, as networking-calico is normally deployed.  Some etcd versions
+        # make the maintenance Status API admin-only (see Etcd3AuthClient.status),
+        # but this Dockerfile's etcd isn't one of them, so here this test only
+        # checks that networking-calico works with such a user.
+        def b64(s):
+            return base64.b64encode(s.encode()).decode()
+
+        admin = etcdv3.Etcd3Client(host="127.0.0.1", port=2379, api_path="/v3/")
+        for path, body in [
+            ("/auth/user/add", {"name": "root", "password": "rootpw"}),
+            ("/auth/user/grant", {"user": "root", "role": "root"}),
+            ("/auth/role/add", {"name": "calico"}),
+            (
+                "/auth/role/grant",
+                {
+                    "name": "calico",
+                    "perm": {
+                        "permType": "READWRITE",
+                        "key": b64("/calico/"),
+                        "range_end": b64("/calico0"),
+                    },
+                },
+            ),
+            ("/auth/user/add", {"name": "calicouser", "password": "calicopw"}),
+            ("/auth/user/grant", {"user": "calicouser", "role": "calico"}),
+            ("/auth/enable", {}),
+        ]:
+            admin.post(admin.get_url(path), json=body)
+
+        # Connect as that user.
+        cfg.CONF.set_override("etcd_username", "calicouser", group="calico")
+        cfg.CONF.set_override("etcd_password", "calicopw", group="calico")
+        self.addCleanup(cfg.CONF.clear_override, "etcd_username", group="calico")
+        self.addCleanup(cfg.CONF.clear_override, "etcd_password", group="calico")
+        etcdv3._client = None
+
+        # get_status works, and so do reads and writes under /calico/.
+        cluster_id, revision = etcdv3.get_status()
+        self.assertTrue(cluster_id)
+        self.assertTrue(int(revision) > 0)
+        self.assertTrue(etcdv3.put("/calico/testkey", "testvalue"))
+        value, _ = etcdv3.get("/calico/testkey")
+        self.assertEqual("testvalue", value)
+
+        # The revision from get_status is the whole datastore's revision, not just that
+        # of the key that Etcd3AuthClient.status reads.  Write that key, and check that
+        # get_status gives its revision.  Then write another key, outside /calico/ (so
+        # as root), and check that get_status gives the new revision.
+        self.assertTrue(etcdv3.put(etcdv3._STATUS_KEY, "{}"))
+        _, status_key_revision = etcdv3.get(etcdv3._STATUS_KEY)
+        _, revision = etcdv3.get_status()
+        self.assertEqual(int(status_key_revision), int(revision))
+        root = etcdv3.Etcd3AuthClient(
+            host="127.0.0.1", port=2379, username="root", password="rootpw"
+        )
+        self.assertTrue(root.put("/other/testkey", "testvalue"))
+        _, revision = etcdv3.get_status()
+        self.assertEqual(int(status_key_revision) + 1, int(revision))
 
         # Kill the etcd server.
         self.stop_etcd_server()
@@ -137,8 +238,7 @@ class TestFVEtcdutils(unittest.TestCase):
         self.wait_etcd_ready()
 
         # Create and start an EtcdWatcher.
-        ew = etcdutils.EtcdWatcher('/calico/felix/v2/abc/host',
-                                   '/round-trip-check')
+        ew = etcdutils.EtcdWatcher("/calico/felix/v2/abc/host", "/round-trip-check")
         debug_msgs = []
         ew.debug_reporter = lambda msg: debug_msgs.append(msg)
         eventlet.spawn(ew.start)
@@ -197,4 +297,71 @@ class TestFVEtcdutils(unittest.TestCase):
         )
 
         # Kill the etcd server.
+        self.stop_etcd_server()
+
+    def wait_for(self, description, predicate, timeout_secs=5):
+        deadline = time.monotonic() + timeout_secs
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            eventlet.sleep(0.05)
+        self.fail("Timed out (%ss) waiting for %s" % (timeout_secs, description))
+
+    def test_event_during_stall_survives_watch_cancel(self):
+        # Regression test for watch event loss at cancellation, found when
+        # investigating why the DHCP agent missed WorkloadEndpoint deletions
+        # in CI.  An event that arrives while this process
+        # is stalled - such that EtcdWatcher's WATCH_TIMEOUT_SECS inactivity
+        # deadline expires during the same stall - used to be discarded:
+        # after the stall, eventlet runs the canceller's timer before the
+        # event's consumer, and etcd3gw's watch cancellation threw away
+        # everything already received but not yet consumed.  With
+        # drain-then-cancel semantics (Etcd3AuthClient.watch) the event must
+        # still be delivered.
+        self.start_etcd_server()
+        calico_config.register_options(cfg.CONF)
+        self.wait_etcd_ready()
+
+        events = []
+        ew = etcdutils.EtcdWatcher("/drain-test")
+        ew.register_path(
+            "/drain-test/<key>",
+            on_set=lambda response, key: events.append(("set", key)),
+            on_del=lambda response, key: events.append(("del", key)),
+        )
+        eventlet.spawn(ew.start)
+        eventlet.sleep(1)
+
+        # Write a key and wait for the event; this also resets the watch's
+        # inactivity deadline to WATCH_TIMEOUT_SECS from now.
+        etcdv3.put("/drain-test/k1", "v")
+        self.wait_for("set event", lambda: ("set", "k1") in events)
+
+        # Wait until just before that deadline, then delete the key from a
+        # separate process while stalling this process's eventlet hub across
+        # the deadline.  (The delete must come from another process, since
+        # this process is stalled.)
+        eventlet.sleep(8)
+        curl = subprocess.Popen(
+            [
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "http://127.0.0.1:2379/v3/kv/deleterange",
+                "-X",
+                "POST",
+                "-d",
+                '{"key": "%s"}' % base64.b64encode(b"/drain-test/k1").decode(),
+            ]
+        )
+        eventlet.patcher.original("time").sleep(3.5)
+        curl.wait(timeout=10)
+
+        # The delete event arrived during the stall, and the watch is now
+        # being cancelled for inactivity; the cancellation must deliver the
+        # event rather than throw it away.
+        self.wait_for("del event", lambda: ("del", "k1") in events)
+
+        ew.stop()
         self.stop_etcd_server()

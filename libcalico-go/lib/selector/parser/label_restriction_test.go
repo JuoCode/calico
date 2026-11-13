@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/lib/std/uniquestr"
 )
 
 var labelRestrictionsTests = []struct {
@@ -31,13 +33,13 @@ var labelRestrictionsTests = []struct {
 	{"all()", nil},
 	{"global()", nil},
 	{"a == 'value'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"value"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("value")},
 	}},
 	{"has(a)", map[string]LabelRestriction{
 		"a": {MustBePresent: true},
 	}},
 	{"a in {'v1','v2'}", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1", "v2"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1", "v2")},
 	}},
 	{"a not in {'v1','v2'}", nil},
 	{"a contains 'foo'", map[string]LabelRestriction{
@@ -53,40 +55,40 @@ var labelRestrictionsTests = []struct {
 
 	// AND
 	{"a == 'v1' && a == 'v1'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
 	}},
 	{"a == 'v1' && a == 'v2'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice()},
 	}},
 	{"a == 'v1' && has(a)", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
 	}},
 	{"a in {'v1','v2'} && a in {'v2','v3'} ", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v2"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v2")},
 	}},
 	{"a in {'v1','v2', 'v3'} && a in {'v2','v3'} ", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v2", "v3"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v2", "v3")},
 	}},
 	{"has(a) && a == 'v1'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
 	}},
 	{"has(a) && !has(a)", map[string]LabelRestriction{
 		"a": {MustBePresent: true, MustBeAbsent: true},
 	}},
 	{"a == 'v1' && b == 'v2'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
-		"b": {MustBePresent: true, MustHaveOneOfValues: []string{"v2"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
+		"b": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v2")},
 	}},
 	{"a == 'v1' && all()", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
 	}},
 	{"all() && a == 'v1'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1")},
 	}},
 
 	// OR
 	{"a == 'v1' || a == 'v2'", map[string]LabelRestriction{
-		"a": {MustBePresent: true, MustHaveOneOfValues: []string{"v1", "v2"}},
+		"a": {MustBePresent: true, MustHaveOneOfValues: handleSlice("v1", "v2")},
 	}},
 	{"has(a) || a == 'v2'", map[string]LabelRestriction{
 		"a": {MustBePresent: true},
@@ -119,9 +121,17 @@ func TestLabelRestrictions(t *testing.T) {
 			sel, err := Parse(test.Sel)
 			Expect(err).NotTo(HaveOccurred())
 			lrs := sel.LabelRestrictions()
-			Expect(lrs).To(Equal(test.Res), fmt.Sprintf("Selector %s should produce restrictions: %v", test.Sel, test.Res))
+			var res LabelRestrictions
+			if test.Res != nil {
+				m := map[uniquestr.Handle]LabelRestriction{}
+				for k, v := range test.Res {
+					m[uniquestr.Make(k)] = v
+				}
+				res = MakeLabelRestrictions(m)
+			}
+			Expect(lrs).To(Equal(res), fmt.Sprintf("Selector %s should produce restrictions: %v", test.Sel, test.Res))
 			lrs = sel.LabelRestrictions()
-			Expect(lrs).To(Equal(test.Res), fmt.Sprintf("Selector %s should produce same restrictions on second call: %v",
+			Expect(lrs).To(Equal(res), fmt.Sprintf("Selector %s should produce same restrictions on second call: %v",
 				test.Sel, test.Res))
 
 			if test.Sel == "" {
@@ -134,8 +144,52 @@ func TestLabelRestrictions(t *testing.T) {
 				sel, err := Parse(s)
 				Expect(err).NotTo(HaveOccurred())
 				lrs := sel.LabelRestrictions()
-				Expect(lrs).To(Equal(test.Res), fmt.Sprintf("Selector %s should produce restrictions: %v", s, test.Res))
+				Expect(lrs).To(Equal(res), fmt.Sprintf("Selector %s should produce restrictions: %v", s, test.Res))
 			})
 		})
 	}
+}
+
+func TestLabelRestrictionsCache(t *testing.T) {
+	RegisterTestingT(t)
+
+	selA, err := Parse("has(a)")
+	Expect(err).NotTo(HaveOccurred())
+	selB, err := Parse("has(b)")
+	Expect(err).NotTo(HaveOccurred())
+
+	// Clear cache.
+	lastRestrictionSelector = nil
+	lastLabelRestrictions = nil
+
+	// First call should populate the cache.
+	lrsA1 := selA.LabelRestrictions()
+	Expect(lastRestrictionSelector).To(BeIdenticalTo(selA))
+
+	// Second call to the same selector should be a cache hit;
+	// the cached selector pointer should not change.
+	lrsA2 := selA.LabelRestrictions()
+	Expect(lastRestrictionSelector).To(BeIdenticalTo(selA),
+		"cache hit should not change the cached selector")
+	Expect(lrsA2).To(Equal(lrsA1))
+
+	// Calling on a different selector should update the cache.
+	lrsB := selB.LabelRestrictions()
+	Expect(lastRestrictionSelector).To(BeIdenticalTo(selB),
+		"cache miss should update the cached selector")
+	Expect(lrsB).NotTo(Equal(lrsA1))
+
+	// Going back to selA should update the cache again.
+	lrsA3 := selA.LabelRestrictions()
+	Expect(lastRestrictionSelector).To(BeIdenticalTo(selA),
+		"cache should update when switching back to first selector")
+	Expect(lrsA3).To(Equal(lrsA1))
+}
+
+func handleSlice(ss ...string) []uniquestr.Handle {
+	var hs = make([]uniquestr.Handle, len(ss))
+	for i, s := range ss {
+		hs[i] = uniquestr.Make(s)
+	}
+	return hs
 }

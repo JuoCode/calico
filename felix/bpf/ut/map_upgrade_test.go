@@ -17,10 +17,10 @@ package ut_test
 import (
 	"os"
 	"os/exec"
-
 	"testing"
 
 	. "github.com/onsi/gomega"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/bpf/libbpf"
 	"github.com/projectcalico/calico/felix/bpf/maps"
@@ -40,9 +40,19 @@ func bpfMapList() string {
 	return string(out)
 }
 func deleteMap(bpfMap maps.Map) {
-	bpfMap.(*maps.PinnedMap).Close()
-	os.Remove(bpfMap.Path())
-	os.Remove(bpfMap.Path() + "_old")
+	log.WithField("bpfMap.GetName()", bpfMap.GetName()).Debug("Deleting PinnedMap")
+	err := bpfMap.(*maps.PinnedMap).Close()
+	if err != nil {
+		log.WithError(err).Debug("Error closing PinnedMap")
+	}
+	err = os.Remove(bpfMap.Path())
+	if err != nil && !os.IsNotExist(err) {
+		log.WithError(err).WithField("path", bpfMap.Path()).Debug("Error removing PinnedMap path")
+	}
+	err = os.Remove(bpfMap.Path() + "_old")
+	if err != nil && !os.IsNotExist(err) {
+		log.WithError(err).WithField("path", bpfMap.Path()+"_old").Debug("Error removing PinnedMap old path")
+	}
 }
 
 func TestMapUpgradeV2ToV3(t *testing.T) {
@@ -186,7 +196,7 @@ func TestMapUpgradeV3ToV5WithLowerSize(t *testing.T) {
 	err := mockMapv3.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v3.NewKey(0x1234 + uint32(i))
 		v := v3.NewValue(0x4568 + uint32(i))
 
@@ -241,7 +251,7 @@ func TestMapUpgradeWithDeltaEntries(t *testing.T) {
 	Expect(val).To(Equal(val5.AsBytes()))
 
 	// update v2 map with new k,v pairs
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k = v2.NewKey(0x1234 + uint32(i))
 		v = v2.NewValue(0x4568 + uint32(i))
 		err = mockMapv2.Update(k.AsBytes(), v.AsBytes())
@@ -262,7 +272,7 @@ func TestMapUpgradeWithDeltaEntries(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(val).To(Equal(val5.AsBytes()))
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k5 = v5.NewKey(0x1234 + uint32(i))
 		val5 = v5.NewValue(0x4568 + uint32(i))
 		val, err = mockMapv5.Get(k5.AsBytes())
@@ -284,7 +294,7 @@ func TestMapResizeWhileUpgradeInProgress(t *testing.T) {
 	err := mockMapv2.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v2.NewKey(0x1234 + uint32(i))
 		v := v2.NewValue(0x4568 + uint32(i))
 		err = mockMapv2.Update(k.AsBytes(), v.AsBytes())
@@ -296,7 +306,7 @@ func TestMapResizeWhileUpgradeInProgress(t *testing.T) {
 	err = mockMapv5.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v5.NewKey(0x1234 + uint32(i))
 		v := v5.NewValue(0x4568 + uint32(i))
 		val, err := mockMapv5.Get(k.AsBytes())
@@ -304,7 +314,7 @@ func TestMapResizeWhileUpgradeInProgress(t *testing.T) {
 		Expect(val).To(Equal(v.AsBytes()))
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		k := v5.NewKey(0x1234 + uint32(i))
 		err := mockMapv5.Delete(k.AsBytes())
 		Expect(err).NotTo(HaveOccurred())
@@ -314,7 +324,7 @@ func TestMapResizeWhileUpgradeInProgress(t *testing.T) {
 	err = mockMapv5_new.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v5.NewKey(0x1234 + uint32(i))
 		v := v5.NewValue(0x4568 + uint32(i))
 		val, err := mockMapv5_new.Get(k.AsBytes())
@@ -336,7 +346,7 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 	err := mockMapv2_old.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v2.NewKey(0x1234 + uint32(i))
 		v := v2.NewValue(0x4568 + uint32(i))
 		err = mockMapv2_old.Update(k.AsBytes(), v.AsBytes())
@@ -362,7 +372,7 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 	}
 
 	// Repin /sys/fs/bpt/tc/globals/cali_mock2_old1 to /sys/fs/bpt/tc/globals/cali_mock2_old
-	err = libbpf.ObjPin(int(mockMapv2_old.MapFD()), mockMapv2.Path()+"_old")
+	err = libbpf.ObjPin(int(mockMapv2_old.MapFD()), mockMapv2_old.Path()+"_old")
 	Expect(err).NotTo(HaveOccurred())
 	// Remove /sys/fs/bpt/tc/globals/cali_mock2_old1
 	os.Remove(mockMapv2_old.Path() + "_old1")
@@ -381,7 +391,7 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 	err = mockMapv5.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := v5.NewKey(0x1234 + uint32(i))
 		v := v5.NewValue(0x4568 + uint32(i))
 		val, err := mockMapv5.Get(k.AsBytes())
@@ -395,7 +405,7 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(mockMapv2.GetName()))
 }
 
-func TestUpgradeWithSameVersionDifferentParams(t *testing.T) {
+func TestMapUpgradeWithSameVersionDifferentParams(t *testing.T) {
 	RegisterTestingT(t)
 
 	// Create v2 map and add 10 entries to it
@@ -422,13 +432,20 @@ func TestUpgradeWithSameVersionDifferentParams(t *testing.T) {
 	Expect(mapInfo.ValueSize).To(Equal(64))
 
 	mapParams.ValueSize = 128
-	b = maps.NewPinnedMap(mapParams)
-	err = b.EnsureExists()
+	c := maps.NewPinnedMap(mapParams)
+	err = c.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 
-	mapInfo, err = maps.GetMapInfo(b.MapFD())
+	mapInfo, err = maps.GetMapInfo(c.MapFD())
 	Expect(err).NotTo(HaveOccurred())
 
 	Expect(mapInfo.KeySize).To(Equal(24))
 	Expect(mapInfo.ValueSize).To(Equal(128))
+
+	deleteMap(mockMapv2)
+	deleteMap(b)
+	deleteMap(c)
+	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(mockMapv2.GetName()))
+	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(b.GetName()))
+	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(c.GetName()))
 }

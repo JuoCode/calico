@@ -15,20 +15,22 @@ import (
 
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ns"
-	. "github.com/onsi/ginkgo"
+	"github.com/mcuadros/go-version"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/vishvananda/netlink"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/testutils"
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
 	grpc_dataplane "github.com/projectcalico/calico/cni-plugin/pkg/dataplane/grpc"
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/grpc/proto"
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/linux"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
+	"github.com/projectcalico/calico/libcalico-go/lib/netlinkutils"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
@@ -44,7 +46,7 @@ var _ = Describe("CalicoCni", func() {
 		testutils.WipeDatastore()
 		// Create the node for these tests. The IPAM code requires a corresponding Calico node to exist.
 		var err error
-		n := libapiv3.NewNode()
+		n := internalapi.NewNode()
 		n.Name, err = names.Hostname()
 		Expect(err).NotTo(HaveOccurred())
 		_, err = calicoClient.Nodes().Create(context.Background(), n, options.SetOptions{})
@@ -120,7 +122,7 @@ var _ = Describe("CalicoCni", func() {
 
 			mac := contVeth.Attrs().HardwareAddr
 
-			Expect(endpoints.Items[0].Spec).Should(Equal(libapiv3.WorkloadEndpointSpec{
+			Expect(endpoints.Items[0].Spec).Should(Equal(internalapi.WorkloadEndpointSpec{
 				InterfaceName: fmt.Sprintf("cali%s", containerID),
 				IPNetworks:    []string{result.IPs[0].Address.String()},
 				MAC:           mac.String(),
@@ -139,7 +141,9 @@ var _ = Describe("CalicoCni", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(hostVeth.Attrs().Flags.String()).Should(ContainSubstring("up"))
 			Expect(hostVeth.Attrs().MTU).Should(Equal(1500))
-			Expect(hostVeth.Attrs().HardwareAddr.String()).Should(Equal("ee:ee:ee:ee:ee:ee"))
+			// Note: we don't assert the host-side MAC here. The CNI plugin sets it to
+			// ee:ee:ee:ee:ee:ee but some kernel versions reset veth MACs asynchronously
+			// (e.g., during IPv6 link-local address setup), causing flaky test failures.
 
 			// Assert hostVeth sysctl values are set to what we expect for IPv4.
 			err = testutils.CheckSysctlValue(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", hostVethName), "1")
@@ -157,7 +161,14 @@ var _ = Describe("CalicoCni", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Assert if the host side route is programmed correctly.
-			hostRoutes, err := netlink.RouteList(hostVeth, syscall.AF_INET)
+			nlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+			Expect(err).ShouldNot(HaveOccurred())
+			defer func() {
+				if err := nlHandle.Close(); err != nil {
+					log.WithError(err).Warn("Failed to close netlink handle")
+				}
+			}()
+			hostRoutes, err := netlinkutils.RouteListRetryEINTR(nlHandle, hostVeth, syscall.AF_INET)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(hostRoutes[0]).Should(Equal(netlink.Route{
 				LinkIndex: hostVeth.Attrs().Index,
@@ -174,14 +185,16 @@ var _ = Describe("CalicoCni", func() {
 
 			// Assume the first IP is the IPv4 address
 			Expect(contAddresses[0].IP.String()).Should(Equal(ip))
-			Expect(contRoutes).Should(SatisfyAll(ContainElement(netlink.Route{
-				LinkIndex: contVeth.Attrs().Index,
-				Gw:        net.IPv4(169, 254, 1, 1).To4(),
-				Protocol:  syscall.RTPROT_BOOT,
-				Table:     syscall.RT_TABLE_MAIN,
-				Type:      syscall.RTN_UNICAST,
-				Family:    syscall.AF_INET,
-			}),
+			Expect(contRoutes).Should(SatisfyAll(
+				ContainElement(netlink.Route{
+					LinkIndex: contVeth.Attrs().Index,
+					Dst:       netlinkDefaultCIDR(),
+					Gw:        net.IPv4(169, 254, 1, 1).To4(),
+					Protocol:  syscall.RTPROT_BOOT,
+					Table:     syscall.RT_TABLE_MAIN,
+					Type:      syscall.RTN_UNICAST,
+					Family:    syscall.AF_INET,
+				}),
 				ContainElement(netlink.Route{
 					LinkIndex: contVeth.Attrs().Index,
 					Scope:     netlink.SCOPE_LINK,
@@ -373,7 +386,7 @@ var _ = Describe("CalicoCni", func() {
 	})
 
 	Context("With a gRPC dataplane", func() {
-		It("communicates with the dataplane", func(done Done) {
+		It("communicates with the dataplane", func() {
 			var contNs ns.NetNS
 			var grpcBackend *grpc_dataplane.TestServer
 			var exitCode int
@@ -450,8 +463,7 @@ var _ = Describe("CalicoCni", func() {
 			if err != nil && !strings.Contains(err.Error(), "no such file or directory") {
 				Expect(err).NotTo(HaveOccurred())
 			}
-			close(done)
-		}, 30.0)
+		})
 	})
 
 	Context("deprecate hostname for nodename", func() {
@@ -707,7 +719,7 @@ var _ = Describe("CalicoCni", func() {
 
 		var containerID string
 		var workloadName string
-		var endpointSpec libapiv3.WorkloadEndpointSpec
+		var endpointSpec internalapi.WorkloadEndpointSpec
 		var contNs ns.NetNS
 		var result *cniv1.Result
 
@@ -728,6 +740,12 @@ var _ = Describe("CalicoCni", func() {
 			var err error
 			containerID, result, _, _, _, contNs, err = testutils.CreateContainerWithId(netconf, "", testutils.TEST_DEFAULT_NS, "", "badbeef")
 			Expect(err).ShouldNot(HaveOccurred())
+
+			// Verify that IPAM populates routes in the result (one route per allocated IP).
+			Expect(result.IPs).Should(HaveLen(1))
+			Expect(result.Routes).Should(HaveLen(1))
+			Expect(result.Routes[0].Dst.IP.Equal(result.IPs[0].Address.IP)).Should(BeTrue(),
+				"Route Dst IP should match the allocated IP")
 
 			// The endpoint is created in etcd
 			endpoints, err := calicoClient.WorkloadEndpoints().List(ctx, options.ListOptions{Namespace: "default"})
@@ -769,6 +787,10 @@ var _ = Describe("CalicoCni", func() {
 			// Try to create the same container (so CNI receives the ADD for the same endpoint again)
 			resultSecondAdd, _, _, _, err := testutils.RunCNIPluginWithId(netconf, "", testutils.TEST_DEFAULT_NS, "", containerID, "eth0", contNs)
 			Expect(err).ShouldNot(HaveOccurred())
+			// Routes are generated by the IPAM plugin on first ADD but not on the no-op
+			// second ADD (which skips IPAM). Nullify before comparing.
+			resultSecondAdd.Routes = nil
+			result.Routes = nil
 			Expect(resultSecondAdd).Should(Equal(result))
 
 			// The endpoint is created in etcd
@@ -786,6 +808,10 @@ var _ = Describe("CalicoCni", func() {
 			tweaked := strings.Replace(netconf, "net1", "net2", 1)
 			resultSecondAdd, _, _, _, err := testutils.RunCNIPluginWithId(tweaked, "", "", "", containerID, "", contNs)
 			Expect(err).ShouldNot(HaveOccurred())
+			// Routes are generated by the IPAM plugin on first ADD but not on the no-op
+			// second ADD (which skips IPAM). Nullify before comparing.
+			resultSecondAdd.Routes = nil
+			result.Routes = nil
 			Expect(resultSecondAdd).Should(Equal(result))
 
 			// The endpoint is created in etcd
@@ -849,7 +875,11 @@ var _ = Describe("CalicoCni", func() {
 
 				hostNlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
 				Expect(err).ShouldNot(HaveOccurred())
-				defer hostNlHandle.Close()
+				defer func() {
+					if err := hostNlHandle.Close(); err != nil {
+						log.WithError(err).Warn("Failed to close netlink handle")
+					}
+				}()
 
 				// CNI plugin generates host side vEth name from containerID if used for "cni" orchestrator.
 				hostVethName := "cali" + containerID[:min(11, len(containerID))] // "cali" + containerID
@@ -868,7 +898,7 @@ var _ = Describe("CalicoCni", func() {
 
 	Describe("testConnection tests", func() {
 
-		It("successfully connects to the datastore", func(done Done) {
+		It("successfully connects to the datastore", func() {
 			netconf := fmt.Sprintf(`
 {
   "cniVersion": "%s",
@@ -885,20 +915,20 @@ var _ = Describe("CalicoCni", func() {
 }`, cniVersion, os.Getenv("ETCD_IP"), os.Getenv("DATASTORE_TYPE"))
 			pluginPath := fmt.Sprintf("%s/%s", os.Getenv("BIN"), os.Getenv("PLUGIN"))
 			c := exec.Command(pluginPath, "-t")
+			c.Env = append(os.Environ(), "CNI_COMMAND=VERSION")
 			stdin, err := c.StdinPipe()
 			Expect(err).ToNot(HaveOccurred())
 
 			go func() {
-				defer stdin.Close()
+				defer func() { _ = stdin.Close() }()
 				_, _ = io.WriteString(stdin, netconf)
 			}()
 
 			_, err = c.CombinedOutput()
 			Expect(err).ToNot(HaveOccurred())
-			close(done)
-		}, 10)
+		})
 
-		It("reports it cannot connect to the datastore", func(done Done) {
+		It("reports it cannot connect to the datastore", func() {
 			// wrong port.
 			netconf := fmt.Sprintf(`
 {
@@ -916,18 +946,81 @@ var _ = Describe("CalicoCni", func() {
 }`, cniVersion, os.Getenv("ETCD_IP"), os.Getenv("DATASTORE_TYPE"))
 			pluginPath := fmt.Sprintf("%s/%s", os.Getenv("BIN"), os.Getenv("PLUGIN"))
 			c := exec.Command(pluginPath, "-t")
+			c.Env = append(os.Environ(), "CNI_COMMAND=VERSION")
 			stdin, err := c.StdinPipe()
 			Expect(err).ToNot(HaveOccurred())
 
 			go func() {
-				defer stdin.Close()
+				defer func() { _ = stdin.Close() }()
 				_, _ = io.WriteString(stdin, netconf)
 			}()
 
 			_, err = c.CombinedOutput()
 			Expect(err).To(HaveOccurred())
-			close(done)
-		}, 10)
+		})
 
 	})
+
+	Context("When CNI ADD success, return all interfaces", func() {
+		ipPool4 := "10.0.0.0/8"
+		netconf := fmt.Sprintf(`
+		{
+			"cniVersion": "%s",
+			"name": "net1",
+			"type": "calico",
+			"etcd_endpoints": "http://%s:2379",
+			"nodename_file_optional": true,
+			"datastore_type": "%s",
+			"ipam": {
+				"type": "host-local",
+				"subnet": "%s"
+			}
+		}`, cniVersion, os.Getenv("ETCD_IP"), os.Getenv("DATASTORE_TYPE"), ipPool4)
+
+		BeforeEach(func() {
+			if version.Compare(cniVersion, "0.3.0", "<") {
+				Skip("Skipping test because of CNI version < 0.3.0")
+			}
+		})
+
+		It("should allocate IPv4 only", func() {
+			_, ipPool4CIDR, err := net.ParseCIDR(ipPool4)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, result, _, contAddresses, _, contNs, err := testutils.CreateContainer(netconf, "", testutils.TEST_DEFAULT_NS, "")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			Expect(len(contAddresses)).Should(Equal(1))
+
+			for _, ip := range contAddresses {
+				podIP := ip.IP
+				Expect(ipPool4CIDR.Contains(podIP)).Should(BeTrue())
+			}
+
+			interfaces := result.Interfaces
+
+			Expect(len(interfaces)).Should(Equal(2))
+			Expect(len(result.IPs)).Should(Equal(1))
+
+			for _, ip := range result.IPs {
+				interfaceIndex := ip.Interface
+				Expect(interfaceIndex).ShouldNot(BeNil())
+				iface := interfaces[*interfaceIndex]
+				Expect(iface).ShouldNot(BeNil())
+				Expect(iface.Name).Should(Equal("eth0"))
+				Expect(iface.Mac).ShouldNot(BeEmpty())
+				Expect(iface.Sandbox).ShouldNot(BeEmpty())
+			}
+
+			// Delete the container.
+			_, err = testutils.DeleteContainer(netconf, contNs.Path(), "", testutils.TEST_DEFAULT_NS)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+	})
 })
+
+func netlinkDefaultCIDR() *net.IPNet {
+	_, defaultCIDR, _ := net.ParseCIDR("0.0.0.0/0")
+	defaultCIDR.IP = defaultCIDR.IP.To16() // Netlink returns a v6-formed IP.
+	return defaultCIDR
+}

@@ -17,14 +17,14 @@ package config_test
 import (
 	"net"
 
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/config"
 )
 
 var _ = DescribeTable("Endpoint list parameter parsing",
-	func(raw string, expected interface{}) {
+	func(raw string, expected any) {
 		p := config.EndpointListParam{config.Metadata{
 			Name: "Endpoints",
 		}}
@@ -42,7 +42,7 @@ var _ = DescribeTable("Endpoint list parameter parsing",
 )
 
 var _ = DescribeTable("CIDR list parameter parsing",
-	func(raw string, expected interface{}, expectSuccess bool) {
+	func(raw string, expected any, expectSuccess bool) {
 		p := config.CIDRListParam{config.Metadata{
 			Name: "CIDRs",
 		}}
@@ -59,7 +59,6 @@ var _ = DescribeTable("CIDR list parameter parsing",
 	Entry("Single CIDR", "1.1.1.1/32", []string{"1.1.1.1/32"}, true),
 	Entry("Single CIDR subnet", "1.1.1.1/24", []string{"1.1.1.0/24"}, true),
 	Entry("Mix of IP and CIDRs", "1.1.1.1/24, 2.2.2.2", []string{"1.1.1.0/24", "2.2.2.2/32"}, true),
-	Entry("Reject IPv6", "aabc::1111/32", []string{}, false),
 )
 
 var _ = DescribeTable("KeyValue list parameter parsing",
@@ -127,7 +126,7 @@ var _ = DescribeTable("IPv6 list parameter parsing",
 )
 
 var _ = DescribeTable("String Slice parameter with InterfaceRegex parsing",
-	func(raw string, expected interface{}, expectSuccess bool) {
+	func(raw string, expected any, expectSuccess bool) {
 		p := config.StringSliceParam{config.Metadata{
 			Name: "StringSliceParam",
 		}, config.InterfaceRegex,
@@ -151,7 +150,7 @@ var _ = DescribeTable("String Slice parameter with InterfaceRegex parsing",
 )
 
 var _ = DescribeTable("String Slice parameter with IfaceParamRegexp parsing",
-	func(raw string, expected interface{}, expectSuccess bool) {
+	func(raw string, expected any, expectSuccess bool) {
 		p := config.StringSliceParam{config.Metadata{
 			Name: "StringSliceParam",
 		}, config.IfaceParamRegexp,

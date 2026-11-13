@@ -18,86 +18,122 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
-
-	docopt "github.com/docopt/docopt-go"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 )
 
-func updateIPAMStrictAffinity(ctx context.Context, ipamClient ipam.Interface, enabled bool) error {
+func updateIPAMConfig(
+	ctx context.Context,
+	ipamClient ipam.Interface,
+	strictAffinity *bool,
+	maxBlocks *int,
+	persistence *ipam.VMAddressPersistence,
+	ipCooldownSeconds *int,
+) error {
 	ipamConfig, err := ipamClient.GetIPAMConfig(ctx)
 	if err != nil {
-		return fmt.Errorf("Error: %v", err)
+		return fmt.Errorf("error: %v", err)
 	}
 
-	// If StrictAffinity == true => an address from a block can only be assigned by
-	// host with block affinity.
-	ipamConfig.StrictAffinity = enabled
+	// Update StrictAffinity if specified.
+	if strictAffinity != nil {
+		ipamConfig.StrictAffinity = *strictAffinity
+	}
+
+	// Set MaxBlocksPerHost if specified.
+	if maxBlocks != nil {
+		ipamConfig.MaxBlocksPerHost = *maxBlocks
+	}
+
+	// Update KubeVirtVMAddressPersistence if specified.
+	if persistence != nil {
+		ipamConfig.KubeVirtVMAddressPersistence = persistence
+	}
+
+	// Update IPCooldownSeconds if specified.
+	if ipCooldownSeconds != nil {
+		ipamConfig.IPCooldownSeconds = *ipCooldownSeconds
+	}
 
 	err = ipamClient.SetIPAMConfig(ctx, *ipamConfig)
 	if err != nil {
-		return fmt.Errorf("Error: %v", err)
+		return fmt.Errorf("error: %v", err)
 	}
 
-	fmt.Println("Successfully set StrictAffinity to:", enabled)
+	if strictAffinity != nil {
+		fmt.Println("Successfully set StrictAffinity to:", *strictAffinity)
+	}
+	if maxBlocks != nil {
+		fmt.Println("Successfully set MaxBlocksPerHost to:", *maxBlocks)
+	}
+	if persistence != nil {
+		fmt.Println("Successfully set KubeVirtVMAddressPersistence to:", *persistence)
+	}
+	if ipCooldownSeconds != nil {
+		fmt.Println("Successfully set IPCooldownSeconds to:", *ipCooldownSeconds)
+	}
 
 	return nil
 }
 
-// Configure IPAM.
-func Configure(args []string) error {
-	doc := constants.DatastoreIntro + `Usage:
-  <BINARY_NAME> ipam configure --strictaffinity=<true/false> [--config=<CONFIG>] [--allow-version-mismatch]
-
-Options:
-  -h --help                        Show this screen.
-     --strictaffinity=<true/false> Set StrictAffinity to true/false. When StrictAffinity
-                                   is true, borrowing IP addresses is not allowed.
-  -c --config=<CONFIG>             Path to the file containing connection configuration in
-                                   YAML or JSON format.
-                                   [default: ` + constants.DefaultConfigPath + `]
-     --allow-version-mismatch      Allow client and cluster versions mismatch.
-
-Description:
- Modify configuration for Calico IP address management.
-`
-	// Replace all instances of BINARY_NAME with the name of the binary.
-	name, _ := util.NameAndDescription()
-	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", name)
-
-	parsedArgs, err := docopt.ParseArgs(doc, args, "")
-	if err != nil {
-		return fmt.Errorf("Invalid option: 'calicoctl %s'. Use flag '--help' to read about a specific subcommand.", strings.Join(args, " "))
+// parsePersistence validates and converts CLI value to typed enum.
+func parsePersistence(val string) (*ipam.VMAddressPersistence, error) {
+	switch val {
+	case string(ipam.VMAddressPersistenceEnabled):
+		p := ipam.VMAddressPersistenceEnabled
+		return &p, nil
+	case string(ipam.VMAddressPersistenceDisabled):
+		p := ipam.VMAddressPersistenceDisabled
+		return &p, nil
+	default:
+		return nil, fmt.Errorf("invalid value for --kubevirt-ip-persistence. Use Enabled or Disabled")
 	}
-	if len(parsedArgs) == 0 {
-		return nil
-	}
+}
 
-	err = common.CheckVersionMismatch(parsedArgs["--config"], parsedArgs["--allow-version-mismatch"])
-	if err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-
-	// Create a new backend client from env vars.
-	cf := parsedArgs["--config"].(string)
-	client, err := clientmgr.NewClient(cf)
+// ConfigureIPAM updates IPAM configuration from pre-parsed flag values.
+func ConfigureIPAM(ctx context.Context, config, strictAffinityStr, maxBlocksStr, persistenceStr string, ipCooldownSecondsInt int) error {
+	client, err := clientmgr.NewClient(config)
 	if err != nil {
 		return err
 	}
 
 	ipamClient := client.IPAM()
-	passedValue := parsedArgs["--strictaffinity"].(string)
-	enabled, err := strconv.ParseBool(passedValue)
-	if err != nil {
-		return fmt.Errorf("Invalid value. Use true or false to set strictaffinity")
+
+	var strictAffinity *bool
+	if strictAffinityStr != "" {
+		enabled, err := strconv.ParseBool(strictAffinityStr)
+		if err != nil {
+			return fmt.Errorf("invalid value. Use true or false to set strictaffinity")
+		}
+		strictAffinity = &enabled
 	}
 
-	return updateIPAMStrictAffinity(ctx, ipamClient, enabled)
+	var maxBlocks *int
+	if maxBlocksStr != "" {
+		maxBlocksVal, err := strconv.Atoi(maxBlocksStr)
+		if err != nil {
+			return fmt.Errorf("invalid value for maxblockhost. Use a valid number")
+		}
+		maxBlocks = &maxBlocksVal
+	}
+
+	var persistence *ipam.VMAddressPersistence
+	if persistenceStr != "" {
+		persistence, err = parsePersistence(persistenceStr)
+		if err != nil {
+			return err
+		}
+	}
+
+	var ipCooldownSeconds *int
+	if ipCooldownSecondsInt >= 0 {
+		ipCooldownSeconds = &ipCooldownSecondsInt
+	}
+
+	if strictAffinity == nil && maxBlocks == nil && persistence == nil && ipCooldownSeconds == nil {
+		return fmt.Errorf("at least one configuration option must be specified")
+	}
+
+	return updateIPAMConfig(ctx, ipamClient, strictAffinity, maxBlocks, persistence, ipCooldownSeconds)
 }

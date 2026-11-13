@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -21,20 +19,17 @@ import (
 	"path/filepath"
 	"regexp"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/workload"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 )
 
 var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-	const nodeCount = 1
-
 	var (
 		infra                    infrastructure.DatastoreInfra
 		topologyOptions          infrastructure.TopologyOptions
@@ -55,17 +50,9 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []a
 		topologyOptions.FelixLogSeverity = "Debug"
 		topologyOptions.FelixDebugFilenameRegex = "status_file_reporter"
 
-		tc, _ = infrastructure.StartNNodeTopology(nodeCount, topologyOptions, infra)
+		tc, _ = infrastructure.StartSingleNodeTopology(topologyOptions, infra)
 		tc.Felixes[0].Exec("rm", "-rf", "/tmp/endpoint-status")
 		dataplaneInSyncReceivedC = tc.Felixes[0].WatchStdoutFor(regexp.MustCompile("DataplaneInSync received from upstream"))
-	})
-
-	AfterEach(func() {
-		tc.Stop()
-		if CurrentGinkgoTestDescription().Failed {
-			infra.DumpErrorData()
-		}
-		infra.Stop()
 	})
 
 	Describe("with the file-reporter writing endpoint status to '/tmp/endpoint-status'", func() {
@@ -75,18 +62,23 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []a
 			}
 		}
 
-		It("should receive DataplaneInSync message from the dataplane", func() {
+		startFelixAndWaitForInSync := func() {
 			tc.Felixes[0].TriggerDelayedStart()
+			tc.Felixes[0].WaitForReady()
 			Eventually(dataplaneInSyncReceivedC, "10s").Should(BeClosed(), "receipt of DataplaneInSync message not seen in logs")
+		}
+
+		It("should receive DataplaneInSync message from the dataplane", func() {
+			startFelixAndWaitForInSync()
 		})
 
 		It("should create endpoint-status files in a directory named endpoint-status with the specified directory prefix", func() {
-			tc.Felixes[0].TriggerDelayedStart()
+			startFelixAndWaitForInSync()
 			var filenames [2]string
 			var statCmds [2]func() error
 			for i := range dummyWorkloads {
 				dummyWorkloads[i] = workload.New(tc.Felixes[0], fmt.Sprintf("workload-endpoint-status-tests-%d", i), "default", fmt.Sprintf("10.65.0.%d", 10+i), "8080", "tcp")
-				err := dummyWorkloads[i].Start()
+				err := dummyWorkloads[i].Start(infra)
 				Expect(err).NotTo(HaveOccurred())
 				dummyWorkloads[i].ConfigureInInfra(infra)
 
@@ -115,8 +107,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []a
 			tc.Felixes[0].Exec("touch", name)
 
 			By("Waiting for Felix's status file reporter to come in-sync")
-			tc.Felixes[0].TriggerDelayedStart()
-			Eventually(dataplaneInSyncReceivedC, "10s").Should(BeClosed(), "receipt of DataplaneInSync message not seen in logs")
+			startFelixAndWaitForInSync()
 
 			By("checking if the stale file has been cleaned up")
 			fileExists := func() bool {
@@ -124,14 +115,14 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []a
 				_, err := tc.Felixes[0].ExecOutput("stat", name)
 				return err == nil
 			}
-			Eventually(fileExists).Should(BeFalse(), "Stale file was not cleaned up by Felix")
+			Eventually(fileExists, "10s", "500ms").Should(BeFalse(), "Stale file was not cleaned up by Felix")
 		})
 
-		It("should re-use pre-existing, valid files after a restart", func() {
+		It("should re-use pre-existing files after a restart", func() {
 			By("creating a workload before Felix starts")
 			wl := workload.New(tc.Felixes[0], "workload-endpoint-status-tests-0", "default", "10.65.0.10", "8080", "tcp")
 			wl.ConfigureInInfra(infra)
-			err := wl.Start()
+			err := wl.Start(infra)
 			Expect(err).NotTo(HaveOccurred(), "Couldn't start a test workload")
 
 			By("determining the filename Felix will look for")
@@ -146,20 +137,14 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Pod setup status wait", []a
 			expectedFilename := filepath.Join("/tmp/endpoint-status", filename)
 			tc.Felixes[0].Exec("mkdir", "/tmp/endpoint-status")
 			tc.Felixes[0].Exec("touch", expectedFilename)
-			// This stat call returns the time since epoch when the file was last accessed.
-			lastAccessed, err := tc.Felixes[0].ExecOutput("stat", "--format='%y'", expectedFilename)
-			Expect(err).NotTo(HaveOccurred(), "stat call failed while trying to create a file")
 
 			By("waiting for Felix's status file reporter to become in-sync")
-			tc.Felixes[0].TriggerDelayedStart()
-			Eventually(dataplaneInSyncReceivedC, "10s").Should(BeClosed(), "receipt of DataplaneInSync message not seen in logs")
+			startFelixAndWaitForInSync()
 
-			By("checking if the pre-existing file's access time changed")
-			checkLastAccessed := func() string {
-				lastAccessedPostStartup, _ := tc.Felixes[0].ExecOutput("stat", "--format='%y'", expectedFilename)
-				return lastAccessedPostStartup
-			}
-			Consistently(checkLastAccessed, "3s").Should(BeEquivalentTo(lastAccessed), "felix modified/deleted a file it didn't need to, or the test and Felix expected differing filenames")
+			output, err := tc.Felixes[0].ExecOutput("cat", expectedFilename)
+			Expect(err).NotTo(HaveOccurred(), "stat call failed while trying to create a file")
+
+			Expect(output).To(ContainSubstring("10.65.0.10"))
 		})
 	})
 

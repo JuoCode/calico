@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,124 @@ package iptables
 
 import (
 	"fmt"
+	"math"
+	"net"
+	"strconv"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
 )
 
-type Action interface {
-	ToFragment(features *environment.Features) string
-	String() string
+func Actions() generictables.ActionFactory {
+	return &actionFactory{}
+}
+
+type actionFactory struct{}
+
+func (s *actionFactory) Allow() generictables.Action {
+	return AcceptAction{}
+}
+
+func (s *actionFactory) GoTo(target string) generictables.Action {
+	return GotoAction{Target: target}
+}
+
+func (s *actionFactory) Return() generictables.Action {
+	return ReturnAction{}
+}
+
+func (s *actionFactory) Reject(with generictables.RejectWith) generictables.Action {
+	return RejectAction{With: with}
+}
+
+func (s *actionFactory) SetMaskedMark(mark, mask uint32) generictables.Action {
+	return SetMaskedMarkAction{
+		Mark: mark,
+		Mask: mask,
+	}
+}
+
+func (s *actionFactory) SetMark(mark uint32) generictables.Action {
+	return SetMarkAction{
+		Mark: mark,
+	}
+}
+
+func (s *actionFactory) ClearMark(mark uint32) generictables.Action {
+	return ClearMarkAction{Mark: mark}
+}
+
+func (s *actionFactory) Jump(target string) generictables.Action {
+	return JumpAction{Target: target}
+}
+
+func (s *actionFactory) NoTrack() generictables.Action {
+	return NoTrackAction{}
+}
+
+func (s *actionFactory) Log(prefix string) generictables.Action {
+	return LogAction{Prefix: prefix}
+}
+
+func (s *actionFactory) SNAT(ip string) generictables.Action {
+	return SNATAction{ToAddr: ip}
+}
+
+func (s *actionFactory) DNAT(ip string, port uint16) generictables.Action {
+	return DNATAction{DestAddr: ip, DestPort: port}
+}
+
+func (s *actionFactory) Masq(toPorts string) generictables.Action {
+	return MasqAction{ToPorts: toPorts}
+}
+
+func (s *actionFactory) Drop() generictables.Action {
+	return DropAction{}
+}
+
+func (s *actionFactory) SetConnmark(mark, mask uint32) generictables.Action {
+	return SetConnMarkAction{
+		Mark: mark,
+		Mask: mask,
+	}
+}
+
+func (s *actionFactory) Nflog(group uint16, prefix string, size int) generictables.Action {
+	return NflogAction{
+		Group:  group,
+		Prefix: prefix,
+		Size:   size,
+	}
+}
+
+func (a *actionFactory) LimitPacketRate(rate, burst int64, mark uint32) generictables.Action {
+	return LimitPacketRateAction{
+		Rate:  rate,
+		Burst: burst,
+		Mark:  mark,
+	}
+}
+
+func (a *actionFactory) LimitNumConnections(num int64, rejectWith generictables.RejectWith) generictables.Action {
+	return LimitNumConnectionsAction{
+		Num:        num,
+		RejectWith: rejectWith,
+	}
+}
+
+func (a *actionFactory) DSCP(value uint8) generictables.Action {
+	return DSCPAction{
+		Value: value,
+	}
+}
+
+// FlowOffload is unsupported in iptables mode; flowtable offload is nftables-only. The rule
+// renderer only emits it when nftables is active, so reaching this is a programming error.
+func (s *actionFactory) FlowOffload() generictables.Action {
+	logrus.Panic("FlowOffload is not supported in iptables mode")
+	return nil
 }
 
 type Referrer interface {
@@ -30,8 +141,7 @@ type Referrer interface {
 }
 
 type GotoAction struct {
-	Target   string
-	TypeGoto struct{}
+	Target string
 }
 
 func (g GotoAction) ToFragment(features *environment.Features) string {
@@ -49,8 +159,7 @@ func (g GotoAction) ReferencedChain() string {
 var _ Referrer = GotoAction{}
 
 type JumpAction struct {
-	Target   string
-	TypeJump struct{}
+	Target string
 }
 
 func (g JumpAction) ToFragment(features *environment.Features) string {
@@ -65,10 +174,14 @@ func (g JumpAction) ReferencedChain() string {
 	return g.Target
 }
 
-var _ Referrer = JumpAction{}
+var (
+	_ Referrer                         = JumpAction{}
+	_ generictables.ReturnActionMarker = ReturnAction{}
+)
 
-type ReturnAction struct {
-	TypeReturn struct{}
+type ReturnAction struct{}
+
+func (r ReturnAction) IsReturnAction() {
 }
 
 func (r ReturnAction) ToFragment(features *environment.Features) string {
@@ -79,9 +192,7 @@ func (r ReturnAction) String() string {
 	return "Return"
 }
 
-type DropAction struct {
-	TypeDrop struct{}
-}
+type DropAction struct{}
 
 func (g DropAction) ToFragment(features *environment.Features) string {
 	return "--jump DROP"
@@ -92,10 +203,13 @@ func (g DropAction) String() string {
 }
 
 type RejectAction struct {
-	TypeReject struct{}
+	With generictables.RejectWith
 }
 
 func (g RejectAction) ToFragment(features *environment.Features) string {
+	if g.With != "" {
+		return fmt.Sprintf("--jump REJECT --reject-with %s", g.With)
+	}
 	return "--jump REJECT"
 }
 
@@ -104,8 +218,7 @@ func (g RejectAction) String() string {
 }
 
 type LogAction struct {
-	Prefix  string
-	TypeLog struct{}
+	Prefix string
 }
 
 func (g LogAction) ToFragment(features *environment.Features) string {
@@ -116,9 +229,7 @@ func (g LogAction) String() string {
 	return "Log"
 }
 
-type AcceptAction struct {
-	TypeAccept struct{}
-}
+type AcceptAction struct{}
 
 func (g AcceptAction) ToFragment(features *environment.Features) string {
 	return "--jump ACCEPT"
@@ -128,17 +239,40 @@ func (g AcceptAction) String() string {
 	return "Accept"
 }
 
+type NflogAction struct {
+	Group  uint16
+	Prefix string
+	Size   int
+}
+
+func (n NflogAction) ToFragment(features *environment.Features) string {
+	size := 80
+	if n.Size != 0 {
+		size = n.Size
+	}
+	if n.Size < 0 {
+		return fmt.Sprintf("--jump NFLOG --nflog-group %d --nflog-prefix %s", n.Group, n.Prefix)
+	} else if features.NFLogSize {
+		return fmt.Sprintf("--jump NFLOG --nflog-group %d --nflog-prefix %s --nflog-size %d", n.Group, n.Prefix, size)
+	} else {
+		return fmt.Sprintf("--jump NFLOG --nflog-group %d --nflog-prefix %s --nflog-range %d", n.Group, n.Prefix, size)
+	}
+}
+
+func (n NflogAction) String() string {
+	return fmt.Sprintf("Nflog:g=%d,p=%s", n.Group, n.Prefix)
+}
+
 type DNATAction struct {
 	DestAddr string
 	DestPort uint16
-	TypeDNAT struct{}
 }
 
 func (g DNATAction) ToFragment(features *environment.Features) string {
 	if g.DestPort == 0 {
 		return fmt.Sprintf("--jump DNAT --to-destination %s", g.DestAddr)
 	} else {
-		return fmt.Sprintf("--jump DNAT --to-destination %s:%d", g.DestAddr, g.DestPort)
+		return fmt.Sprintf("--jump DNAT --to-destination %s", net.JoinHostPort(g.DestAddr, strconv.Itoa(int(g.DestPort))))
 	}
 }
 
@@ -147,8 +281,7 @@ func (g DNATAction) String() string {
 }
 
 type SNATAction struct {
-	ToAddr   string
-	TypeSNAT struct{}
+	ToAddr string
 }
 
 func (g SNATAction) ToFragment(features *environment.Features) string {
@@ -164,8 +297,7 @@ func (g SNATAction) String() string {
 }
 
 type MasqAction struct {
-	ToPorts  string
-	TypeMasq struct{}
+	ToPorts string
 }
 
 func (g MasqAction) ToFragment(features *environment.Features) string {
@@ -184,8 +316,7 @@ func (g MasqAction) String() string {
 }
 
 type ClearMarkAction struct {
-	Mark          uint32
-	TypeClearMark struct{}
+	Mark uint32
 }
 
 func (c ClearMarkAction) ToFragment(features *environment.Features) string {
@@ -197,8 +328,7 @@ func (c ClearMarkAction) String() string {
 }
 
 type SetMarkAction struct {
-	Mark        uint32
-	TypeSetMark struct{}
+	Mark uint32
 }
 
 func (c SetMarkAction) ToFragment(features *environment.Features) string {
@@ -210,9 +340,8 @@ func (c SetMarkAction) String() string {
 }
 
 type SetMaskedMarkAction struct {
-	Mark              uint32
-	Mask              uint32
-	TypeSetMaskedMark struct{}
+	Mark uint32
+	Mask uint32
 }
 
 func (c SetMaskedMarkAction) ToFragment(features *environment.Features) string {
@@ -223,9 +352,7 @@ func (c SetMaskedMarkAction) String() string {
 	return fmt.Sprintf("Set:%#x", c.Mark)
 }
 
-type NoTrackAction struct {
-	TypeNoTrack struct{}
-}
+type NoTrackAction struct{}
 
 func (g NoTrackAction) ToFragment(features *environment.Features) string {
 	return "--jump NOTRACK"
@@ -236,8 +363,7 @@ func (g NoTrackAction) String() string {
 }
 
 type SaveConnMarkAction struct {
-	SaveMask     uint32
-	TypeConnMark struct{}
+	SaveMask uint32
 }
 
 func (c SaveConnMarkAction) ToFragment(features *environment.Features) string {
@@ -256,8 +382,7 @@ func (c SaveConnMarkAction) String() string {
 }
 
 type RestoreConnMarkAction struct {
-	RestoreMask  uint32
-	TypeConnMark struct{}
+	RestoreMask uint32
 }
 
 func (c RestoreConnMarkAction) ToFragment(features *environment.Features) string {
@@ -276,9 +401,8 @@ func (c RestoreConnMarkAction) String() string {
 }
 
 type SetConnMarkAction struct {
-	Mark         uint32
-	Mask         uint32
-	TypeConnMark struct{}
+	Mark uint32
+	Mask uint32
 }
 
 func (c SetConnMarkAction) ToFragment(features *environment.Features) string {
@@ -294,4 +418,60 @@ func (c SetConnMarkAction) ToFragment(features *environment.Features) string {
 
 func (c SetConnMarkAction) String() string {
 	return fmt.Sprintf("SetConnMarkWithMask:%#x/%#x", c.Mark, c.Mask)
+}
+
+type LimitPacketRateAction struct {
+	Rate  int64
+	Burst int64
+	Mark  uint32
+}
+
+func (a LimitPacketRateAction) ToFragment(features *environment.Features) string {
+	if a.Mark == 0 {
+		logrus.WithField("mark", a.Mark).Panic("Invalid mark")
+	}
+	// Rate and Burst are limited to XT_LIMIT_SCALE (10k)
+	// See https://github.com/torvalds/linux/blob/16b70698aa3ae7888826d0c84567c72241cf6713/include/uapi/linux/netfilter/xt_limit.h#L8
+	if a.Rate < 0 || a.Rate > 10000 {
+		logrus.WithField("rate", a.Rate).Panic("Invalid rate")
+	}
+	if a.Burst < 1 || a.Burst > 10000 {
+		logrus.WithField("burst", a.Burst).Panic("Invalid burst")
+	}
+	return fmt.Sprintf("-m limit --limit %d/sec --limit-burst %d --jump MARK --set-mark %#x/%#x", a.Rate, a.Burst, a.Mark, a.Mark)
+}
+
+func (a LimitPacketRateAction) String() string {
+	return fmt.Sprintf("LimitPacketRate:%d/s,burst:%d", a.Rate, a.Burst)
+}
+
+type LimitNumConnectionsAction struct {
+	Num        int64
+	RejectWith generictables.RejectWith
+}
+
+func (a LimitNumConnectionsAction) ToFragment(features *environment.Features) string {
+	// The connection limit is an uint32 (maximum value 4294967295).
+	// See https://github.com/torvalds/linux/blob/16b70698aa3ae7888826d0c84567c72241cf6713/include/uapi/linux/netfilter/xt_connlimit.h#L25
+	if a.Num < 0 || a.Num > math.MaxUint32 {
+		logrus.WithField("rate", a.Num).Panic("Invalid limit")
+	}
+	// '-m tcp --tcp-flags FIN,SYN,RST,ACK SYN' is equivalent to '--syn' but the long form is shown on the output of 'iptables-*-save', so use the long form too for consistency
+	return fmt.Sprintf("-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above %d --connlimit-mask 0 -j REJECT --reject-with %s", a.Num, a.RejectWith)
+}
+
+func (a LimitNumConnectionsAction) String() string {
+	return fmt.Sprintf("LimitNumConnectionsAction:%d,rejectWith:%s", a.Num, a.RejectWith)
+}
+
+type DSCPAction struct {
+	Value uint8
+}
+
+func (a DSCPAction) ToFragment(features *environment.Features) string {
+	return fmt.Sprintf("--jump DSCP --set-dscp %d", a.Value)
+}
+
+func (a DSCPAction) String() string {
+	return fmt.Sprintf("DSCP %d", a.Value)
 }

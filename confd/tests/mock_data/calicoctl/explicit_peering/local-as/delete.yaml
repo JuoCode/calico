@@ -4,11 +4,11 @@ metadata:
   name: bgppeer-1
 spec:
   peerIP: 10.192.0.3
-  asNumber: 64566
+  asNumber: 64512
+  localASNumber: 65002
   node: kube-master
 
 ---
-
 kind: BGPPeer
 apiVersion: projectcalico.org/v3
 metadata:
@@ -16,10 +16,10 @@ metadata:
 spec:
   peerIP: 10.192.0.4
   asNumber: 64566
+  localASNumber: 65001
   node: kube-master
 
 ---
-
 kind: IPPool
 apiVersion: projectcalico.org/v3
 metadata:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2018 Tigera, Inc. All rights reserved.
+# Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,34 +17,36 @@ import json
 import re
 import uuid
 
-from networking_calico.compat import log
+from oslo_log import log
+
 from networking_calico import datamodel_v2
 from networking_calico import etcdv3
 from networking_calico.timestamp import timestamp_now
 
 # Particular JSON key strings.
-CLUSTER_GUID = 'clusterGUID'
-CLUSTER_TYPE = 'clusterType'
-DATASTORE_READY = 'datastoreReady'
-ENDPOINT_REPORTING_ENABLED = 'endpointReportingEnabled'
-INTERFACE_PREFIX = 'interfacePrefix'
+CLUSTER_GUID = "clusterGUID"
+CLUSTER_TYPE = "clusterType"
+DATASTORE_READY = "datastoreReady"
+ENDPOINT_REPORTING_ENABLED = "endpointReportingEnabled"
+INTERFACE_PREFIX = "interfacePrefix"
 
 # Annotation keys.
-ANN_KEY_PREFIX = 'openstack.projectcalico.org/'
-ANN_KEY_FQDN = ANN_KEY_PREFIX + 'fqdn'
-ANN_KEY_NETWORK_ID = ANN_KEY_PREFIX + 'network-id'
+ANN_KEY_PREFIX = "openstack.projectcalico.org/"
+ANN_KEY_FQDN = ANN_KEY_PREFIX + "fqdn"
+ANN_KEY_NETWORK_ID = ANN_KEY_PREFIX + "network-id"
 
 # Namespace constants.
-NO_REGION_NAMESPACE = 'openstack'
-REGION_NAMESPACE_PREFIX = 'openstack-'
+NO_REGION_NAMESPACE = "openstack"
+REGION_NAMESPACE_PREFIX = "openstack-"
 NOT_NAMESPACED = None
 
 
 LOG = log.getLogger(__name__)
 
 
-def put(resource_kind, namespace, name, spec, annotations={}, labels=None,
-        mod_revision=None):
+def put(
+    resource_kind, namespace, name, spec, annotations={}, labels=None, mod_revision=None
+):
     """Write a Calico v3 resource to etcdv3.
 
     - resource_kind (string): E.g. WorkloadEndpoint, Profile, etc.
@@ -71,36 +73,38 @@ def put(resource_kind, namespace, name, spec, annotations={}, labels=None,
       e.g. "12345", and indicates that the write should only proceed if
       replacing an existing value with that mod_revision.
 
-    Returns True if the write happened successfully; False if not.
+    Returns the resource's metadata UID (a string) if the write happened
+    successfully; None if not.  The returned UID is truthy on success, so
+    callers that previously checked truthiness are unaffected.
     """
     key = _build_key(resource_kind, namespace, name)
     value = None
     try:
-        # Get the existing resource so we can persist its metadata.
+        # Get the existing resource so we can persist its metadata. _get_with_metadata
+        # returns value=None if the existing JSON is corrupt — the `if value is None`
+        # branch below then rebuilds the structure from scratch, same as KeyNotFound.
         value, _ = _get_with_metadata(resource_kind, namespace, name)
     except etcdv3.KeyNotFound:
         pass
-    except ValueError:
-        LOG.warning("etcd value not valid JSON, so ignoring")
     if value is None:
         # Build basic resource structure.
         value = {
-            'kind': resource_kind,
-            'apiVersion': 'projectcalico.org/v3',
-            'metadata': {
-                'name': name,
+            "kind": resource_kind,
+            "apiVersion": "projectcalico.org/v3",
+            "metadata": {
+                "name": name,
             },
         }
     # Ensure namespace set, for a namespaced resource.
     if _is_namespaced(resource_kind):
         assert namespace is not None
-        value['metadata']['namespace'] = namespace
+        value["metadata"]["namespace"] = namespace
     # Ensure that there is a creation timestamp.
-    if 'creationTimestamp' not in value['metadata']:
-        value['metadata']['creationTimestamp'] = timestamp_now()
+    if "creationTimestamp" not in value["metadata"]:
+        value["metadata"]["creationTimestamp"] = timestamp_now()
     # Ensure that there is a UID.
-    if 'uid' not in value['metadata']:
-        value['metadata']['uid'] = str(uuid.uuid4())
+    if "uid" not in value["metadata"]:
+        value["metadata"]["uid"] = str(uuid.uuid4())
     # Set annotations and labels if specified.  (We previously used to merge
     # here, instead of overwriting, but (a) for annotations there is actually
     # no use case for that, because we only use annotations on endpoints for
@@ -109,12 +113,15 @@ def put(resource_kind, namespace, name, spec, annotations={}, labels=None,
     # we overwrite and don't merge; otherwise a VM could never be removed from
     # a security group.)
     if annotations:
-        value['metadata']['annotations'] = annotations
+        value["metadata"]["annotations"] = annotations
     if labels:
-        value['metadata']['labels'] = labels
+        value["metadata"]["labels"] = labels
     # Set the new spec (overriding whatever may already be there).
-    value['spec'] = spec
-    return etcdv3.put(key, json.dumps(value), mod_revision=mod_revision)
+    value["spec"] = spec
+    uid = value["metadata"]["uid"]
+    if etcdv3.put(key, json.dumps(value), mod_revision=mod_revision):
+        return uid
+    return None
 
 
 def get(resource_kind, name):
@@ -134,21 +141,46 @@ def get(resource_kind, name):
     - mod_revision is the etcdv3 revision at which the resource was last
       modified.
 
-    Raises etcdv3.KeyNotFound if there is no resource with that kind and name.
+    Raises etcdv3.KeyNotFound if there is no resource with that kind and name.  If the
+    existing etcd value is not valid JSON, returns (None, mod_revision) so the caller
+    can overwrite it via a CAS write at that mod_revision.
     """
-    value, mod_revision = _get_with_metadata(resource_kind,
-                                             NOT_NAMESPACED,
-                                             name)
-    return value['spec'], mod_revision
+    value, mod_revision = _get_with_metadata(resource_kind, NOT_NAMESPACED, name)
+    spec = value["spec"] if value is not None else None
+    return spec, mod_revision
 
 
-def delete_legacy(resource_kind, name_prefix=''):
+def get_namespaced(resource_kind, namespace, name, with_labels_and_annotations=False):
+    """Read a single Calico v3 resource from etcdv3.
+
+    Returns either ``(spec, mod_revision)`` or ``((spec, labels, annotations),
+    mod_revision)`` depending on ``with_labels_and_annotations``.  This mirrors the
+    per-tuple shape that :func:`get_all` returns for the matching kind, so callers can
+    use the result interchangeably.  Raises :class:`etcdv3.KeyNotFound` if the key is
+    absent.  If the existing etcd value is not valid JSON, the spec / (spec, labels,
+    annotations) tuple is replaced by None / (None, None, None) so resync can repair
+    the corrupt entry via a CAS write at the returned mod_revision (same shape as
+    get_all()).
+    """
+    value, mod_revision = _get_with_metadata(resource_kind, namespace, name)
+    if value is None:
+        if with_labels_and_annotations:
+            return (None, None, None), mod_revision
+        return None, mod_revision
+    spec = value["spec"]
+    if with_labels_and_annotations:
+        labels = value["metadata"].get("labels", {})
+        annotations = value["metadata"].get("annotations", {})
+        return (spec, labels, annotations), mod_revision
+    return spec, mod_revision
+
+
+def delete_legacy(resource_kind, name_prefix=""):
     key = _build_key(resource_kind, NO_REGION_NAMESPACE, name_prefix)
     etcdv3.delete_prefix(key)
 
 
-def get_all(resource_kind, namespace,
-            with_labels_and_annotations=False, revision=None):
+def get_all(resource_kind, namespace, with_labels_and_annotations=False, revision=None):
     """Read all Calico v3 resources of a certain kind from etcdv3.
 
     - resource_kind (string): E.g. WorkloadEndpoint, Profile, etc.
@@ -179,21 +211,21 @@ def get_all(resource_kind, namespace,
     - mod_revision is the revision at which that resource was last modified (an
       integer represented as a string).
     """
-    prefix = _build_key(resource_kind, namespace, '')
+    prefix = _build_key(resource_kind, namespace, "")
     results = etcdv3.get_prefix(prefix, revision=revision)
     tuples = []
     for result in results:
         key, value, mod_revision = result
-        name = key.split('/')[-1]
+        name = key.split("/")[-1]
 
         # Decode the value.
         spec = labels = annotations = None
         try:
             value_dict = json.loads(value)
             LOG.debug("value dict: %s", value_dict)
-            spec = value_dict['spec']
-            labels = value_dict['metadata'].get('labels', {})
-            annotations = value_dict['metadata'].get('annotations', {})
+            spec = value_dict["spec"]
+            labels = value_dict["metadata"].get("labels", {})
+            annotations = value_dict["metadata"].get("annotations", {})
         except ValueError:
             # When the value is not valid JSON, we still return a tuple for
             # this key, with spec, labels and annotations all as None.  This is
@@ -226,6 +258,17 @@ def delete(resource_kind, namespace, name, mod_revision=None):
     return etcdv3.delete(key, mod_revision=mod_revision)
 
 
+def get_uid(resource_kind, namespace, name):
+    """Read the metadata UID of a Calico v3 resource."""
+    try:
+        value, _ = _get_with_metadata(resource_kind, namespace, name)
+    except etcdv3.KeyNotFound:
+        return "unknown"
+    if value is None:
+        return "unknown"
+    return value.get("metadata", {}).get("uid", "unknown")
+
+
 SANITIZE_LABEL_MAX_LENGTH = 63
 
 
@@ -236,17 +279,17 @@ def sanitize_label_name_value(name, max_length):
     last characters are alphanumeric, and that the length is within a specified
     maximum length.
     """
-    name = re.sub('[^-_.A-Za-z0-9]', '_', name[:max_length])
+    name = re.sub("[^-_.A-Za-z0-9]", "_", name[:max_length])
     # Ensure that the first character is alphanumeric, by deleting leading
     # characters that are not alphanumeric.
-    m = re.match('^([^A-Za-z0-9]+)', name)
+    m = re.match("^([^A-Za-z0-9]+)", name)
     if m:
-        name = name[m.end(1):]
+        name = name[m.end(1) :]
     # Ensure that the last character is alphanumeric, by deleting trailing
     # characters that are not alphanumeric.
-    m = re.match('.*?([^A-Za-z0-9]+)$', name)
+    m = re.match(".*?([^A-Za-z0-9]+)$", name)
     if m:
-        name = name[:m.start(1)]
+        name = name[: m.start(1)]
 
     return name
 
@@ -255,6 +298,8 @@ def _is_namespaced(resource_kind):
     if resource_kind == "WorkloadEndpoint":
         return True
     if resource_kind == "NetworkPolicy":
+        return True
+    if resource_kind == "LiveMigration":
         return True
     return False
 
@@ -274,23 +319,44 @@ def get_namespace(region_string):
         return NO_REGION_NAMESPACE
 
 
+def split_endpoint_name(name):
+    """Split a WorkloadEndpoint name into its parts, with their dashes unescaped.
+
+    A well-formed name gives four: host, orchestrator, workload and endpoint.
+    """
+
+    # "-" separates the parts, and "--" is a dash within one.  "#" can't appear in a
+    # host name or a UUID, so it can stand in for "--" while splitting.
+    parts = name.replace("--", "#").split("-")
+    return tuple(part.replace("#", "-") for part in parts)
+
+
 def _build_key(resource_kind, namespace, name):
     kind_plural = _plural(resource_kind).lower()
     if _is_namespaced(resource_kind):
         assert namespace is not None
         return "/calico/resources/v3/projectcalico.org/%s/%s/%s" % (
-            kind_plural, namespace, name
+            kind_plural,
+            namespace,
+            name,
         )
     else:
-        return "/calico/resources/v3/projectcalico.org/%s/%s" % (
-            kind_plural, name
-        )
+        return "/calico/resources/v3/projectcalico.org/%s/%s" % (kind_plural, name)
 
 
 def _get_with_metadata(resource_kind, namespace, name):
-    # Note: 'with_metadata' here means including the Calico data model
-    # metadata, as well as the etcdv3 mod_revision.
+    # Note: 'with_metadata' here means including the Calico data model metadata, as well
+    # as the etcdv3 mod_revision.
+    #
+    # On invalid JSON, returns (None, mod_revision) rather than raising ValueError, so
+    # resync (and other callers) can repair a corrupt etcd entry — using the
+    # mod_revision in a CAS write — instead of aborting.  Mirrors the spec=None
+    # behaviour of get_all().  Callers are responsible for handling a None value.
     key = _build_key(resource_kind, namespace, name)
     value_as_string, mod_revision = etcdv3.get(key)
-    value = json.loads(value_as_string)
+    try:
+        value = json.loads(value_as_string)
+    except ValueError:
+        LOG.warning("etcd value not valid JSON for %s", key)
+        value = None
     return value, mod_revision

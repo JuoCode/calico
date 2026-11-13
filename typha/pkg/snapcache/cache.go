@@ -26,13 +26,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/typha/pkg/promutils"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
-
 	"github.com/projectcalico/calico/typha/pkg/jitter"
+	"github.com/projectcalico/calico/typha/pkg/promutils"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 )
 
@@ -123,7 +121,7 @@ func init() {
 type Cache struct {
 	config Config
 
-	inputC chan interface{}
+	inputC chan any
 
 	pendingStatus  api.SyncStatus
 	pendingUpdates []api.Update
@@ -150,6 +148,9 @@ type Cache struct {
 	counterBreadcrumbBlock     prometheus.Counter
 	counterBreadcrumbNonBlock  prometheus.Counter
 	summaryUpdateSize          prometheus.Summary
+
+	// Done is created by Start() and closed when the main loop exits.
+	Done chan struct{}
 }
 
 const (
@@ -205,7 +206,7 @@ func New(config Config) *Cache {
 
 	c := &Cache{
 		config:         config,
-		inputC:         make(chan interface{}, config.MaxBatchSize*2),
+		inputC:         make(chan any, config.MaxBatchSize*2),
 		breadcrumbCond: cond,
 		kvs:            kvs,
 		wakeUpTicker:   jitter.NewTicker(config.WakeUpInterval, config.WakeUpInterval/10),
@@ -271,10 +272,12 @@ func (c *Cache) OnUpdates(updates []api.Update) {
 
 // Start starts the cache's main loop in a background goroutine.
 func (c *Cache) Start(ctx context.Context) {
-	go c.loop(ctx)
+	c.Done = make(chan struct{})
+	go c.loop(ctx, c.Done)
 }
 
-func (c *Cache) loop(ctx context.Context) {
+func (c *Cache) loop(ctx context.Context, done chan struct{}) {
+	defer close(done)
 	for {
 		// First, block, waiting for updates and batch them up in our pendingXXX fields.
 		// This will opportunistically slurp up a limited number of pending updates.
@@ -293,7 +296,7 @@ func (c *Cache) loop(ctx context.Context) {
 func (c *Cache) fillBatchFromInputQueue(ctx context.Context) error {
 	somethingToSend := false
 	batchSize := 0
-	storePendingUpdate := func(obj interface{}) {
+	storePendingUpdate := func(obj any) {
 		somethingToSend = true
 		switch obj := obj.(type) {
 		case api.SyncStatus:
@@ -339,7 +342,7 @@ func (c *Cache) fillBatchFromInputQueue(ctx context.Context) error {
 				// Already did a broadcast recently due to minting a real breadcrumb.
 				continue
 			}
-			log.Debug("Waking all clients.")
+			log.Trace("Waking all clients.")
 			c.breadcrumbCond.Broadcast()
 			c.lastBroadcast = time.Now()
 			// If there are no updates, we want the Prometheus stat to decay

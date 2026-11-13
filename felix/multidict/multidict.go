@@ -18,7 +18,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
-type Multidict[K comparable, V comparable] map[K]set.Set[V]
+type Multidict[K comparable, V comparable] map[K]set.Typed[V]
 
 func New[K comparable, V comparable]() Multidict[K, V] {
 	return make(Multidict[K, V])
@@ -69,10 +69,9 @@ func (md Multidict[K, V]) Iter(key K, f func(value V)) {
 	if s == nil {
 		return
 	}
-	s.Iter(func(v V) error {
+	for v := range s.All() {
 		f(v)
-		return nil
-	})
+	}
 }
 
 func (md Multidict[K, V]) DiscardKey(k K) {

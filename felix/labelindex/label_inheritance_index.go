@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The labelindex package provides the InheritIndex type, which emits events as the set of
+// Package labelindex provides the InheritIndex type, which emits events as the set of
 // items (currently WorkloadEndpoints/HostEndpoint) it has been told about start (or stop) matching
 // the label selectors (which are extracted from the active policy rules) it has been told about.
 //
@@ -46,10 +46,11 @@ package labelindex
 import (
 	"reflect"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
+	"github.com/projectcalico/calico/lib/std/uniquestr"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
@@ -63,18 +64,18 @@ import (
 // In particular, it holds it current explicitly-assigned labels and a pointer to the parent data
 // for each of its parents.
 type itemData struct {
-	labels  map[string]string
+	labels  uniquelabels.Map
 	parents []*parentData
 }
 
-// Get implements the Labels interface for itemData.  Combines the item's own labels with those
+// GetHandle implements the Labels interface for itemData.  Combines the item's own labels with those
 // of its parents on the fly.
-func (itemData *itemData) Get(labelName string) (value string, present bool) {
-	if value, present = itemData.labels[labelName]; present {
+func (itemData *itemData) GetHandle(labelName uniquestr.Handle) (handle uniquestr.Handle, present bool) {
+	if handle, present = itemData.labels.GetHandle(labelName); present {
 		return
 	}
 	for _, parent := range itemData.parents {
-		if value, present = parent.labels[labelName]; present {
+		if handle, present = parent.labels.GetHandle(labelName); present {
 			return
 		}
 	}
@@ -86,37 +87,37 @@ func (itemData *itemData) Get(labelName string) (value string, present bool) {
 // have partial information.
 type parentData struct {
 	id      string
-	labels  map[string]string
-	itemIDs set.Set[any]
+	labels  uniquelabels.Map
+	itemIDs set.Typed[any]
 }
 
-type MatchCallback func(selId, labelId interface{})
+type MatchCallback func(selId, labelId any)
 
 type InheritIndex struct {
-	itemDataByID         map[interface{}]*itemData
+	itemDataByID         map[any]*itemData
 	parentDataByParentID map[string]*parentData
-	selectorsById        map[interface{}]selector.Selector
+	selectorsById        map[any]*selector.Selector
 
 	// Current matches.
-	selIdsByLabelId map[interface{}]set.Set[any]
-	labelIdsBySelId map[interface{}]set.Set[any]
+	selIdsByLabelId map[any]set.Typed[any]
+	labelIdsBySelId map[any]set.Typed[any]
 
 	// Callback functions
 	OnMatchStarted MatchCallback
 	OnMatchStopped MatchCallback
 
-	dirtyItemIDs set.Set[any]
+	dirtyItemIDs set.Typed[any]
 }
 
 func NewInheritIndex(onMatchStarted, onMatchStopped MatchCallback) *InheritIndex {
-	itemData := map[interface{}]*itemData{}
+	itemData := map[any]*itemData{}
 	inheritIDx := InheritIndex{
 		itemDataByID:         itemData,
 		parentDataByParentID: map[string]*parentData{},
-		selectorsById:        map[interface{}]selector.Selector{},
+		selectorsById:        map[any]*selector.Selector{},
 
-		selIdsByLabelId: map[interface{}]set.Set[any]{},
-		labelIdsBySelId: map[interface{}]set.Set[any]{},
+		selIdsByLabelId: map[any]set.Typed[any]{},
+		labelIdsBySelId: map[any]set.Typed[any]{},
 
 		// Callback functions
 		OnMatchStarted: onMatchStarted,
@@ -168,36 +169,39 @@ func (l *InheritIndex) OnUpdate(update api.Update) (_ bool) {
 	return
 }
 
-func (idx *InheritIndex) UpdateSelector(id interface{}, sel selector.Selector) {
+func (idx *InheritIndex) UpdateSelector(id any, sel *selector.Selector) {
 	if sel == nil {
 		log.WithField("id", id).Panic("Selector should not be nil")
+		panic("Selector should not be nil")
 	}
 	oldSel := idx.selectorsById[id]
 	// Since the selectorRoot struct has cache fields, the easiest way to compare two
 	// selectors is to compare their IDs.
-	if oldSel != nil && oldSel.UniqueID() == sel.UniqueID() {
+	if oldSel.Equal(sel) {
 		log.WithField("selID", id).Debug("Skipping unchanged selector")
 		return
 	}
-	log.WithField("selID", id).Info("Updating selector")
+	log.WithFields(log.Fields{
+		"id":       id,
+		"selector": sel,
+	}).Info("Updating selector")
 	idx.scanAllLabels(id, sel)
 	idx.selectorsById[id] = sel
 }
 
-func (idx *InheritIndex) DeleteSelector(id interface{}) {
+func (idx *InheritIndex) DeleteSelector(id any) {
 	log.Infof("Deleting selector %v", id)
 	matchSet := idx.labelIdsBySelId[id]
 	if matchSet != nil {
-		matchSet.Iter(func(labelId interface{}) error {
+		for labelId := range matchSet.All() {
 			// This modifies the set we're iterating over, but that's safe in Go.
 			idx.deleteMatch(id, labelId)
-			return nil
-		})
+		}
 	}
 	delete(idx.selectorsById, id)
 }
 
-func (idx *InheritIndex) UpdateLabels(id interface{}, labels map[string]string, parentIDs []string) {
+func (idx *InheritIndex) UpdateLabels(id any, labels uniquelabels.Map, parentIDs []string) {
 	log.Debug("Inherit index updating labels for ", id)
 	log.Debug("Num dirty items ", idx.dirtyItemIDs.Len(), " items")
 
@@ -213,7 +217,7 @@ func (idx *InheritIndex) UpdateLabels(id interface{}, labels map[string]string, 
 		}
 	}
 	newItemData := &itemData{}
-	if len(labels) > 0 {
+	if labels.Len() > 0 {
 		newItemData.labels = labels
 	}
 	if len(parentIDs) > 0 {
@@ -232,7 +236,7 @@ func (idx *InheritIndex) UpdateLabels(id interface{}, labels map[string]string, 
 	log.Debug("Num ending dirty items ", idx.dirtyItemIDs.Len(), " items")
 }
 
-func (idx *InheritIndex) DeleteLabels(id interface{}) {
+func (idx *InheritIndex) DeleteLabels(id any) {
 	log.Debug("Inherit index deleting labels for ", id)
 	oldItemData := idx.itemDataByID[id]
 	var oldParents []*parentData
@@ -261,12 +265,12 @@ func (idx *InheritIndex) discardParentIfEmpty(id string) {
 	if parent == nil {
 		return
 	}
-	if parent.itemIDs == nil && parent.labels == nil {
+	if parent.itemIDs == nil && parent.labels.IsNil() {
 		delete(idx.parentDataByParentID, id)
 	}
 }
 
-func (idx *InheritIndex) onItemParentsUpdate(id interface{}, oldParents, newParents []*parentData) {
+func (idx *InheritIndex) onItemParentsUpdate(id any, oldParents, newParents []*parentData) {
 	log.WithFields(log.Fields{
 		"oldParents": oldParents,
 		"newParents": newParents,
@@ -302,7 +306,7 @@ func (idx *InheritIndex) onItemParentsUpdate(id interface{}, oldParents, newPare
 
 func (idx *InheritIndex) UpdateParentLabels(parentID string, labels map[string]string) {
 	parent := idx.getOrCreateParent(parentID)
-	parent.labels = labels
+	parent.labels = uniquelabels.Make(labels) // FIXME intern further upstream?
 	idx.flushChildren(parentID)
 }
 
@@ -311,7 +315,7 @@ func (idx *InheritIndex) DeleteParentLabels(parentID string) {
 	if parent == nil {
 		return
 	}
-	parent.labels = nil
+	parent.labels = uniquelabels.Map{}
 	idx.discardParentIfEmpty(parentID)
 	idx.flushChildren(parentID)
 }
@@ -319,17 +323,16 @@ func (idx *InheritIndex) DeleteParentLabels(parentID string) {
 func (idx *InheritIndex) flushChildren(parentID string) {
 	parentData := idx.parentDataByParentID[parentID]
 	if parentData != nil && parentData.itemIDs != nil {
-		parentData.itemIDs.Iter(func(itemID interface{}) error {
+		for itemID := range parentData.itemIDs.All() {
 			log.Debug("Marking child ", itemID, " dirty")
 			idx.dirtyItemIDs.Add(itemID)
-			return nil
-		})
+		}
 	}
 	idx.flushUpdates()
 }
 
 func (idx *InheritIndex) flushUpdates() {
-	idx.dirtyItemIDs.Iter(func(itemID interface{}) error {
+	for itemID := range idx.dirtyItemIDs.All() {
 		log.Debugf("Flushing %#v", itemID)
 		_, ok := idx.itemDataByID[itemID]
 		if !ok {
@@ -337,22 +340,21 @@ func (idx *InheritIndex) flushUpdates() {
 			log.Debugf("Flushing delete of item %v", itemID)
 			matchSet := idx.selIdsByLabelId[itemID]
 			if matchSet != nil {
-				matchSet.Iter(func(selId interface{}) error {
+				for selId := range matchSet.All() {
 					// This modifies the set we're iterating over, but that's safe in Go.
 					idx.deleteMatch(selId, itemID)
-					return nil
-				})
+				}
 			}
 		} else {
 			// Item updated/created, re-evaluate labels.
 			log.Debugf("Flushing update of item %v", itemID)
 			idx.scanAllSelectors(itemID)
 		}
-		return set.RemoveItem
-	})
+		idx.dirtyItemIDs.Discard(itemID)
+	}
 }
 
-func (idx *InheritIndex) scanAllLabels(selId interface{}, sel selector.Selector) {
+func (idx *InheritIndex) scanAllLabels(selId any, sel *selector.Selector) {
 	log.Debugf("Scanning all (%v) labels against selector %v",
 		len(idx.itemDataByID), selId)
 	for labelId, labels := range idx.itemDataByID {
@@ -360,7 +362,7 @@ func (idx *InheritIndex) scanAllLabels(selId interface{}, sel selector.Selector)
 	}
 }
 
-func (idx *InheritIndex) scanAllSelectors(labelId interface{}) {
+func (idx *InheritIndex) scanAllSelectors(labelId any) {
 	log.Debugf("Scanning all (%v) selectors against labels %v",
 		len(idx.selectorsById), labelId)
 	labels := idx.itemDataByID[labelId]
@@ -370,9 +372,9 @@ func (idx *InheritIndex) scanAllSelectors(labelId interface{}) {
 }
 
 func (idx *InheritIndex) updateMatches(
-	selId interface{},
-	sel selector.Selector,
-	labelId interface{},
+	selId any,
+	sel *selector.Selector,
+	labelId any,
 	labels parser.Labels,
 ) {
 	nowMatches := sel.EvaluateLabels(labels)
@@ -383,7 +385,7 @@ func (idx *InheritIndex) updateMatches(
 	}
 }
 
-func (idx *InheritIndex) storeMatch(selId, labelId interface{}) {
+func (idx *InheritIndex) storeMatch(selId, labelId any) {
 	labelIds := idx.labelIdsBySelId[selId]
 	if labelIds == nil {
 		labelIds = set.New[any]()
@@ -405,7 +407,7 @@ func (idx *InheritIndex) storeMatch(selId, labelId interface{}) {
 	}
 }
 
-func (idx *InheritIndex) deleteMatch(selId, labelId interface{}) {
+func (idx *InheritIndex) deleteMatch(selId, labelId any) {
 	labelIds := idx.labelIdsBySelId[selId]
 	if labelIds == nil {
 		return

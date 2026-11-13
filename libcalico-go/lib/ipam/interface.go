@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,11 +41,23 @@ type Interface interface {
 
 	// ReleaseIPs releases any of the given IP addresses that are currently assigned,
 	// so that they are available to be used in another assignment.
-	ReleaseIPs(ctx context.Context, ips ...ReleaseOptions) ([]cnet.IP, error)
+	ReleaseIPs(ctx context.Context, ips ...ReleaseOptions) ([]cnet.IP, []ReleaseOptions, error)
 
-	// GetAssignmentAttributes returns the attributes stored with the given IP address
-	// upon assignment, as well as the handle used for assignment (if any).
-	GetAssignmentAttributes(ctx context.Context, addr cnet.IP) (map[string]string, *string, error)
+	// MoveIPToHandle transfers an already-allocated address to the handle in opts, in a
+	// single block update so the address is never unowned in between. It only proceeds if
+	// the address is still owned by opts.ExpectedOwner.
+	//
+	// This hands an address between two sandboxes of one workload, where the handle
+	// changes with the container ID. To give an address to a different workload, release
+	// it and assign it.
+	MoveIPToHandle(ctx context.Context, ip cnet.IP, opts MoveOptions) error
+
+	// GetAssignmentAttributes returns the AllocationAttribute for the given IP address,
+	// which includes the handle ID, ActiveOwnerAttrs, and AlternateOwnerAttrs.
+	// This provides an atomic snapshot of all allocation attributes for the IP.
+	// If the IP is not assigned, it returns a nil *model.AllocationAttribute and an
+	// ErrorResourceDoesNotExist error.
+	GetAssignmentAttributes(ctx context.Context, addr cnet.IP) (*model.AllocationAttribute, error)
 
 	// IPsByHandle returns a list of all IP addresses that have been
 	// assigned using the provided handle.
@@ -59,7 +71,7 @@ type Interface interface {
 	// ClaimAffinity claims affinity to the given host for all blocks
 	// within the given CIDR.  The given CIDR must fall within a configured
 	// pool. If an empty string is passed as the host, then the value returned by os.Hostname is used.
-	ClaimAffinity(ctx context.Context, cidr cnet.IPNet, host string) ([]cnet.IPNet, []cnet.IPNet, error)
+	ClaimAffinity(ctx context.Context, cidr cnet.IPNet, affinityCfg AffinityConfig) ([]cnet.IPNet, []cnet.IPNet, error)
 
 	// ReleaseAffinity releases affinity for all blocks within the given CIDR
 	// on the given host.  If an empty string is passed as the host, then the
@@ -73,7 +85,7 @@ type Interface interface {
 	// os.Hostname will be used. If mustBeEmpty is true, then an error
 	// will be returned if any blocks within the CIDR are not empty - in this case, this
 	// function may release some but not all blocks attached to this host.
-	ReleaseHostAffinities(ctx context.Context, host string, mustBeEmpty bool) error
+	ReleaseHostAffinities(ctx context.Context, affinityCfg AffinityConfig, mustBeEmpty bool) error
 
 	// ReleasePoolAffinities releases affinity for all blocks within
 	// the specified pool across all hosts.
@@ -95,7 +107,7 @@ type Interface interface {
 	// and removes all host-specific IPAM data from the datastore.
 	// RemoveIPAMHost does not release any IP addresses claimed on the given host.
 	// If an empty string is passed as the host then the value returned by os.Hostname is used.
-	RemoveIPAMHost(ctx context.Context, host string) error
+	RemoveIPAMHost(ctx context.Context, affinityCfg AffinityConfig) error
 
 	// GetUtilization returns IP utilization info for the specified pools, or for all pools.
 	GetUtilization(ctx context.Context, args GetUtilizationArgs) ([]*PoolUtilization, error)
@@ -105,4 +117,30 @@ type Interface interface {
 	// Otherwise, return the CIDR of the IPAM block allocated for this host.
 	// It returns IPv4, IPv6 block CIDR and any error encountered.
 	EnsureBlock(ctx context.Context, args BlockArgs) (*cnet.IPNet, *cnet.IPNet, error)
+
+	// UpgradeHost checks the resources related to the given node and, if it
+	// finds any that are in older formats, upgrades them.  It is idempotent.
+	UpgradeHost(ctx context.Context, nodeName string) error
+
+	// GarbageCollectColdIPs runs garbage collection on the given pre-loaded
+	// block, deallocating any released IPs whose cooldown period has elapsed.
+	// It writes the block back to the datastore if it was modified.
+	// Garbage collection is run by the CNI plugin every time a block is
+	// loaded, so this acts as a failsafe to ensure any otherwise-untouched
+	// blocks get collected.
+	GarbageCollectColdIPs(ctx context.Context, config *IPAMConfig, kvp *model.KVPair) error
+
+	// SetOwnerAttributes sets ActiveOwnerAttrs and/or AlternateOwnerAttrs for an IP atomically.
+	//
+	// Parameters:
+	//   - updates: Specifies the attribute values to set. See OwnerAttributeUpdates for details.
+	//   - preconditions: Optional verification of expected owners before setting attributes.
+	//     If nil, no verification is performed.
+	//
+	// Use cases:
+	//   - Set AlternateOwnerAttrs only: updates.AlternateOwnerAttrs=<target pod attrs>
+	//   - Clear ActiveOwnerAttrs: updates.ClearActiveOwner=true
+	//   - Swap attributes: updates.ActiveOwnerAttrs=<current alternate>, updates.AlternateOwnerAttrs=<current active>
+	//   - Set both: updates.ActiveOwnerAttrs=<new active>, updates.AlternateOwnerAttrs=<new alternate>
+	SetOwnerAttributes(ctx context.Context, ip cnet.IP, handleID string, updates *OwnerAttributeUpdates, preconditions *OwnerAttributePreconditions) error
 }

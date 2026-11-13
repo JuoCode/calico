@@ -15,15 +15,17 @@
 package resources
 
 import (
+	"encoding/json"
 	"strings"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/json"
 )
 
 const (
@@ -128,20 +130,31 @@ func SetCalicoMetadataFromK8sAnnotations(calicoRes Resource, k8sRes Resource) {
 	}
 }
 
+// ConvertCalicoResourceToK8sResource converts the given Resource from its projectcalico.org/v3 representation
+// to its crd.projectcalico.org/v1 representation.
+//
 // Store Calico Metadata in the k8s resource annotations for CRD backed resources.
 // This should store all Metadata except for those stored in Annotations and Labels and
 // store them in annotations.
 func ConvertCalicoResourceToK8sResource(resIn Resource) (Resource, error) {
 	rom := resIn.GetObjectMeta()
 
+	resKind := resIn.GetObjectKind().GroupVersionKind().Kind
+
 	// Make sure to remove data that is passed to Kubernetes so it is not duplicated in
 	// the metadata annotation.
 	romCopy := &metav1.ObjectMeta{}
 	rom.(*metav1.ObjectMeta).DeepCopyInto(romCopy)
-	romCopy.Name = ""
 	romCopy.Namespace = ""
 	romCopy.ResourceVersion = ""
 	romCopy.UID = ""
+	if resKind != apiv3.KindGlobalNetworkPolicy &&
+		resKind != apiv3.KindNetworkPolicy &&
+		resKind != apiv3.KindStagedNetworkPolicy &&
+		resKind != apiv3.KindStagedGlobalNetworkPolicy {
+		// We only want to store the name for network policies, all other resources should not have the name stored in metadata annotations
+		romCopy.Name = ""
+	}
 
 	// Any projectcalico.org/v3 owners need to be translated to their equivalent crd.projectcalico.org/v1 representations.
 	// They will be converted back on read.
@@ -217,6 +230,9 @@ func isOurs(k string) bool {
 	return strings.Contains(k, "projectcalico.org/") || strings.Contains(k, "operator.tigera.io/")
 }
 
+// ConvertK8sResourceToCalicoResource converts the given Resource from its crd.projectcalico.org/v1 representation
+// to its projectcalico.org/v3 representation.
+//
 // Retrieve all of the Calico Metadata from the k8s resource annotations for CRD backed
 // resources. This should remove the relevant Calico Metadata annotation when it has finished.
 func ConvertK8sResourceToCalicoResource(res Resource) error {
@@ -293,7 +309,27 @@ func ConvertK8sResourceToCalicoResource(res Resource) error {
 
 	// Manually write in the data not stored in the annotations: Name, Namespace, ResourceVersion,
 	// so that they do not get overwritten.
-	meta.Name = rom.GetName()
+	if meta.Name == "" {
+		// We store the original v3 Name in our annotation when writing NetworkPolicy and GNP objects. If that's present, use it.
+		// If the kind is Policy and the annotation is not present, we remove the default. prefix to be compatible with previous Calico versions
+		// Otherwise, fill in the name from the underlying CRD.
+		switch res.GetObjectKind().GroupVersionKind().Kind {
+		case apiv3.KindGlobalNetworkPolicy:
+			policy := res.(*apiv3.GlobalNetworkPolicy)
+			meta.Name = determinePolicyName(rom.GetName(), policy.Spec.Tier)
+		case apiv3.KindNetworkPolicy:
+			policy := res.(*apiv3.NetworkPolicy)
+			meta.Name = determinePolicyName(rom.GetName(), policy.Spec.Tier)
+		case apiv3.KindStagedGlobalNetworkPolicy:
+			policy := res.(*apiv3.StagedGlobalNetworkPolicy)
+			meta.Name = determinePolicyName(rom.GetName(), policy.Spec.Tier)
+		case apiv3.KindStagedNetworkPolicy:
+			policy := res.(*apiv3.StagedNetworkPolicy)
+			meta.Name = determinePolicyName(rom.GetName(), policy.Spec.Tier)
+		default:
+			meta.Name = rom.GetName()
+		}
+	}
 	meta.Namespace = rom.GetNamespace()
 	meta.ResourceVersion = rom.GetResourceVersion()
 	meta.UID = rom.GetUID()
@@ -308,8 +344,33 @@ func ConvertK8sResourceToCalicoResource(res Resource) error {
 		meta.SetCreationTimestamp(rom.GetCreationTimestamp())
 	}
 
+	// If no creation timestamp was stored in the metadata annotation, use the one from the CR.
+	// The timestamp is normally set in the clientv3 code. However, for objects that bypass
+	// the v3 client (e.g., IPAM), we won't have generated a creation timestamp and the field
+	// is required on update calls.
+	if meta.GetCreationTimestamp().Time.IsZero() {
+		meta.SetCreationTimestamp(rom.GetCreationTimestamp())
+	}
+
 	// Overwrite the K8s metadata with the Calico metadata.
 	meta.DeepCopyInto(rom.(*metav1.ObjectMeta))
 
 	return nil
+}
+
+func watchOptionsToK8sListOptions(wo api.WatchOptions) metav1.ListOptions {
+	return metav1.ListOptions{
+		ResourceVersion:     wo.Revision,
+		Watch:               true,
+		AllowWatchBookmarks: wo.AllowWatchBookmarks,
+	}
+}
+
+func determinePolicyName(name, tier string) string {
+	if tier == "default" || tier == "" {
+		// It's possible the policy does not contain tier, that means it's in the default Tier it's added later by the API server
+		return strings.TrimPrefix(name, "default.")
+	}
+
+	return name
 }

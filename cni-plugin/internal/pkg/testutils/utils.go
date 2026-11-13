@@ -18,21 +18,19 @@ import (
 	"os"
 	"strings"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
-	log "github.com/sirupsen/logrus"
 )
 
 const K8S_TEST_NS = "test"
@@ -77,9 +75,9 @@ func MustCreateNewIPPool(c client.Interface, cidr string, ipip, natOutgoing, ipa
 
 // MustCreateNewIPPoolBlockSize creates a new Calico IPAM IP Pool with support for setting the block size.
 func MustCreateNewIPPoolBlockSize(c client.Interface, cidr string, ipip, natOutgoing, ipam bool, blockSize int) string {
-	name := strings.Replace(cidr, ".", "-", -1)
-	name = strings.Replace(name, ":", "-", -1)
-	name = strings.Replace(name, "/", "-", -1)
+	name := strings.ReplaceAll(cidr, ".", "-")
+	name = strings.ReplaceAll(name, ":", "-")
+	name = strings.ReplaceAll(name, "/", "-")
 	var mode api.IPIPMode
 	if ipip {
 		mode = api.IPIPModeAlways
@@ -102,10 +100,30 @@ func MustCreateNewIPPoolBlockSize(c client.Interface, cidr string, ipip, natOutg
 	return pool.Name
 }
 
+// MustCreateNewIPPoolAllowedUses creates an enabled Calico IP pool with the given
+// AllowedUses, so tests can exercise IPAM's use-based pool filtering.
+func MustCreateNewIPPoolAllowedUses(c client.Interface, cidr string, allowedUses []api.IPPoolAllowedUse) string {
+	name := strings.ReplaceAll(cidr, ".", "-")
+	name = strings.ReplaceAll(name, ":", "-")
+	name = strings.ReplaceAll(name, "/", "-")
+
+	pool := api.NewIPPool()
+	pool.Name = name
+	pool.Spec.CIDR = cidr
+	pool.Spec.IPIPMode = api.IPIPModeNever
+	pool.Spec.AllowedUses = allowedUses
+
+	_, err := c.IPPools().Create(context.Background(), pool, options.SetOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return pool.Name
+}
+
 func MustDeleteIPPool(c client.Interface, cidr string) {
-	name := strings.Replace(cidr, ".", "-", -1)
-	name = strings.Replace(name, ":", "-", -1)
-	name = strings.Replace(name, "/", "-", -1)
+	name := strings.ReplaceAll(cidr, ".", "-")
+	name = strings.ReplaceAll(name, ":", "-")
+	name = strings.ReplaceAll(name, "/", "-")
 
 	_, err := c.IPPools().Delete(context.Background(), name, options.DeleteOptions{})
 	if err != nil {
@@ -145,7 +163,7 @@ func AddNode(c client.Interface, kc *kubernetes.Clientset, host string) error {
 		log.WithField("node", host).WithError(err).Info("Node created")
 	} else {
 		// Otherwise, create it in Calico.
-		n := libapi.NewNode()
+		n := internalapi.NewNode()
 		n.Name = host
 		_, err = c.Nodes().Create(context.Background(), n, options.SetOptions{})
 		if err != nil {
@@ -163,7 +181,7 @@ func DeleteNode(c client.Interface, kc *kubernetes.Clientset, host string) error
 		log.WithError(err).WithField("node", host).Debug("Kubernetes node deleted")
 	} else {
 		// Otherwise, delete it in Calico.
-		n := libapi.NewNode()
+		n := internalapi.NewNode()
 		n.Name = host
 		_, err = c.Nodes().Delete(context.Background(), host, options.DeleteOptions{})
 		log.WithError(err).WithField("node", host).Debug("Calico node deleted")

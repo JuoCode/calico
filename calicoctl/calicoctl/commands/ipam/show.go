@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,26 +17,20 @@ package ipam
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 
-	"github.com/olekukonko/tablewriter"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
+	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/argutils"
+	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-
-	docopt "github.com/docopt/docopt-go"
-
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/argutils"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
-	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 )
 
 type borrowedIP struct {
@@ -57,7 +51,7 @@ func getBorrowedIPs(ctx context.Context, ippoolClient clientv3.IPPoolInterface, 
 		return nil, 0, err
 	}
 
-	// For really old IP allocations, AttrSecondary[model.IPAMBlockAttributeNode] used to be not set.
+	// For really old IP allocations, ActiveOwnerAttrs[model.IPAMBlockAttributeNode] used to be not set.
 	// Count such IP addresses, and, if any, warn customer as we are unable to classify those as
 	// borrowed or not.
 	unclassifiedIPs := 0
@@ -89,16 +83,21 @@ func getBorrowedIPs(ctx context.Context, ippoolClient clientv3.IPPoolInterface, 
 					}
 				}
 
-				if borrowingNode, ok := attributes.AttrSecondary[model.IPAMBlockAttributeNode]; ok {
+				if borrowingNode, ok := attributes.ActiveOwnerAttrs[model.IPAMBlockAttributeNode]; ok {
 					if blockOwner != borrowingNode {
 						bIP := borrowedIP{block: b.CIDR.IPNet.String(), blockOwner: blockOwner, borrowingNode: borrowingNode}
 						bIP.addr = b.OrdinalToIP(i).String()
-						if _, ok := attributes.AttrSecondary[model.IPAMBlockAttributePod]; ok {
-							bIP.allocatedTo = fmt.Sprintf("%s/%s", attributes.AttrSecondary[model.IPAMBlockAttributeNamespace],
-								attributes.AttrSecondary[model.IPAMBlockAttributePod])
+
+						// Determine allocation type and human-readable allocatedTo.
+						ns := attributes.ActiveOwnerAttrs[model.IPAMBlockAttributeNamespace]
+						if vmiName, ok := attributes.ActiveOwnerAttrs[model.IPAMBlockAttributeVMIName]; ok {
+							bIP.allocationType = "vmi"
+							bIP.allocatedTo = fmt.Sprintf("%s/%s", ns, vmiName)
+						} else if podName, ok := attributes.ActiveOwnerAttrs[model.IPAMBlockAttributePod]; ok {
 							bIP.allocationType = model.IPAMBlockAttributePod
-						} else if _, ok := attributes.AttrSecondary[model.IPAMBlockAttributeType]; ok {
-							bIP.allocationType = attributes.AttrSecondary[model.IPAMBlockAttributeType]
+							bIP.allocatedTo = fmt.Sprintf("%s/%s", ns, podName)
+						} else if t, ok := attributes.ActiveOwnerAttrs[model.IPAMBlockAttributeType]; ok {
+							bIP.allocationType = t
 						}
 						details = append(details, &bIP)
 					}
@@ -111,31 +110,25 @@ func getBorrowedIPs(ctx context.Context, ippoolClient clientv3.IPPoolInterface, 
 	return details, unclassifiedIPs, nil
 }
 
-func showBorrowedDetails(ctx context.Context, ippoolClient clientv3.IPPoolInterface, bc bapi.Client) error {
+func ShowBorrowedDetails(ctx context.Context, ippoolClient clientv3.IPPoolInterface, bc bapi.Client) error {
 	details, unclassifiedIPs, err := getBorrowedIPs(ctx, ippoolClient, bc)
 	if err != nil {
 		return err
 	}
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"IP", "BORROWING-NODE", "BLOCK", "BLOCK OWNER", "TYPE", "ALLOCATED-TO"})
-	genRow := func(address, borrowingNode, block, blockOwner, t, allocatedTo string) []string {
-		return []string{
-			address,
-			borrowingNode,
-			block,
-			blockOwner,
-			t,
-			allocatedTo,
-		}
-	}
-
-	var rows [][]string
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.AppendHeader(table.Row{"IP", "BORROWING-NODE", "BLOCK", "BLOCK OWNER", "TYPE", "ALLOCATED-TO"})
 	for _, detail := range details {
-		rows = append(rows, genRow(detail.addr, detail.borrowingNode, detail.block, detail.blockOwner,
-			detail.allocationType, detail.allocatedTo))
+		t.AppendRow(table.Row{
+			detail.addr,
+			detail.borrowingNode,
+			detail.block,
+			detail.blockOwner,
+			detail.allocationType,
+			detail.allocatedTo,
+		})
 	}
-	table.AppendBulk(rows)
-	table.Render()
+	t.Render()
 
 	if unclassifiedIPs != 0 {
 		fmt.Printf("\nNote: found %d IP allocations without an explicit node association. Unable to determine if they are borrowed.\n",
@@ -145,9 +138,9 @@ func showBorrowedDetails(ctx context.Context, ippoolClient clientv3.IPPoolInterf
 	return nil
 }
 
-func showIP(ctx context.Context, ipamClient ipam.Interface, passedIP interface{}) error {
-	ip := argutils.ValidateIP(passedIP.(string))
-	attr, _, err := ipamClient.GetAssignmentAttributes(ctx, ip)
+func ShowIP(ctx context.Context, ipamClient ipam.Interface, passedIP string) error {
+	ip := argutils.ValidateIP(passedIP)
+	allocAttr, err := ipamClient.GetAssignmentAttributes(ctx, ip)
 	if err != nil {
 		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
 			// IP address is not assigned.  The detailed error message here is either
@@ -162,156 +155,119 @@ func showIP(ctx context.Context, ipamClient ipam.Interface, passedIP interface{}
 
 	// IP address is assigned.
 	fmt.Printf("IP %s is in use\n", ip)
-	if len(attr) != 0 {
-		fmt.Println("Attributes:")
-		for k, v := range attr {
-			fmt.Printf("  %v: %v\n", k, v)
-		}
+
+	// Print HandleID
+	if allocAttr.HandleID != nil {
+		fmt.Printf("Handle ID: %s\n", *allocAttr.HandleID)
 	} else {
-		fmt.Println("No attributes defined")
+		fmt.Println("Handle ID: <none>")
 	}
+
+	// Active Owner Attributes
+	active := formatOwnerAttrs("Active Owner Attributes", allocAttr.ActiveOwnerAttrs)
+	if active != "" {
+		fmt.Print(active)
+	} else {
+		fmt.Println("No Active Owner attributes defined")
+	}
+
+	// Alternate Owner Attributes
+	alternate := formatOwnerAttrs("Alternate Owner Attributes", allocAttr.AlternateOwnerAttrs)
+	if alternate != "" {
+		fmt.Print(alternate)
+	}
+
 	return nil
 }
 
-func showBlockUtilization(ctx context.Context, ipamClient ipam.Interface, showBlocks bool) error {
+// formatOwnerAttrs formats owner attributes into a printable string.
+// If attrs is empty, it returns an empty string.
+func formatOwnerAttrs(title string, attrs map[string]string) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(attrs))
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s:\n", title)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "  %v: %v\n", k, attrs[k])
+	}
+	return b.String()
+}
+
+func ShowBlockUtilization(ctx context.Context, ipamClient ipam.Interface, showBlocks bool) error {
 	usage, err := ipamClient.GetUtilization(ctx, ipam.GetUtilizationArgs{})
 	if err != nil {
 		return err
 	}
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"GROUPING", "CIDR", "IPS TOTAL", "IPS IN USE", "IPS FREE"})
-	genRow := func(kind, cidr string, inUse, capacity float64) []string {
-		return []string{
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.AppendHeader(table.Row{"GROUPING", "CIDR", "IPS TOTAL", "IPS IN USE", "IPS RESERVED", "IPS FREE", "IPS COOLING"})
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Name: "IPS TOTAL", Align: text.AlignRight},
+		{Name: "IPS IN USE", Align: text.AlignRight},
+		{Name: "IPS RESERVED", Align: text.AlignRight},
+		{Name: "IPS FREE", Align: text.AlignRight},
+		{Name: "IPS COOLING", Align: text.AlignRight},
+	})
+
+	// An IP allocated before it was reserved counts in both IN USE and RESERVED, so the percentages need not sum to 100.
+	// COOLING is the part of IN USE released and not yet reusable.
+	genRow := func(kind, cidr string, capacity, inUse, reserved, free, cooling int) table.Row {
+		withPercentage := func(n int) string {
+			return fmt.Sprintf("%.5g (%.f%%)", float64(n), 100*float64(n)/float64(capacity))
+		}
+		return table.Row{
 			kind,
 			cidr,
-			fmt.Sprintf("%.5g", capacity),
-			// Note: the '+capacity/2' bits here give us rounding to the nearest
-			// integer, instead of rounding down, and so ensure that the two percentages
-			// add up to 100.
-			fmt.Sprintf("%.5g (%.f%%)", inUse, 100*inUse/capacity),
-			fmt.Sprintf("%.5g (%.f%%)", capacity-inUse, 100*(capacity-inUse)/capacity),
+			fmt.Sprintf("%.5g", float64(capacity)),
+			withPercentage(inUse),
+			withPercentage(reserved),
+			withPercentage(free),
+			withPercentage(cooling),
 		}
 	}
 	for _, poolUse := range usage {
-		var blockRows [][]string
-		var poolInUse float64
+		var blockRows []table.Row
 		for _, blockUse := range poolUse.Blocks {
-			blockRows = append(blockRows, genRow("Block", blockUse.CIDR.String(), float64(blockUse.Capacity-blockUse.Available), float64(blockUse.Capacity)))
-			poolInUse += float64(blockUse.Capacity - blockUse.Available)
+			blockRows = append(blockRows, genRow("Block", blockUse.CIDR.String(), blockUse.Capacity, blockUse.InUse, blockUse.Reserved, blockUse.Free, blockUse.Cooling))
 		}
-		ones, bits := poolUse.CIDR.Mask.Size()
-		poolCapacity := math.Pow(2, float64(bits-ones))
-		if ones > 0 {
+		if ones, _ := poolUse.CIDR.Mask.Size(); ones > 0 {
 			// Only show the IP Pool row for a real IP Pool and not for the orphaned
 			// block case.
-			table.Append(genRow("IP Pool", poolUse.CIDR.String(), poolInUse, poolCapacity))
+			t.AppendRow(genRow("IP Pool", poolUse.CIDR.String(), poolUse.Capacity, poolUse.InUse, poolUse.Reserved, poolUse.Free, poolUse.Cooling))
 		}
 		if showBlocks {
-			table.AppendBulk(blockRows)
+			t.AppendRows(blockRows)
 		}
 	}
-	table.Render()
+	t.Render()
 
 	return nil
 }
 
-func showConfiguration(ctx context.Context, ipamClient ipam.Interface) error {
+func ShowConfiguration(ctx context.Context, ipamClient ipam.Interface) error {
 	ipamConfig, err := ipamClient.GetIPAMConfig(ctx)
 	if err != nil {
-		return fmt.Errorf("Error: %v", err)
+		return fmt.Errorf("error: %v", err)
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"PROPERTY", "VALUE"})
-	genRow := func(name string, value interface{}) []string {
-		return []string{
-			name,
-			fmt.Sprintf("%#v", value),
-		}
-	}
-
-	var rows [][]string
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.AppendHeader(table.Row{"PROPERTY", "VALUE"})
 	e := reflect.ValueOf(ipamConfig).Elem()
 	for i := 0; i < e.NumField(); i++ {
-		varName := e.Type().Field(i).Name
-		varValue := e.Field(i).Interface()
-
-		rows = append(rows, genRow(varName, varValue))
+		t.AppendRow(table.Row{
+			e.Type().Field(i).Name,
+			fmt.Sprintf("%#v", e.Field(i).Interface()),
+		})
 	}
-	table.AppendBulk(rows)
-	table.Render()
+	t.Render()
 	return nil
-}
-
-// IPAM takes keyword with an IP address then calls the subcommands.
-func Show(args []string) error {
-	doc := constants.DatastoreIntro + `Usage:
-  <BINARY_NAME> ipam show [--ip=<IP> | --show-blocks | --show-borrowed | --show-configuration] [--config=<CONFIG>] [--allow-version-mismatch]
-
-Options:
-  -h --help                    Show this screen.
-     --ip=<IP>                 Report whether this specific IP address is in use.
-     --show-blocks             Show detailed information for IP blocks as well as pools.
-     --show-borrowed           Show detailed information for "borrowed" IP addresses.
-     --show-configuration      Show current Calico IPAM configuration.
-  -c --config=<CONFIG>         Path to the file containing connection configuration in
-                               YAML or JSON format.
-                               [default: ` + constants.DefaultConfigPath + `]
-     --allow-version-mismatch  Allow client and cluster versions mismatch.
-
-Description:
-  The ipam show command prints information about a given IP address, or about
-  overall IP usage.
-`
-	// Replace all instances of BINARY_NAME with the name of the binary.
-	name, _ := util.NameAndDescription()
-	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", name)
-
-	parsedArgs, err := docopt.ParseArgs(doc, args, "")
-	if err != nil {
-		return fmt.Errorf("Invalid option: 'calicoctl %s'. Use flag '--help' to read about a specific subcommand.", strings.Join(args, " "))
-	}
-	if len(parsedArgs) == 0 {
-		return nil
-	}
-
-	err = common.CheckVersionMismatch(parsedArgs["--config"], parsedArgs["--allow-version-mismatch"])
-	if err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-
-	// Create a new backend client from env vars.
-	cf := parsedArgs["--config"].(string)
-	client, err := clientmgr.NewClient(cf)
-	if err != nil {
-		return err
-	}
-
-	ipamClient := client.IPAM()
-	ippoolClient := client.IPPools()
-
-	// Get the backend client.
-	type accessor interface {
-		Backend() bapi.Client
-	}
-	bc := client.(accessor).Backend()
-
-	passedIP := parsedArgs["--ip"]
-	showBlocks := parsedArgs["--show-blocks"].(bool)
-	showBorrowed := parsedArgs["--show-borrowed"].(bool)
-	configuration := parsedArgs["--show-configuration"].(bool)
-
-	if passedIP != nil {
-		return showIP(ctx, ipamClient, passedIP)
-	} else if showBlocks {
-		return showBlockUtilization(ctx, ipamClient, true)
-	} else if showBorrowed {
-		return showBorrowedDetails(ctx, ippoolClient, bc)
-	} else if configuration {
-		return showConfiguration(ctx, ipamClient)
-	}
-
-	return showBlockUtilization(ctx, ipamClient, false)
 }

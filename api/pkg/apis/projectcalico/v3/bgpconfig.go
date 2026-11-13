@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,8 @@
 package v3
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -25,6 +24,7 @@ const (
 	KindBGPConfigurationList = "BGPConfigurationList"
 )
 
+// +kubebuilder:validation:Enum=None;NodeIP
 type BindMode string
 
 const (
@@ -46,41 +46,73 @@ type BGPConfigurationList struct {
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
+// +kubebuilder:resource:scope=Cluster,shortName={bgpconfig,bgpconfigs}
 type BGPConfiguration struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+	metav1.ObjectMeta `json:"metadata" protobuf:"bytes,1,opt,name=metadata"`
 
-	Spec BGPConfigurationSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+	Spec BGPConfigurationSpec `json:"spec" protobuf:"bytes,2,opt,name=spec"`
 }
 
+// ServiceLoadBalancerAggregation defines how LoadBalancer service IPs should be aggregated for BGP advertisement.
+// +kubebuilder:validation:Enum=Enabled;Disabled
+type ServiceLoadBalancerAggregation string
+
+const (
+	// ServiceLoadBalancerAggregationEnabled means the full CIDR range will be advertised (default behavior)
+	ServiceLoadBalancerAggregationEnabled ServiceLoadBalancerAggregation = "Enabled"
+	// ServiceLoadBalancerAggregationDisabled means individual /32 routes will be advertised for each LoadBalancer service
+	ServiceLoadBalancerAggregationDisabled ServiceLoadBalancerAggregation = "Disabled"
+)
+
 // BGPConfigurationSpec contains the values of the BGP configuration.
+// +kubebuilder:validation:XValidation:rule="!has(self.nodeMeshPassword) || !has(self.nodeToNodeMeshEnabled) || self.nodeToNodeMeshEnabled == true",message="nodeMeshPassword cannot be set when nodeToNodeMeshEnabled is false",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="!has(self.nodeMeshMaxRestartTime) || !has(self.nodeToNodeMeshEnabled) || self.nodeToNodeMeshEnabled == true",message="nodeMeshMaxRestartTime cannot be set when nodeToNodeMeshEnabled is false",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="!has(self.communities) || size(self.communities) == 0 || (has(self.prefixAdvertisements) && size(self.prefixAdvertisements) > 0)",message="communities are defined but not used in prefixAdvertisements",reason=FieldValueInvalid
 type BGPConfigurationSpec struct {
-	// LogSeverityScreen is the log severity above which logs are sent to the stdout. [Default: INFO]
-	LogSeverityScreen string `json:"logSeverityScreen,omitempty" validate:"omitempty,logLevel" confignamev1:"loglevel"`
+	// LogSeverityScreen is the log severity above which logs are sent to the stdout. [Default: Info]
+	// +kubebuilder:default=Info
+	// +kubebuilder:validation:Pattern=`^(?i)(Trace|Debug|Info|Warning|Error|Fatal)?$`
+	LogSeverityScreen string `json:"logSeverityScreen,omitempty" confignamev1:"loglevel"`
 
 	// NodeToNodeMeshEnabled sets whether full node to node BGP mesh is enabled. [Default: true]
+	// +optional
 	NodeToNodeMeshEnabled *bool `json:"nodeToNodeMeshEnabled,omitempty" validate:"omitempty" confignamev1:"node_mesh"`
 
 	// ASNumber is the default AS number used by a node. [Default: 64512]
+	// +optional
 	ASNumber *numorstring.ASNumber `json:"asNumber,omitempty" validate:"omitempty" confignamev1:"as_num"`
 
 	// ServiceLoadBalancerIPs are the CIDR blocks for Kubernetes Service LoadBalancer IPs.
 	// Kubernetes Service status.LoadBalancer.Ingress IPs will only be advertised if they are within one of these blocks.
+	// +listType=atomic
 	ServiceLoadBalancerIPs []ServiceLoadBalancerIPBlock `json:"serviceLoadBalancerIPs,omitempty" validate:"omitempty,dive" confignamev1:"svc_loadbalancer_ips"`
 
 	// ServiceExternalIPs are the CIDR blocks for Kubernetes Service External IPs.
 	// Kubernetes Service ExternalIPs will only be advertised if they are within one of these blocks.
+	// +listType=atomic
 	ServiceExternalIPs []ServiceExternalIPBlock `json:"serviceExternalIPs,omitempty" validate:"omitempty,dive" confignamev1:"svc_external_ips"`
 
 	// ServiceClusterIPs are the CIDR blocks from which service cluster IPs are allocated.
 	// If specified, Calico will advertise these blocks, as well as any cluster IPs within them.
+	// +listType=atomic
 	ServiceClusterIPs []ServiceClusterIPBlock `json:"serviceClusterIPs,omitempty" validate:"omitempty,dive" confignamev1:"svc_cluster_ips"`
 
+	// ServiceLoadBalancerAggregation controls how LoadBalancer service IPs are advertised.
+	// When set to "Disabled", individual /32 routes are advertised for each service instead of
+	// the full CIDR range. This is useful for anycast failover mechanisms where failed service
+	// routes need to be withdrawn. [Default: Enabled]
+	// +kubebuilder:default=Enabled
+	ServiceLoadBalancerAggregation *ServiceLoadBalancerAggregation `json:"serviceLoadBalancerAggregation,omitempty" validate:"omitempty" confignamev1:"svc_loadbalancer_aggregation"`
+
 	// Communities is a list of BGP community values and their arbitrary names for tagging routes.
+	// +kubebuilder:validation:MaxItems=500
+	// +listType=atomic
 	Communities []Community `json:"communities,omitempty" validate:"omitempty,dive" confignamev1:"communities"`
 
 	// PrefixAdvertisements contains per-prefix advertisement configuration.
+	// +kubebuilder:validation:MaxItems=500
+	// +listType=atomic
 	PrefixAdvertisements []PrefixAdvertisement `json:"prefixAdvertisements,omitempty" validate:"omitempty,dive" confignamev1:"prefix_advertisements"`
 
 	// ListenPort is the port where BGP protocol should listen. Defaults to 179
@@ -107,44 +139,114 @@ type BGPConfigurationSpec struct {
 
 	// IgnoredInterfaces indicates the network interfaces that needs to be excluded when reading device routes.
 	// +optional
+	// +listType=set
 	IgnoredInterfaces []string `json:"ignoredInterfaces,omitempty" validate:"omitempty,dive,ignoredInterface"`
+
+	// The virtual IPv4 address of the node with which its local workload is expected to peer.
+	// It is recommended to use a link-local address.
+	// +optional
+	LocalWorkloadPeeringIPV4 string `json:"localWorkloadPeeringIPV4,omitempty" validate:"omitempty,ipv4"`
+
+	// The virtual IPv6 address of the node with which its local workload is expected to peer.
+	// It is recommended to use a link-local address.
+	// +optional
+	LocalWorkloadPeeringIPV6 string `json:"localWorkloadPeeringIPV6,omitempty" validate:"omitempty,ipv6"`
+
+	// ProgramClusterRoutes controls which "cluster routes" are programmed by Calico's BGP
+	// stack, i.e. the routes that a node needs in order to reach workloads on other nodes.  It
+	// only applies to IP Pools with vxlanMode: Never; the cluster routes for IP Pools with
+	// vxlanMode: Always or vxlanMode: CrossSubnet are always programmed by Felix.  The routes
+	// that BIRD does not program here are expected to be programmed by Felix instead.  Below,
+	// an IPIP IP Pool is one with ipipMode: Always or CrossSubnet, and an unencapsulated one
+	// has ipipMode and vxlanMode both Never.
+	//
+	// - Disabled: BIRD programs no cluster routes.
+	// - EnabledNoEncapOnly: BIRD programs them for unencapsulated IP Pools.
+	// - EnabledIPIPOnly: BIRD programs them for IPIP IP Pools.
+	// - Enabled: BIRD programs them for both.
+	//
+	// This field must be kept consistent with FelixConfiguration.ProgramClusterRoutes, which
+	// makes the same choice from Felix's side.  If both Felix and BIRD are enabled for the same
+	// kind of IP Pool they will fight over the routes; if neither is, there will be no cluster
+	// routes at all.
+	//
+	// Note: asking BIRD to program IPIP cluster routes, which the Enabled and EnabledIPIPOnly
+	// values do, is deprecated as of v3.33 and will be removed in v3.35.
+	//
+	// [Default: EnabledNoEncapOnly]
+	// +kubebuilder:validation:Enum=Enabled;Disabled;EnabledIPIPOnly;EnabledNoEncapOnly
+	// +kubebuilder:default=EnabledNoEncapOnly
+	// +optional
+	ProgramClusterRoutes *string `json:"programClusterRoutes,omitempty"`
+
+	// IPv4NormalRoutePriority is the normal route priority (metric) that Felix uses for IPv4
+	// workload routes. This must match the value configured in FelixConfiguration. BIRD uses
+	// this to identify elevated-priority routes during live migration and to override local
+	// workload routes with higher-priority BGP-learned routes. [Default: 1024]
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483646
+	// +optional
+	IPv4NormalRoutePriority *int `json:"ipv4NormalRoutePriority,omitempty" validate:"omitempty,gte=1,lte=2147483646"`
+
+	// IPv6NormalRoutePriority is the normal route priority (metric) that Felix uses for IPv6
+	// workload routes. This must match the value configured in FelixConfiguration. BIRD uses
+	// this to identify elevated-priority routes during live migration and to override local
+	// workload routes with higher-priority BGP-learned routes. [Default: 1024]
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483646
+	// +optional
+	IPv6NormalRoutePriority *int `json:"ipv6NormalRoutePriority,omitempty" validate:"omitempty,gte=1,lte=2147483646"`
 }
 
 // ServiceLoadBalancerIPBlock represents a single allowed LoadBalancer IP CIDR block.
+// +mapType=atomic
 type ServiceLoadBalancerIPBlock struct {
+	// +kubebuilder:validation:Format=cidr
 	CIDR string `json:"cidr,omitempty" validate:"omitempty,net"`
 }
 
 // ServiceExternalIPBlock represents a single allowed External IP CIDR block.
+// +mapType=atomic
 type ServiceExternalIPBlock struct {
+	// +kubebuilder:validation:Format=cidr
 	CIDR string `json:"cidr,omitempty" validate:"omitempty,net"`
 }
 
 // ServiceClusterIPBlock represents a single allowed ClusterIP CIDR block.
+// +mapType=atomic
 type ServiceClusterIPBlock struct {
+	// +kubebuilder:validation:Format=cidr
 	CIDR string `json:"cidr,omitempty" validate:"omitempty,net"`
 }
 
 // Community contains standard or large community value and its name.
+// +mapType=atomic
 type Community struct {
 	// Name given to community value.
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name,omitempty" validate:"required,name"`
 	// Value must be of format `aa:nn` or `aa:nn:mm`.
 	// For standard community use `aa:nn` format, where `aa` and `nn` are 16 bit number.
 	// For large community use `aa:nn:mm` format, where `aa`, `nn` and `mm` are 32 bit number.
 	// Where, `aa` is an AS Number, `nn` and `mm` are per-AS identifier.
+	// +kubebuilder:validation:MaxLength=40
 	// +kubebuilder:validation:Pattern=`^(\d+):(\d+)$|^(\d+):(\d+):(\d+)$`
+	// +kubebuilder:validation:XValidation:rule="self.split(':').all(p, p.matches('^[0-9]{1,10}$') && int(p) <= (size(self.split(':')) == 2 ? 65535 : 4294967295))",message="standard community values must be 16-bit numbers and large community values 32-bit numbers",reason=FieldValueInvalid
 	Value string `json:"value,omitempty" validate:"required"`
 }
 
 // PrefixAdvertisement configures advertisement properties for the specified CIDR.
+// +mapType=atomic
 type PrefixAdvertisement struct {
 	// CIDR for which properties should be advertised.
+	// +kubebuilder:validation:Format=cidr
 	CIDR string `json:"cidr,omitempty" validate:"required,net"`
 	// Communities can be list of either community names already defined in `Specs.Communities` or community value of format `aa:nn` or `aa:nn:mm`.
 	// For standard community use `aa:nn` format, where `aa` and `nn` are 16 bit number.
 	// For large community use `aa:nn:mm` format, where `aa`, `nn` and `mm` are 32 bit number.
 	// Where,`aa` is an AS Number, `nn` and `mm` are per-AS identifier.
+	// +kubebuilder:validation:MaxItems=50
+	// +listType=atomic
 	Communities []string `json:"communities,omitempty" validate:"required"`
 }
 

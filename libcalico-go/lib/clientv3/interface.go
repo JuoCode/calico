@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,8 +39,17 @@ type Interface interface {
 	ClusterInformationClient
 	KubeControllersConfigurationClient
 	CalicoNodeStatusClient
-	IPAMConfigClient
+	IPAMConfigurationClient
 	BlockAffinitiesClient
+	LiveMigrationsClient
+	// Tiers returns an interface for managing tier resources.
+	Tiers() TierInterface
+	// StagedGlobalNetworkPolicies returns an interface for managing staged global network policy resources.
+	StagedGlobalNetworkPolicies() StagedGlobalNetworkPolicyInterface
+	// StagedNetworkPolicies returns an interface for managing staged namespaced network policy resources.
+	StagedNetworkPolicies() StagedNetworkPolicyInterface
+	// StagedKubernetesNetworkPolicies returns an interface for managing staged kubernetes network policy resources.
+	StagedKubernetesNetworkPolicies() StagedKubernetesNetworkPolicyInterface
 
 	// EnsureInitialized is used to ensure the backend datastore is correctly
 	// initialized for use by Calico.  This method may be called multiple times, and
@@ -49,6 +58,10 @@ type Interface interface {
 	// method and so a general consumer of this API can assume that the datastore
 	// is already initialized.
 	EnsureInitialized(ctx context.Context, calicoVersion, clusterType string) error
+
+	// Close attempts to close any connections to the datastore.  Using the
+	// client after calling this method may result in undefined behavior.
+	Close() error
 }
 
 type NodesClient interface {
@@ -136,14 +149,19 @@ type CalicoNodeStatusClient interface {
 	CalicoNodeStatus() CalicoNodeStatusInterface
 }
 
-type IPAMConfigClient interface {
+type IPAMConfigurationClient interface {
 	// IPAMConfig returns an interface for managing IPAMConfig resources.
-	IPAMConfig() IPAMConfigInterface
+	IPAMConfiguration() IPAMConfigurationInterface
 }
 
 type BlockAffinitiesClient interface {
 	// BlockAffinities returns an interface for viewing IPAM block affinity resources.
 	BlockAffinities() BlockAffinityInterface
+}
+
+type LiveMigrationsClient interface {
+	// LiveMigrations returns an interface for managing LiveMigration resources.
+	LiveMigrations() LiveMigrationInterface
 }
 
 type BGPFilterClient interface {

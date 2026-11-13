@@ -15,13 +15,14 @@
 package syncserver_test
 
 import (
-	. "github.com/projectcalico/calico/typha/pkg/syncserver"
-
 	"math"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/typha/pkg/syncproto"
+	. "github.com/projectcalico/calico/typha/pkg/syncserver"
 )
 
 // These low-level tests complement the FV tests (in typha/fv-tests), which spin up the server on a real port.
@@ -47,6 +48,23 @@ var _ = Describe("With zero config", func() {
 			ShutdownMaxDropInterval:        time.Second,
 			MaxConns:                       math.MaxInt32,
 			Port:                           5473,
+			PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+				syncproto.CompressionZstd,
+				syncproto.CompressionSnappy,
+			},
+		}))
+	})
+	It("should drop unknown and duplicate compression algorithms", func() {
+		config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+			syncproto.CompressionZstd,
+			"bogus",
+			syncproto.CompressionZstd,
+			syncproto.CompressionSnappy,
+		}
+		config.ApplyDefaults()
+		Expect(config.PreferredCompressionAlgorithmOrder).To(Equal([]syncproto.CompressionAlgorithm{
+			syncproto.CompressionZstd,
+			syncproto.CompressionSnappy,
 		}))
 	})
 	It("should convert random port to 0", func() {

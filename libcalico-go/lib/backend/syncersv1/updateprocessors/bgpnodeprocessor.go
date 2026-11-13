@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -51,11 +51,11 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 
 	// Extract the separate bits of BGP config - these are stored as separate keys in the
 	// v1 model.  For a delete these will all be nil.
-	var asNum, ipv4, netv4, ipv6, netv6, rrClusterID interface{}
-	var node *libapiv3.Node
+	var asNum, ipv4, netv4, ipv6, netv6, rrClusterID, wgAddrV4, wgAddrV6 any
+	var node *internalapi.Node
 	var ok bool
 	if kvp.Value != nil {
-		node, ok = kvp.Value.(*libapiv3.Node)
+		node, ok = kvp.Value.(*internalapi.Node)
 		if !ok {
 			return nil, errors.New("Incorrect value type - expecting resource of kind Node")
 		}
@@ -68,6 +68,13 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 		ipv4 = ""
 		ipv6 = ""
 		rrClusterID = ""
+
+		// Emit the WireGuard keys as blank strings rather than leaving them nil when
+		// unset. confd treats a nil-valued node key as a signal that the node's config
+		// is being removed and drops the node from its BGP IP cache, which breaks
+		// unrelated per-peer logic (e.g. passive mode). Blank keeps the node present.
+		wgAddrV4 = ""
+		wgAddrV6 = ""
 		if bgp := node.Spec.BGP; bgp != nil {
 			if len(bgp.IPv4Address) != 0 {
 				ip, cidr, perr := net.ParseCIDROrIP(bgp.IPv4Address)
@@ -91,6 +98,15 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 				asNum = bgp.ASNumber.String()
 			}
 			rrClusterID = bgp.RouteReflectorClusterID
+		}
+
+		if wg := node.Spec.Wireguard; wg != nil {
+			if wg.InterfaceIPv4Address != "" {
+				wgAddrV4 = wg.InterfaceIPv4Address
+			}
+			if wg.InterfaceIPv6Address != "" {
+				wgAddrV6 = wg.InterfaceIPv6Address
+			}
 		}
 	}
 
@@ -143,6 +159,22 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 			Value:    rrClusterID,
 			Revision: kvp.Revision,
 		},
+		{
+			Key: model.NodeBGPConfigKey{
+				Nodename: name,
+				Name:     "wireguard_addr_v4",
+			},
+			Value:    wgAddrV4,
+			Revision: kvp.Revision,
+		},
+		{
+			Key: model.NodeBGPConfigKey{
+				Nodename: name,
+				Name:     "wireguard_addr_v6",
+			},
+			Value:    wgAddrV6,
+			Revision: kvp.Revision,
+		},
 	}
 
 	if c.usePodCIDR {
@@ -162,7 +194,7 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 				continue
 			}
 			kvps = append(kvps, &model.KVPair{
-				Key:      model.BlockAffinityKey{Host: name, CIDR: *cidr},
+				Key:      model.BlockAffinityKey{Host: name, CIDR: model.PrefixFromIPNet(*cidr)},
 				Value:    nil,
 				Revision: kvp.Revision,
 			})
@@ -177,7 +209,7 @@ func (c *bgpNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, er
 			}
 
 			kvps = append(kvps, &model.KVPair{
-				Key:      model.BlockAffinityKey{Host: name, CIDR: *cidr},
+				Key:      model.BlockAffinityKey{Host: name, CIDR: model.PrefixFromIPNet(*cidr)},
 				Value:    &model.BlockAffinity{State: model.StateConfirmed},
 				Revision: kvp.Revision,
 			})
@@ -194,7 +226,7 @@ func (c *bgpNodeUpdateProcessor) OnSyncerStarting() {
 
 func (c *bgpNodeUpdateProcessor) extractName(k model.Key) (string, error) {
 	rk, ok := k.(model.ResourceKey)
-	if !ok || rk.Kind != libapiv3.KindNode {
+	if !ok || rk.Kind != internalapi.KindNode {
 		return "", errors.New("Incorrect key type - expecting resource of kind Node")
 	}
 	return rk.Name, nil

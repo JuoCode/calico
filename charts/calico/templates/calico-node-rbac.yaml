@@ -68,6 +68,13 @@ rules:
     verbs:
       - watch
       - list
+  # Watch for changes to Kubernetes ClusterNetworkPolicies.
+  - apiGroups: ["policy.networking.k8s.io"]
+    resources:
+      - clusternetworkpolicies
+    verbs:
+      - watch
+      - list
   # Used by Calico for policy information.
   - apiGroups: [""]
     resources:
@@ -83,41 +90,70 @@ rules:
       - pods/status
     verbs:
       - patch
-  # Calico monitors various CRDs for config.
-  - apiGroups: ["crd.projectcalico.org"]
+{{- if or (eq .Values.network "flannel") .Values.flannel_migration }}
+  # On canal the CNI plugin runs as the node's own service account, so the node role carries the
+  # permission that lets its pods/status patch through protect-cni-annotations.projectcalico.org.
+  # A canal to Calico migration keeps it, since canal's plugin runs on unmigrated nodes meanwhile.
+  - apiGroups: ["projectcalico.org"]
     resources:
+      - cniannotations
+    verbs:
+      - write
+{{- end }}
+  # Calico monitors various CRDs for config.
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources:
+{{- if not .Values.useV3CRDs }}
       - globalfelixconfigs
+      - globalbgpconfigs
+{{- end }}
       - felixconfigurations
       - bgppeers
       - bgpfilters
-      - globalbgpconfigs
       - bgpconfigurations
       - ippools
       - ipreservations
       - ipamblocks
       - globalnetworkpolicies
-      - globalnetworksets
+      - stagedglobalnetworkpolicies
       - networkpolicies
+      - stagednetworkpolicies
+      - stagedkubernetesnetworkpolicies
+      - globalnetworksets
       - networksets
       - clusterinformations
       - hostendpoints
       - blockaffinities
       - caliconodestatuses
+      - tiers
     verbs:
       - get
       - list
       - watch
+  # Calico creates some tiers on startup.
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources:
+      - tiers
+    verbs:
+      - create
   # Calico must create and update some CRDs on startup.
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - ippools
       - felixconfigurations
+      - bgpconfigurations
       - clusterinformations
     verbs:
       - create
       - update
+  # Calico marks the IP pools it creates allocatable.
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources:
+      - ippools/status
+    verbs:
+      - update
   # Calico must update some CRDs.
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - caliconodestatuses
     verbs:
@@ -132,16 +168,24 @@ rules:
       - watch
   # These permissions are only required for upgrade from v2.6, and can
   # be removed after upgrade or on fresh installations.
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - bgpconfigurations
       - bgppeers
     verbs:
       - create
       - update
+  # calico/node creates the default IPAMConfiguration at startup when Calico IPAM is in use.
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources:
+      - ipamconfigurations
+      - ipamconfigs
+    verbs:
+      - get
+      - create
 {{- if eq .Values.network "calico" }}
   # These permissions are required for Calico CNI to perform IPAM allocations.
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - blockaffinities
       - ipamblocks
@@ -152,16 +196,8 @@ rules:
       - create
       - update
       - delete
-  # The CNI plugin and calico/node need to be able to create a default
-  # IPAMConfiguration
-  - apiGroups: ["crd.projectcalico.org"]
-    resources:
-      - ipamconfigs
-    verbs:
-      - get
-      - create
   # Block affinities must also be watchable by confd for route aggregation.
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - blockaffinities
     verbs:
@@ -174,6 +210,14 @@ rules:
     verbs:
       - get
 {{- end }}
+  # For monitoring KubeVirt live migration.
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachineinstancemigrations
+    verbs:
+      - get
+      - list
+      - watch
 {{- end }}
 
 ---
@@ -197,8 +241,15 @@ rules:
       - pods/status
     verbs:
       - patch
+  # Lets the CNI plugin's pods/status patch through protect-cni-annotations.projectcalico.org.
+  # Nothing serves this resource; it exists only to be granted.
+  - apiGroups: ["projectcalico.org"]
+    resources:
+      - cniannotations
+    verbs:
+      - write
 {{- if eq .Values.network "calico" }}
-  - apiGroups: ["crd.projectcalico.org"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
     resources:
       - blockaffinities
       - ipamblocks
@@ -206,6 +257,7 @@ rules:
       - clusterinformations
       - ippools
       - ipreservations
+      - ipamconfigurations
       - ipamconfigs
     verbs:
       - get
@@ -213,6 +265,13 @@ rules:
       - create
       - update
       - delete
+  # The CNI plugin reads KubeVirt resources for IPAM of KubeVirt workloads.
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachineinstances
+      - virtualmachines
+    verbs:
+      - get
 {{- end }}
 {{- end }}
 ---
@@ -252,9 +311,9 @@ roleRef:
   kind: ClusterRole
   name: flannel
 subjects:
-- kind: ServiceAccount
-  name: canal
-  namespace: kube-system
+  - kind: ServiceAccount
+    name: canal
+    namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -265,9 +324,9 @@ roleRef:
   kind: ClusterRole
   name: calico-node
 subjects:
-- kind: ServiceAccount
-  name: canal
-  namespace: kube-system
+  - kind: ServiceAccount
+    name: canal
+    namespace: kube-system
 {{- else }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -278,9 +337,9 @@ roleRef:
   kind: ClusterRole
   name: calico-node
 subjects:
-- kind: ServiceAccount
-  name: calico-node
-  namespace: kube-system
+  - kind: ServiceAccount
+    name: calico-node
+    namespace: kube-system
 {{- end }}
 ---
 
@@ -293,6 +352,6 @@ roleRef:
   kind: ClusterRole
   name: calico-cni-plugin
 subjects:
-- kind: ServiceAccount
-  name: calico-cni-plugin
-  namespace: kube-system
+  - kind: ServiceAccount
+    name: calico-cni-plugin
+    namespace: kube-system

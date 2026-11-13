@@ -19,18 +19,16 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
@@ -76,28 +74,24 @@ func (m ipamMigrator) InitialiseIPPoolAndFelixConfig() error {
 	// Validate config and get pod CIDR.
 	_, cidr, err := cnet.ParseCIDR(m.config.FlannelNetwork)
 	if err != nil {
-		return fmt.Errorf("Failed to parse the CIDR '%s'", m.config.FlannelNetwork)
+		return fmt.Errorf("failed to parse the CIDR '%s'", m.config.FlannelNetwork)
 	}
 
 	var cidrV6 *cnet.IPNet
 	if m.config.FlannelIpv6Network != "" {
 		_, cidrV6, err = cnet.ParseCIDR(m.config.FlannelIpv6Network)
 		if err != nil {
-			return fmt.Errorf("Failed to parse the CIDR '%s'", m.config.FlannelIpv6Network)
+			return fmt.Errorf("failed to parse the CIDR '%s'", m.config.FlannelIpv6Network)
 		}
 	}
 
 	// Based on FlannelSubnetLen, work out the size of ippool.
-	blockSize := m.config.DefaultIppoolSize
-	if m.config.FlannelSubnetLen > m.config.DefaultIppoolSize {
+	blockSize := max(m.config.FlannelSubnetLen,
 		// Flannel subnet is smaller than one Calico IPAM block with default size of /26.
-		blockSize = m.config.FlannelSubnetLen
-	}
-	blockSizeV6 := m.config.DefaultIppoolSizeV6
-	if m.config.FlannelIpv6SubnetLen > m.config.DefaultIppoolSizeV6 {
+		m.config.DefaultIppoolSize)
+	blockSizeV6 := max(m.config.FlannelIpv6SubnetLen,
 		// Flannel subnet is smaller than one Calico IPAM block with default size of /122.
-		blockSizeV6 = m.config.FlannelIpv6SubnetLen
-	}
+		m.config.DefaultIppoolSizeV6)
 
 	// Canal creates default ippool and FelixConfigurations with no VXLAN.
 	// In this case, we should not check vxlan settings for existing ippool or FelixConfigurations.
@@ -107,14 +101,14 @@ func (m ipamMigrator) InitialiseIPPoolAndFelixConfig() error {
 	// Create default IPv4 ippool with VXLAN enabled
 	err = createDefaultVxlanIPPool(m.ctx, m.calicoClient, cidr, blockSize, m.config.FlannelIPMasq, checkVxlan)
 	if err != nil {
-		return fmt.Errorf("Failed to create default IPv4 ippool")
+		return fmt.Errorf("failed to create default IPv4 ippool")
 	}
 
 	if cidrV6 != nil {
 		// Create default IPv6 ippool with vxlan enabled
 		err = createDefaultVxlanIPPool(m.ctx, m.calicoClient, cidrV6, blockSizeV6, m.config.FlannelIPMasq, checkVxlan)
 		if err != nil {
-			return fmt.Errorf("Failed to create default IPv6 ippool")
+			return fmt.Errorf("failed to create default IPv6 ippool")
 		}
 	}
 
@@ -122,7 +116,7 @@ func (m ipamMigrator) InitialiseIPPoolAndFelixConfig() error {
 	err = updateOrCreateDefaultFelixConfiguration(m.ctx, m.calicoClient,
 		m.config.FlannelVNI, m.config.FlannelPort, m.config.FlannelMTU)
 	if err != nil {
-		return fmt.Errorf("Failed to create or update default FelixConfiguration")
+		return fmt.Errorf("failed to create or update default FelixConfiguration")
 	}
 
 	return nil
@@ -182,8 +176,13 @@ func (m ipamMigrator) SetupCalicoIPAMForNode(node *v1.Node) error {
 	vtepMac := fvm.VtepMAC
 	log.Infof("node %s has vxlan setup from Flannel (vtepMac: '%s', vtepIP: '%s').", node.Name, vtepMac, vtepIP.String())
 
+	affinityCfg := ipam.AffinityConfig{
+		Host:         node.Name,
+		AffinityType: ipam.AffinityTypeHost,
+	}
+
 	// Allocate Calico IPAM blocks for node.
-	claimed, failed, err := m.calicoClient.IPAM().ClaimAffinity(m.ctx, *cidr, node.Name)
+	claimed, failed, err := m.calicoClient.IPAM().ClaimAffinity(m.ctx, *cidr, affinityCfg)
 	if err != nil {
 		log.WithError(err).Errorf("Failed to claim IPAM blocks for node %s, claimed %d, failed %d", node.Name, len(claimed), len(failed))
 		return err
@@ -222,8 +221,9 @@ func setupCalicoNodeVxlan(ctx context.Context, c client.Interface, nodeName stri
 	// Assign vtep IP.
 	// Check current status of vtep IP. It could be assigned already if migration controller restarts.
 	assign := true
-	attr, _, err := c.IPAM().GetAssignmentAttributes(ctx, vtepIP)
+	allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, vtepIP)
 	if err == nil {
+		attr := allocAttr.ActiveOwnerAttrs
 		if attr[ipam.AttributeType] == ipam.AttributeTypeVXLAN && attr[ipam.AttributeNode] == nodeName {
 			// The tunnel address is still valid, do nothing.
 			log.Infof("Calico Node %s vtep IP been assigned already.", nodeName)
@@ -238,7 +238,7 @@ func setupCalicoNodeVxlan(ctx context.Context, c client.Interface, nodeName stri
 	} else {
 		// Failed to get assignment attributes, datastore connection issues possible.
 		log.WithError(err).Errorf("Failed to get assignment attributes for vtep IP '%s'", vtepIP.String())
-		return fmt.Errorf("Failed to get vtep IP %s attribute", vtepIP.String())
+		return fmt.Errorf("failed to get vtep IP %s attribute: %w", vtepIP.String(), err)
 	}
 
 	if assign {
@@ -254,7 +254,7 @@ func setupCalicoNodeVxlan(ctx context.Context, c client.Interface, nodeName stri
 			Attrs:    attrs,
 		})
 		if err != nil {
-			return fmt.Errorf("Failed to assign vtep IP %s", vtepIP.String())
+			return fmt.Errorf("failed to assign vtep IP %s", vtepIP.String())
 		}
 		log.Infof("Calico Node %s vtep IP assigned.", nodeName)
 	}
@@ -273,7 +273,7 @@ func setupCalicoNodeVxlan(ctx context.Context, c client.Interface, nodeName stri
 
 	log.Infof("Calico Node current value: %+v.", node)
 
-	node.Spec.BGP = &libapi.NodeBGPSpec{}
+	node.Spec.BGP = &internalapi.NodeBGPSpec{}
 	// Set public ip with subnet /32.
 	// The subnet part is required to pass Felix validation.
 	node.Spec.BGP.IPv4Address = fmt.Sprintf("%s/32", publicIP)
@@ -302,7 +302,7 @@ func createDefaultVxlanIPPool(ctx context.Context, client client.Interface, cidr
 	case 6:
 		poolName = defaultIpv6PoolName
 	default:
-		return fmt.Errorf("Unknown IP version for CIDR: %s", cidr.String())
+		return fmt.Errorf("unknown IP version for CIDR: %s", cidr.String())
 
 	}
 	pool := &api.IPPool{

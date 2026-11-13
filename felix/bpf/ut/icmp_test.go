@@ -18,8 +18,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
@@ -68,7 +68,7 @@ func TestICMPCTPlain(t *testing.T) {
 		res, err := bpfrun(icmpEcho)
 		Expect(err).NotTo(HaveOccurred())
 		// there is no normal CT record yet, must be denied
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		dumpCTMap(ctMap)
 

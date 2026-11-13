@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,16 +17,16 @@ package bgpsyncer_test
 import (
 	"context"
 	"fmt"
+	"net/netip"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
@@ -60,7 +60,8 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			// Create the backend client to obtain a syncer interface.
 			be, err := backend.NewClient(config)
 			Expect(err).NotTo(HaveOccurred())
-			be.Clean()
+			err = be.Clean()
+			Expect(err).NotTo(HaveOccurred())
 
 			// Create a SyncerTester to receive the BGP syncer callback events and to allow us
 			// to assert state.
@@ -114,13 +115,13 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			syncTester.ExpectCacheSize(expectedCacheSize)
 			syncTester.ExpectPath("/calico/resources/v3/projectcalico.org/bgpconfigurations/default")
 
-			var node *libapiv3.Node
+			var node *internalapi.Node
 			if config.Spec.DatastoreType == apiconfig.Kubernetes {
 				// For Kubernetes, update the existing node config to have some BGP configuration.
 				By("Configuring a node with BGP configuration")
 				node, err = c.Nodes().Get(ctx, "127.0.0.1", options.GetOptions{})
 				Expect(err).NotTo(HaveOccurred())
-				node.Spec.BGP = &libapiv3.NodeBGPSpec{
+				node.Spec.BGP = &internalapi.NodeBGPSpec{
 					IPv4Address: "1.2.3.4/24",
 					IPv6Address: "aa:bb::cc/120",
 				}
@@ -132,10 +133,10 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 				By("Creating a node with BGP configuration")
 				node, err = c.Nodes().Create(
 					ctx,
-					&libapiv3.Node{
+					&internalapi.Node{
 						ObjectMeta: metav1.ObjectMeta{Name: "127.0.0.1"},
-						Spec: libapiv3.NodeSpec{
-							BGP: &libapiv3.NodeBGPSpec{
+						Spec: internalapi.NodeSpec{
+							BGP: &internalapi.NodeBGPSpec{
 								IPv4Address: "1.2.3.4/24",
 								IPv6Address: "aa:bb::cc/120",
 							},
@@ -156,7 +157,7 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			Expect(err).NotTo(HaveOccurred())
 
 			syncTester.ExpectCacheSize(expectedCacheSize)
-			syncTester.ExpectNoData(model.GlobalBGPConfigKey{"as_num"})
+			syncTester.ExpectNoData(model.GlobalBGPConfigKey{Name: "as_num"})
 
 			By("Creating an IPPool")
 			poolCIDR := "192.124.0.0/21"
@@ -175,18 +176,21 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 			)
 			Expect(err).NotTo(HaveOccurred())
 			// The pool will add as single entry ( +1 )
-			poolKeyV1 := model.IPPoolKey{CIDR: net.MustParseCIDR("192.124.0.0/21")}
+			poolKeyV1 := model.IPPoolKey{CIDR: netip.MustParsePrefix("192.124.0.0/21")}
 			expectedCacheSize += 1
 			syncTester.ExpectCacheSize(expectedCacheSize)
 			syncTester.ExpectData(model.KVPair{
 				Key: poolKeyV1,
 				Value: &model.IPPool{
-					CIDR:          poolCIDRNet,
-					IPIPInterface: "tunl0",
-					IPIPMode:      encap.CrossSubnet,
-					Masquerade:    true,
-					IPAM:          true,
-					Disabled:      false,
+					CIDR:           poolCIDRNet,
+					IPIPInterface:  "tunl0",
+					IPIPMode:       encap.CrossSubnet,
+					Masquerade:     true,
+					IPAM:           true,
+					Disabled:       false,
+					AssignmentMode: apiv3.Automatic,
+					AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+					NodeSelector:   "all()",
 				},
 				Revision: pool.ResourceVersion,
 			})
@@ -219,28 +223,28 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 						ExportV4: []apiv3.BGPFilterRuleV4{
 							{
 								CIDR:          "10.10.10.0/24",
-								MatchOperator: apiv3.In,
+								MatchOperator: apiv3.MatchOperatorIn,
 								Action:        apiv3.Accept,
 							},
 						},
 						ImportV4: []apiv3.BGPFilterRuleV4{
 							{
 								CIDR:          "11.11.11.0/24",
-								MatchOperator: apiv3.NotIn,
+								MatchOperator: apiv3.MatchOperatorNotIn,
 								Action:        apiv3.Reject,
 							},
 						},
 						ExportV6: []apiv3.BGPFilterRuleV6{
 							{
 								CIDR:          "dead:beef:1::/64",
-								MatchOperator: apiv3.Equal,
+								MatchOperator: apiv3.MatchOperatorEqual,
 								Action:        apiv3.Accept,
 							},
 						},
 						ImportV6: []apiv3.BGPFilterRuleV6{
 							{
 								CIDR:          "dead:beef:2::/64",
-								MatchOperator: apiv3.NotEqual,
+								MatchOperator: apiv3.MatchOperatorNotEqual,
 								Action:        apiv3.Reject,
 							},
 						},
@@ -280,7 +284,8 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 				current := syncTester.GetCacheEntries()
 				for _, kvp := range current {
 					if kab, ok := kvp.Key.(model.BlockAffinityKey); ok {
-						if kab.Host == "127.0.0.1" && poolCIDRNet.Contains(kab.CIDR.IP) {
+						kabCIDR := model.IPNetFromPrefix(kab.CIDR)
+						if kab.Host == "127.0.0.1" && poolCIDRNet.Contains(kabCIDR.IP) && kab.AffinityType == string(ipam.AffinityTypeHost) {
 							blockAffinityKeyV1 = kab
 							break
 						}
@@ -292,7 +297,7 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 				// The syncer only monitors affine blocks for one host, so IP allocations for a different
 				// host should not result in updates.
 				hostname := "not-this-host"
-				node, err = c.Nodes().Create(ctx, &libapiv3.Node{ObjectMeta: metav1.ObjectMeta{Name: hostname}}, options.SetOptions{})
+				node, err = c.Nodes().Create(ctx, &internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: hostname}}, options.SetOptions{})
 				Expect(err).NotTo(HaveOccurred())
 				expectedCacheSize += 1
 				syncTester.ExpectCacheSize(expectedCacheSize)
@@ -315,9 +320,9 @@ var _ = testutils.E2eDatastoreDescribe("BGP syncer tests", testutils.DatastoreAl
 				By("Releasing the IP addresses and checking for no updates")
 				// Releasing IPs should leave the affine blocks assigned, so releasing the IPs
 				// should result in no updates.
-				_, err = c.IPAM().ReleaseIPs(ctx, ips1...)
+				_, _, err = c.IPAM().ReleaseIPs(ctx, ips1...)
 				Expect(err).NotTo(HaveOccurred())
-				_, err = c.IPAM().ReleaseIPs(ctx, ips2...)
+				_, _, err = c.IPAM().ReleaseIPs(ctx, ips2...)
 				Expect(err).NotTo(HaveOccurred())
 				syncTester.ExpectCacheSize(expectedCacheSize)
 

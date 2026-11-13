@@ -18,6 +18,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <bpf.h>
+
+#include "libbpf.h"
 
 union bpf_attr *bpf_maps_attr_alloc() {
    union bpf_attr *attr = malloc(sizeof(union bpf_attr));
@@ -129,4 +132,30 @@ int bpf_maps_map_load_multi(__u32 map_fd,
      count++;
    }
    return count;
+}
+
+static void set_errno(int ret) {
+	errno = ret >= 0 ? ret : -ret;
+}
+
+void bpf_map_batch_lookup(int fd, void *in_batch, void *out_batch, void *keys,
+			  void *values, __u32 *count, __u64 flags)
+{
+	DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts,
+		.flags = flags);
+
+	set_errno(bpf_map_lookup_batch(fd, in_batch, out_batch, keys, values, count, &opts));
+}
+
+int bpf_create_map(enum bpf_map_type map_type,
+		   const char *name,
+		   __u32 key_size,
+		   __u32 value_size,
+		   __u32 max_entries,
+		   __u32 map_flags)
+{
+	DECLARE_LIBBPF_OPTS(bpf_map_create_opts, opts,
+		.map_flags = map_flags);
+
+	return bpf_map_create(map_type, name, key_size, value_size, max_entries, &opts);
 }

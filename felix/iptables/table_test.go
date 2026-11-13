@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,23 @@ package iptables_test
 import (
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
 	. "github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/iptables/testutils"
-	"github.com/projectcalico/calico/felix/logutils"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/felix/rules"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/projectcalico/calico/felix/rules/rulesdefs"
+	"github.com/projectcalico/calico/lib/logrusr"
 )
 
 var _ = Describe("Table with an empty dataplane (nft)", func() {
 	describeEmptyDataplaneTests("nft")
 })
+
 var _ = Describe("Table with an empty dataplane (legacy)", func() {
 	describeEmptyDataplaneTests("legacy")
 
@@ -42,29 +43,27 @@ var _ = Describe("Table with an empty dataplane (legacy)", func() {
 			"INPUT":   {},
 			"OUTPUT":  {},
 		}, "legacy")
-		iptLock := &mockMutex{}
 		featureDetector := environment.NewFeatureDetector(nil)
 		featureDetector.NewCmd = dataplane.NewCmd
 		featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
 		table := NewTable(
 			"filter",
 			4,
-			rules.RuleHashPrefix,
-			iptLock,
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			TableOptions{
-				HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+				HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 				NewCmdOverride:        dataplane.NewCmd,
 				SleepOverride:         dataplane.Sleep,
 				NowOverride:           dataplane.Now,
 				BackendMode:           "legacy",
 				LookPathOverride:      testutils.LookPathAll,
-				OpRecorder:            logutils.NewSummarizer("test loop"),
+				OpRecorder:            logrusr.NewSummarizer("test loop"),
 			},
 		)
 
-		table.InsertOrAppendRules("FORWARD", []Rule{
-			{Action: DropAction{}},
+		table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+			{Match: Match(), Action: DropAction{}},
 		})
 		table.Apply()
 		Expect(dataplane.CmdNames).To(ConsistOf("iptables", "iptables-legacy-save", "iptables-legacy-restore"))
@@ -74,7 +73,6 @@ var _ = Describe("Table with an empty dataplane (legacy)", func() {
 func describeEmptyDataplaneTests(dataplaneMode string) {
 	var dataplane *testutils.MockDataplane
 	var table *Table
-	var iptLock *mockMutex
 	var featureDetector *environment.FeatureDetector
 	BeforeEach(func() {
 		dataplane = testutils.NewMockDataplane("filter", map[string][]string{
@@ -82,24 +80,22 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			"INPUT":   {},
 			"OUTPUT":  {},
 		}, dataplaneMode)
-		iptLock = &mockMutex{}
 		featureDetector = environment.NewFeatureDetector(nil)
 		featureDetector.NewCmd = dataplane.NewCmd
 		featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
 		table = NewTable(
 			"filter",
 			4,
-			rules.RuleHashPrefix,
-			iptLock,
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			TableOptions{
-				HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+				HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 				NewCmdOverride:        dataplane.NewCmd,
 				SleepOverride:         dataplane.Sleep,
 				NowOverride:           dataplane.Now,
 				BackendMode:           dataplaneMode,
 				LookPathOverride:      testutils.LookPathNoLegacy,
-				OpRecorder:            logutils.NewSummarizer("test loop"),
+				OpRecorder:            logrusr.NewSummarizer("test loop"),
 			},
 		)
 	})
@@ -131,8 +127,6 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 				"iptables-save",
 			}))
 		}
-		Expect(iptLock.Held).To(BeFalse())
-		Expect(iptLock.WasTaken).To(BeFalse())
 	})
 
 	It("should have a refresh scheduled at start-of-day", func() {
@@ -140,11 +134,11 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 	})
 
 	It("Should defer updates until Apply is called", func() {
-		table.InsertOrAppendRules("FORWARD", []Rule{
-			{Action: DropAction{}},
+		table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+			{Match: Match(), Action: DropAction{}},
 		})
-		table.UpdateChains([]*Chain{
-			{Name: "cali-foobar", Rules: []Rule{{Action: AcceptAction{}}}},
+		table.UpdateChains([]*generictables.Chain{
+			{Name: "cali-foobar", Rules: []generictables.Rule{{Match: Match(), Action: AcceptAction{}}}},
 		})
 		Expect(dataplane.CmdNames).To(BeEmpty())
 		table.Apply()
@@ -164,8 +158,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 	})
 
 	It("should ignore delete of nonexistent chain", func() {
-		table.RemoveChains([]*Chain{
-			{Name: "cali-foobar", Rules: []Rule{{Action: AcceptAction{}}}},
+		table.RemoveChains([]*generictables.Chain{
+			{Name: "cali-foobar", Rules: []generictables.Rule{{Match: Match(), Action: AcceptAction{}}}},
 		})
 		table.Apply()
 		Expect(dataplane.DeletedChains).To(BeEmpty())
@@ -176,17 +170,16 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			NewTable(
 				"filter",
 				4,
-				rules.RuleHashPrefix,
-				&mockMutex{},
+				rulesdefs.RuleHashPrefix,
 				featureDetector,
 				TableOptions{
-					HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+					HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 					NewCmdOverride:        dataplane.NewCmd,
 					SleepOverride:         dataplane.Sleep,
 					InsertMode:            "unknown",
 					BackendMode:           dataplaneMode,
 					LookPathOverride:      testutils.LookPathAll,
-					OpRecorder:            logutils.NewSummarizer("test loop"),
+					OpRecorder:            logrusr.NewSummarizer("test loop"),
 				},
 			)
 		}).To(Panic())
@@ -194,16 +187,10 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 	Describe("after inserting a rule", func() {
 		BeforeEach(func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: DropAction{}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}},
 			})
 			table.Apply()
-		})
-		It("should acquire the iptables lock", func() {
-			Expect(iptLock.WasTaken).To(BeTrue())
-		})
-		It("should release the iptables lock", func() {
-			Expect(iptLock.Held).To(BeFalse())
 		})
 		It("should be in the dataplane", func() {
 			Expect(dataplane.Chains).To(Equal(map[string][]string{
@@ -213,8 +200,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			}))
 		})
 		It("further inserts should be idempotent", func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: DropAction{}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}},
 			})
 			dataplane.ResetCmds()
 			table.Apply()
@@ -233,11 +220,11 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("after inserting a rule then updating the insertions", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: DropAction{}},
-					{Action: AcceptAction{}},
-					{Action: DropAction{}},
-					{Action: AcceptAction{}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}},
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: DropAction{}},
+					{Match: Match(), Action: AcceptAction{}},
 				})
 				table.Apply()
 			})
@@ -336,14 +323,14 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 	Describe("after adding a couple of chains", func() {
 		BeforeEach(func() {
-			table.UpdateChains([]*Chain{
-				{Name: "cali-foobar", Rules: []Rule{
-					{Action: AcceptAction{}},
-					{Action: DropAction{}},
+			table.UpdateChains([]*generictables.Chain{
+				{Name: "cali-foobar", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: DropAction{}},
 				}},
-				{Name: "cali-bazzbiff", Rules: []Rule{
-					{Action: AcceptAction{}},
-					{Action: DropAction{}},
+				{Name: "cali-bazzbiff", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: DropAction{}},
 				}},
 			})
 			table.Apply()
@@ -359,11 +346,12 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("after adding a reference from another unreferenced chain", func() {
 			BeforeEach(func() {
-				table.UpdateChain(&Chain{
+				table.UpdateChain(&generictables.Chain{
 					Name: "cali-FORWARD",
-					Rules: []Rule{
-						{Action: JumpAction{Target: "cali-foobar"}},
-					}})
+					Rules: []generictables.Rule{
+						{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
+					},
+				})
 				table.Apply()
 			})
 
@@ -377,8 +365,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 			Describe("after adding an indirect reference from an insert", func() {
 				BeforeEach(func() {
-					table.InsertOrAppendRules("FORWARD", []Rule{
-						{Action: JumpAction{Target: "cali-FORWARD"}},
+					table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+						{Match: Match(), Action: JumpAction{Target: "cali-FORWARD"}},
 					})
 					table.Apply()
 				})
@@ -415,11 +403,12 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 				Describe("after switching the intermediate rule", func() {
 					BeforeEach(func() {
-						table.UpdateChain(&Chain{
+						table.UpdateChain(&generictables.Chain{
 							Name: "cali-FORWARD",
-							Rules: []Rule{
-								{Action: JumpAction{Target: "cali-bazzbiff"}},
-							}})
+							Rules: []generictables.Rule{
+								{Match: Match(), Action: JumpAction{Target: "cali-bazzbiff"}},
+							},
+						})
 						table.Apply()
 					})
 					It("correct chain should be swapped in", func() {
@@ -442,9 +431,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 				Describe("after removing the reference", func() {
 					BeforeEach(func() {
-						table.UpdateChain(&Chain{
+						table.UpdateChain(&generictables.Chain{
 							Name:  "cali-FORWARD",
-							Rules: []Rule{},
+							Rules: []generictables.Rule{},
 						})
 						table.Apply()
 					})
@@ -464,14 +453,15 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("after adding a reference from another referenced chain", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: JumpAction{Target: "cali-FORWARD"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: JumpAction{Target: "cali-FORWARD"}},
 				})
-				table.UpdateChain(&Chain{
+				table.UpdateChain(&generictables.Chain{
 					Name: "cali-FORWARD",
-					Rules: []Rule{
-						{Action: JumpAction{Target: "cali-foobar"}},
-					}})
+					Rules: []generictables.Rule{
+						{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
+					},
+				})
 				table.Apply()
 			})
 			It("it should get programmed", func() {
@@ -493,8 +483,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 			Describe("after adding a reference from an insert", func() {
 				BeforeEach(func() {
-					table.InsertOrAppendRules("FORWARD", []Rule{
-						{Action: JumpAction{Target: "cali-foobar"}},
+					table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+						{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
 					})
 					table.Apply()
 				})
@@ -533,7 +523,7 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 					Describe("after removing the insert", func() {
 						BeforeEach(func() {
-							table.InsertOrAppendRules("FORWARD", []Rule{})
+							table.InsertOrAppendRules("FORWARD", []generictables.Rule{})
 							table.Apply()
 						})
 						It("chain should be removed", func() {
@@ -550,8 +540,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("after adding a reference from an insert", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: JumpAction{Target: "cali-foobar"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
 				})
 				table.Apply()
 			})
@@ -571,7 +561,7 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 			Describe("after removing the reference", func() {
 				BeforeEach(func() {
-					table.InsertOrAppendRules("FORWARD", []Rule{})
+					table.InsertOrAppendRules("FORWARD", []generictables.Rule{})
 					table.Apply()
 				})
 				It("it should get removed", func() {
@@ -585,11 +575,11 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 			Describe("then updating the chain", func() {
 				BeforeEach(func() {
-					table.UpdateChains([]*Chain{
-						{Name: "cali-foobar", Rules: []Rule{
+					table.UpdateChains([]*generictables.Chain{
+						{Name: "cali-foobar", Rules: []generictables.Rule{
 							// We swap the rules.
-							{Action: DropAction{}},
-							{Action: AcceptAction{}},
+							{Match: Match(), Action: DropAction{}},
+							{Match: Match(), Action: AcceptAction{}},
 						}},
 					})
 					table.Apply()
@@ -613,11 +603,11 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 					Expect(dataplane.CmdNames).To(BeEmpty())
 				})
 				It("should squash idempotent updates", func() {
-					table.UpdateChains([]*Chain{
-						{Name: "cali-foobar", Rules: []Rule{
+					table.UpdateChains([]*generictables.Chain{
+						{Name: "cali-foobar", Rules: []generictables.Rule{
 							// Same data as above.
-							{Action: DropAction{}},
-							{Action: AcceptAction{}},
+							{Match: Match(), Action: DropAction{}},
+							{Match: Match(), Action: AcceptAction{}},
 						}},
 					})
 					dataplane.ResetCmds()
@@ -632,11 +622,11 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			})
 			Describe("then extending the chain", func() {
 				BeforeEach(func() {
-					table.UpdateChains([]*Chain{
-						{Name: "cali-foobar", Rules: []Rule{
-							{Action: AcceptAction{}},
-							{Action: DropAction{}},
-							{Action: ReturnAction{}},
+					table.UpdateChains([]*generictables.Chain{
+						{Name: "cali-foobar", Rules: []generictables.Rule{
+							{Match: Match(), Action: AcceptAction{}},
+							{Match: Match(), Action: DropAction{}},
+							{Match: Match(), Action: ReturnAction{}},
 						}},
 					})
 					table.Apply()
@@ -658,9 +648,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 				Describe("then truncating the chain", func() {
 					BeforeEach(func() {
-						table.UpdateChains([]*Chain{
-							{Name: "cali-foobar", Rules: []Rule{
-								{Action: AcceptAction{}},
+						table.UpdateChains([]*generictables.Chain{
+							{Name: "cali-foobar", Rules: []generictables.Rule{
+								{Match: Match(), Action: AcceptAction{}},
 							}},
 						})
 						table.Apply()
@@ -680,9 +670,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 				})
 				Describe("then replacing the chain", func() {
 					BeforeEach(func() {
-						table.UpdateChains([]*Chain{
-							{Name: "cali-foobar", Rules: []Rule{
-								{Action: ReturnAction{}},
+						table.UpdateChains([]*generictables.Chain{
+							{Name: "cali-foobar", Rules: []generictables.Rule{
+								{Match: Match(), Action: ReturnAction{}},
 							}},
 						})
 						table.Apply()
@@ -718,10 +708,10 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			})
 			Describe("then removing the chain", func() {
 				BeforeEach(func() {
-					table.RemoveChains([]*Chain{
-						{Name: "cali-foobar", Rules: []Rule{
-							{Action: AcceptAction{}},
-							{Action: DropAction{}},
+					table.RemoveChains([]*generictables.Chain{
+						{Name: "cali-foobar", Rules: []generictables.Rule{
+							{Match: Match(), Action: AcceptAction{}},
+							{Match: Match(), Action: DropAction{}},
 						}},
 					})
 					table.Apply()
@@ -739,17 +729,129 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 		})
 	})
 
+	Describe("after adding a force-programmed chain", func() {
+		BeforeEach(func() {
+			table.UpdateChains([]*generictables.Chain{
+				{
+					Name: "cali-foobar",
+					Rules: []generictables.Rule{
+						{Match: Match(), Action: AcceptAction{}},
+						{Match: Match(), Action: DropAction{}},
+					},
+					ForceProgramming: true,
+				},
+			})
+			table.Apply()
+		})
+
+		It("it should be programmed", func() {
+			Expect(dataplane.Chains).To(Equal(map[string][]string{
+				"FORWARD": {},
+				"INPUT":   {},
+				"OUTPUT":  {},
+				"cali-foobar": {
+					"-m comment --comment \"cali:42h7Q64_2XDzpwKe\" --jump ACCEPT",
+					"-m comment --comment \"cali:0sUFHicPNNqNyNx8\" --jump DROP",
+				},
+			}))
+		})
+
+		Describe("after adding a reference", func() {
+			BeforeEach(func() {
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
+				})
+				table.Apply()
+			})
+			It("it should still be programmed", func() {
+				Expect(dataplane.Chains).To(Equal(map[string][]string{
+					"FORWARD": {
+						"-m comment --comment \"cali:JttcEuxbGad9jG6N\" --jump cali-foobar",
+					},
+					"INPUT":  {},
+					"OUTPUT": {},
+					"cali-foobar": {
+						"-m comment --comment \"cali:42h7Q64_2XDzpwKe\" --jump ACCEPT",
+						"-m comment --comment \"cali:0sUFHicPNNqNyNx8\" --jump DROP",
+					},
+				}))
+			})
+		})
+
+		Describe("after disabling force programming", func() {
+			BeforeEach(func() {
+				table.UpdateChains([]*generictables.Chain{
+					{
+						Name: "cali-foobar",
+						Rules: []generictables.Rule{
+							{Match: Match(), Action: AcceptAction{}},
+							{Match: Match(), Action: DropAction{}},
+						},
+					},
+				})
+				table.Apply()
+			})
+
+			It("should be removed", func() {
+				Expect(dataplane.Chains).To(Equal(map[string][]string{
+					"FORWARD": {},
+					"INPUT":   {},
+					"OUTPUT":  {},
+				}))
+			})
+		})
+
+		Describe("after removing the chain", func() {
+			BeforeEach(func() {
+				table.RemoveChainByName("cali-foobar")
+				table.Apply()
+			})
+
+			It("should be removed", func() {
+				Expect(dataplane.Chains).To(Equal(map[string][]string{
+					"FORWARD": {},
+					"INPUT":   {},
+					"OUTPUT":  {},
+				}))
+			})
+
+			Describe("after adding it back non-forced", func() {
+				BeforeEach(func() {
+					table.UpdateChains([]*generictables.Chain{
+						{
+							Name: "cali-foobar",
+							Rules: []generictables.Rule{
+								{Match: Match(), Action: AcceptAction{}},
+								{Match: Match(), Action: DropAction{}},
+							},
+						},
+					})
+					table.Apply()
+				})
+
+				It("should not be present", func() {
+					// This verifies that RemoveChainByName decreffed the chain.
+					Expect(dataplane.Chains).To(Equal(map[string][]string{
+						"FORWARD": {},
+						"INPUT":   {},
+						"OUTPUT":  {},
+					}))
+				})
+			})
+		})
+	})
+
 	Describe("applying updates when underlying iptables have changed in a approved chain", func() {
 		BeforeEach(func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: AcceptAction{}},
-				{Action: DropAction{}},
-				{Action: JumpAction{Target: "cali-foobar"}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: AcceptAction{}},
+				{Match: Match(), Action: DropAction{}},
+				{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
 			})
-			table.UpdateChains([]*Chain{
-				{Name: "cali-foobar", Rules: []Rule{
-					{Action: AcceptAction{}},
-					{Action: DropAction{}},
+			table.UpdateChains([]*generictables.Chain{
+				{Name: "cali-foobar", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: DropAction{}},
 				}},
 			})
 			table.Apply()
@@ -780,9 +882,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 					}
 				}
 
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"new drop rule"}},
-					{Action: JumpAction{Target: "cali-foobar"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"new drop rule"}},
+					{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
 				})
 				table.Apply()
 			})
@@ -806,18 +908,18 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 	Describe("applying updates when underlying iptables have changed in a non-approved chain", func() {
 		BeforeEach(func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: JumpAction{Target: "non-cali-chain"}},
-				{Action: JumpAction{Target: "cali-foobar"}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: JumpAction{Target: "non-cali-chain"}},
+				{Match: Match(), Action: JumpAction{Target: "cali-foobar"}},
 			})
-			table.UpdateChains([]*Chain{
-				{Name: "non-cali-chain", Rules: []Rule{
-					{Action: AcceptAction{}, Comment: []string{"non-cali 1"}},
-					{Action: DropAction{}, Comment: []string{"non-cali 2"}},
+			table.UpdateChains([]*generictables.Chain{
+				{Name: "non-cali-chain", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"non-cali 1"}},
+					{Match: Match(), Action: DropAction{}, Comment: []string{"non-cali 2"}},
 				}},
-				{Name: "cali-foobar", Rules: []Rule{
-					{Action: AcceptAction{}, Comment: []string{"cali 1"}},
-					{Action: DropAction{}, Comment: []string{"cali 2"}},
+				{Name: "cali-foobar", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"cali 1"}},
+					{Match: Match(), Action: DropAction{}, Comment: []string{"cali 2"}},
 				}},
 			})
 			table.Apply()
@@ -851,8 +953,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 					}
 				}
 
-				table.InsertOrAppendRules("non-cali-chain", []Rule{
-					{Action: DropAction{}, Comment: []string{"new drop rule"}},
+				table.InsertOrAppendRules("non-cali-chain", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"new drop rule"}},
 				})
 				table.Apply()
 			})
@@ -866,7 +968,8 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 					"OUTPUT": {},
 					"non-cali-chain": {
 						"-m comment --comment \"cali:O9yEP97Dd2y-EskM\" -m comment --comment \"new drop rule\" --jump DROP",
-						"-j randomly-inserted-rule"},
+						"-j randomly-inserted-rule",
+					},
 					"cali-foobar": {
 						"-m comment --comment \"cali:cxE-1zsuD12R9YEG\" -m comment --comment \"cali 1\" --jump ACCEPT",
 						"-m comment --comment \"cali:1cpbPOGLTROlH4Sj\" -m comment --comment \"cali 2\" --jump DROP",
@@ -878,9 +981,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 	Describe("inserting into a non-Calico chain results in the expected writes", func() {
 		BeforeEach(func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: DropAction{}, Comment: []string{"a drop rule"}},
-				{Action: AcceptAction{}, Comment: []string{"an accept rule"}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}, Comment: []string{"a drop rule"}},
+				{Match: Match(), Action: AcceptAction{}, Comment: []string{"an accept rule"}},
 			})
 			table.Apply()
 		})
@@ -901,9 +1004,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 		})
 		Describe("then inserting the same rules", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"a drop rule"}},
-					{Action: AcceptAction{}, Comment: []string{"an accept rule"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"a drop rule"}},
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"an accept rule"}},
 				})
 				dataplane.ResetCmds()
 				table.Apply()
@@ -928,10 +1031,10 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 		})
 		Describe("then inserting different rules", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"a drop rule"}},
-					{Action: AcceptAction{}, Comment: []string{"an accept rule"}},
-					{Action: DropAction{}, Comment: []string{"a second drop rule"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"a drop rule"}},
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"an accept rule"}},
+					{Match: Match(), Action: DropAction{}, Comment: []string{"a second drop rule"}},
 				})
 				dataplane.ResetCmds()
 				table.Apply()
@@ -959,13 +1062,13 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 	Describe("inserting and appending into a non-Calico chain results in the expected writes", func() {
 		BeforeEach(func() {
-			table.AppendRules("FORWARD", []Rule{
-				{Action: DropAction{}, Comment: []string{"append drop rule"}},
-				{Action: AcceptAction{}, Comment: []string{"append accept rule"}},
+			table.AppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}, Comment: []string{"append drop rule"}},
+				{Match: Match(), Action: AcceptAction{}, Comment: []string{"append accept rule"}},
 			})
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: DropAction{}, Comment: []string{"insert drop rule"}},
-				{Action: AcceptAction{}, Comment: []string{"insert accept rule"}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}, Comment: []string{"insert drop rule"}},
+				{Match: Match(), Action: AcceptAction{}, Comment: []string{"insert accept rule"}},
 			})
 
 			table.Apply()
@@ -985,9 +1088,9 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("then appending the same rules", func() {
 			BeforeEach(func() {
-				table.AppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"append drop rule"}},
-					{Action: AcceptAction{}, Comment: []string{"append accept rule"}},
+				table.AppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"append drop rule"}},
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"append accept rule"}},
 				})
 				dataplane.ResetCmds()
 				table.Apply()
@@ -1008,15 +1111,15 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 
 		Describe("then inserting and appending different rules", func() {
 			BeforeEach(func() {
-				table.InsertOrAppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"insert drop rule"}},
-					{Action: AcceptAction{}, Comment: []string{"insert accept rule"}},
-					{Action: DropAction{}, Comment: []string{"second insert drop rule"}},
+				table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"insert drop rule"}},
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"insert accept rule"}},
+					{Match: Match(), Action: DropAction{}, Comment: []string{"second insert drop rule"}},
 				})
-				table.AppendRules("FORWARD", []Rule{
-					{Action: DropAction{}, Comment: []string{"append drop rule"}},
-					{Action: AcceptAction{}, Comment: []string{"append accept rule"}},
-					{Action: DropAction{}, Comment: []string{"second append drop rule"}},
+				table.AppendRules("FORWARD", []generictables.Rule{
+					{Match: Match(), Action: DropAction{}, Comment: []string{"append drop rule"}},
+					{Match: Match(), Action: AcceptAction{}, Comment: []string{"append accept rule"}},
+					{Match: Match(), Action: DropAction{}, Comment: []string{"second append drop rule"}},
 				})
 				dataplane.ResetCmds()
 				table.Apply()
@@ -1037,17 +1140,55 @@ func describeEmptyDataplaneTests(dataplaneMode string) {
 			})
 		})
 	})
+
+	Describe("only appending rules to a chain", func() {
+		BeforeEach(func() {
+			table.AppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}, Comment: []string{"append drop rule"}},
+				{Match: Match(), Action: AcceptAction{}, Comment: []string{"append accept rule"}},
+			})
+
+			table.Apply()
+		})
+		It("should update the dataplane", func() {
+			Expect(dataplane.Chains).To(Equal(map[string][]string{
+				"FORWARD": {
+					"-m comment --comment \"cali:qNsBylRkftPwO3XF\" -m comment --comment \"append drop rule\" --jump DROP",
+					"-m comment --comment \"cali:IQ9H0Scq00rF0w4S\" -m comment --comment \"append accept rule\" --jump ACCEPT",
+				},
+				"INPUT":  {},
+				"OUTPUT": {},
+			}))
+		})
+		It("should avoid spurious insert warnings", func() {
+			table.InvalidateDataplaneCache("test")
+			table.Apply()
+			table.Apply()
+			Expect(dataplane.Chains).To(Equal(map[string][]string{
+				"FORWARD": {
+					"-m comment --comment \"cali:qNsBylRkftPwO3XF\" -m comment --comment \"append drop rule\" --jump DROP",
+					"-m comment --comment \"cali:IQ9H0Scq00rF0w4S\" -m comment --comment \"append accept rule\" --jump ACCEPT",
+				},
+				"INPUT":  {},
+				"OUTPUT": {},
+			}))
+			Expect(table.UnexpectedInsertsSeen()).To(BeZero())
+		})
+	})
 }
 
 var _ = Describe("Tests of post-update recheck behaviour with refresh timer (nft)", func() {
 	describePostUpdateCheckTests(true, "nft")
 })
+
 var _ = Describe("Tests of post-update recheck behaviour with no refresh timer (nft)", func() {
 	describePostUpdateCheckTests(false, "nft")
 })
+
 var _ = Describe("Tests of post-update recheck behaviour with refresh timer (legacy)", func() {
 	describePostUpdateCheckTests(true, "legacy")
 })
+
 var _ = Describe("Tests of post-update recheck behaviour with no refresh timer (legacy)", func() {
 	describePostUpdateCheckTests(false, "legacy")
 })
@@ -1064,13 +1205,13 @@ func describePostUpdateCheckTests(enableRefresh bool, dataplaneMode string) {
 			"OUTPUT":  {},
 		}, dataplaneMode)
 		options := TableOptions{
-			HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+			HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 			NewCmdOverride:        dataplane.NewCmd,
 			SleepOverride:         dataplane.Sleep,
 			NowOverride:           dataplane.Now,
 			BackendMode:           dataplaneMode,
 			LookPathOverride:      testutils.LookPathNoLegacy,
-			OpRecorder:            logutils.NewSummarizer("test loop"),
+			OpRecorder:            logrusr.NewSummarizer("test loop"),
 		}
 		if enableRefresh {
 			options.RefreshInterval = 30 * time.Second
@@ -1081,13 +1222,12 @@ func describePostUpdateCheckTests(enableRefresh bool, dataplaneMode string) {
 		table = NewTable(
 			"filter",
 			4,
-			rules.RuleHashPrefix,
-			&mockMutex{},
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			options,
 		)
-		table.InsertOrAppendRules("FORWARD", []Rule{
-			{Action: DropAction{}},
+		table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+			{Match: Match(), Action: DropAction{}},
 		})
 		table.Apply()
 	})
@@ -1128,8 +1268,8 @@ func describePostUpdateCheckTests(enableRefresh bool, dataplaneMode string) {
 			}
 
 			// Just a random change to trigger a save/restore.
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: AcceptAction{}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: AcceptAction{}},
 			})
 			table.Apply()
 		})
@@ -1147,8 +1287,8 @@ func describePostUpdateCheckTests(enableRefresh bool, dataplaneMode string) {
 
 				Describe("after dataplane speeds up again", func() {
 					BeforeEach(func() {
-						table.InsertOrAppendRules("FORWARD", []Rule{
-							{Action: DropAction{}},
+						table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+							{Match: Match(), Action: DropAction{}},
 						})
 					})
 					BeforeEach(resetAndAdvance(0))
@@ -1246,12 +1386,15 @@ func describePostUpdateCheckTests(enableRefresh bool, dataplaneMode string) {
 var _ = Describe("Table with a dirty dataplane in append mode (nft)", func() {
 	describeDirtyDataplaneTests(true, "nft")
 })
+
 var _ = Describe("Table with a dirty dataplane in insert mode (nft)", func() {
 	describeDirtyDataplaneTests(false, "nft")
 })
+
 var _ = Describe("Table with a dirty dataplane in append mode (legacy)", func() {
 	describeDirtyDataplaneTests(true, "legacy")
 })
+
 var _ = Describe("Table with a dirty dataplane in insert mode (legacy)", func() {
 	describeDirtyDataplaneTests(false, "legacy")
 })
@@ -1335,18 +1478,17 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 		table = NewTable(
 			"filter",
 			4,
-			rules.RuleHashPrefix,
-			&mockMutex{},
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			TableOptions{
-				HistoricChainPrefixes:    rules.AllHistoricChainNamePrefixes,
+				HistoricChainPrefixes:    rulesdefs.AllHistoricChainNamePrefixes,
 				ExtraCleanupRegexPattern: "sneaky-rule",
 				NewCmdOverride:           dataplane.NewCmd,
 				SleepOverride:            dataplane.Sleep,
 				InsertMode:               insertMode,
 				BackendMode:              dataplaneMode,
 				LookPathOverride:         testutils.LookPathNoLegacy,
-				OpRecorder:               logutils.NewSummarizer("test loop"),
+				OpRecorder:               logrusr.NewSummarizer("test loop"),
 			},
 		)
 	})
@@ -1379,29 +1521,29 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 		// That should mean that the Table does a sync operation, avoiding updates to
 		// chains/rules that haven't changed, for example.
 		BeforeEach(func() {
-			table.InsertOrAppendRules("FORWARD", []Rule{
-				{Action: DropAction{}},
-				{Action: AcceptAction{}},
-				{Action: GotoAction{Target: "cali-foobar"}},
+			table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}},
+				{Match: Match(), Action: AcceptAction{}},
+				{Match: Match(), Action: GotoAction{Target: "cali-foobar"}},
 			})
-			table.AppendRules("FORWARD", []Rule{
-				{Action: ReturnAction{}},
-				{Action: DropAction{}},
+			table.AppendRules("FORWARD", []generictables.Rule{
+				{Match: Match(), Action: ReturnAction{}},
+				{Match: Match(), Action: DropAction{}},
 			})
-			table.InsertOrAppendRules("OUTPUT", []Rule{
-				{Action: DropAction{}},
-				{Action: JumpAction{Target: "cali-correct"}},
+			table.InsertOrAppendRules("OUTPUT", []generictables.Rule{
+				{Match: Match(), Action: DropAction{}},
+				{Match: Match(), Action: JumpAction{Target: "cali-correct"}},
 			})
-			table.UpdateChains([]*Chain{
-				{Name: "cali-foobar", Rules: []Rule{
-					{Action: AcceptAction{}},
-					{Action: DropAction{}},
-					{Action: ReturnAction{}},
+			table.UpdateChains([]*generictables.Chain{
+				{Name: "cali-foobar", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: DropAction{}},
+					{Match: Match(), Action: ReturnAction{}},
 				}},
 			})
-			table.UpdateChains([]*Chain{
-				{Name: "cali-correct", Rules: []Rule{
-					{Action: AcceptAction{}},
+			table.UpdateChains([]*generictables.Chain{
+				{Name: "cali-correct", Rules: []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
 				}},
 			})
 		})
@@ -1535,19 +1677,19 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 				Expect(func() {
 					table.Apply()
 				}).To(Panic())
-			}, 1)
+			})
 			It("it should do exponential backoff", func() {
 				Expect(func() {
 					table.Apply()
 				}).To(Panic())
 				Expect(dataplane.CumulativeSleep).To(Equal((100 + 200 + 400) * time.Millisecond))
-			}, 1)
+			})
 			It("it should retry 3 times", func() {
 				Expect(func() {
 					table.Apply()
 				}).To(Panic())
 				Expect(dataplane.Cmds).To(HaveLen(5))
-			}, 1)
+			})
 		})
 
 		It("shouldn't touch already-correct chain", func() {
@@ -1590,14 +1732,14 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 				Expect(func() {
 					table.Apply()
 				}).To(Panic())
-			}, 1)
+			})
 			It("it should do exponential backoff", func() {
 				Expect(func() {
 					table.Apply()
 				}).To(Panic())
 				Expect(dataplane.CumulativeSleep).To(Equal(
 					(1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 512) * time.Millisecond))
-			}, 1)
+			})
 		})
 
 		Describe("with a simulated clobber of chains before first write", func() {
@@ -1670,14 +1812,14 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 			})
 			It("and pending updates, should get to correct state", func() {
 				// And we make some updates in the same batch.
-				table.InsertOrAppendRules("OUTPUT", []Rule{
-					{Action: AcceptAction{}},
-					{Action: JumpAction{Target: "cali-correct"}},
+				table.InsertOrAppendRules("OUTPUT", []generictables.Rule{
+					{Match: Match(), Action: AcceptAction{}},
+					{Match: Match(), Action: JumpAction{Target: "cali-correct"}},
 				})
-				table.UpdateChains([]*Chain{
-					{Name: "cali-foobar", Rules: []Rule{
-						{Action: AcceptAction{}},
-						{Action: ReturnAction{}},
+				table.UpdateChains([]*generictables.Chain{
+					{Name: "cali-foobar", Rules: []generictables.Rule{
+						{Match: Match(), Action: AcceptAction{}},
+						{Match: Match(), Action: ReturnAction{}},
 					}},
 				})
 				// Next Apply() should refresh then put everything in sync.
@@ -1738,6 +1880,7 @@ func describeDirtyDataplaneTests(appendMode bool, dataplaneMode string) {
 var _ = Describe("Table with inserts and a non-Calico chain (legacy)", func() {
 	describeInsertAndNonCalicoChainTests("legacy")
 })
+
 var _ = Describe("Table with inserts and a non-Calico chain (nft)", func() {
 	describeInsertAndNonCalicoChainTests("nft")
 })
@@ -1745,34 +1888,31 @@ var _ = Describe("Table with inserts and a non-Calico chain (nft)", func() {
 func describeInsertAndNonCalicoChainTests(dataplaneMode string) {
 	var dataplane *testutils.MockDataplane
 	var table *Table
-	var iptLock *mockMutex
 	BeforeEach(func() {
 		dataplane = testutils.NewMockDataplane("filter", map[string][]string{
 			"FORWARD":    {},
 			"non-calico": {"-m comment \"foo\""},
 		}, dataplaneMode)
-		iptLock = &mockMutex{}
 		featureDetector := environment.NewFeatureDetector(nil)
 		featureDetector.NewCmd = dataplane.NewCmd
 		featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
 		table = NewTable(
 			"filter",
 			6,
-			rules.RuleHashPrefix,
-			iptLock,
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			TableOptions{
-				HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+				HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 				NewCmdOverride:        dataplane.NewCmd,
 				SleepOverride:         dataplane.Sleep,
 				NowOverride:           dataplane.Now,
 				BackendMode:           dataplaneMode,
 				LookPathOverride:      testutils.LookPathNoLegacy,
-				OpRecorder:            logutils.NewSummarizer("test loop"),
+				OpRecorder:            logrusr.NewSummarizer("test loop"),
 			},
 		)
-		table.InsertOrAppendRules("FORWARD", []Rule{
-			{Action: DropAction{}},
+		table.InsertOrAppendRules("FORWARD", []generictables.Rule{
+			{Match: Match(), Action: DropAction{}},
 		})
 		table.Apply()
 	})
@@ -1790,8 +1930,6 @@ func describeInsertAndNonCalicoChainTests(dataplaneMode string) {
 				"FORWARD": {"-m comment --comment \"cali:hecdSCslEjdBPBPo\" --jump DROP"},
 			}
 			dataplane.ResetCmds()
-			iptLock.WasTaken = false
-			iptLock.Held = false
 			table.Apply()
 		})
 
@@ -1802,9 +1940,6 @@ func describeInsertAndNonCalicoChainTests(dataplaneMode string) {
 		})
 		It("should make no changes to the dataplane", func() {
 			Expect(dataplane.CmdNames).To(BeEmpty())
-		})
-		It("should not take the lock", func() {
-			Expect(iptLock.WasTaken).To(BeFalse())
 		})
 	})
 }
@@ -1820,38 +1955,35 @@ var _ = Describe("Insert early rules (nft)", func() {
 func describeInsertEarlyRules(dataplaneMode string) {
 	var dataplane *testutils.MockDataplane
 	var table *Table
-	var iptLock *mockMutex
 	var featureDetector *environment.FeatureDetector
 	BeforeEach(func() {
 		dataplane = testutils.NewMockDataplane("filter", map[string][]string{
 			"FORWARD": {"-m comment --comment \"some rule\""},
 		}, dataplaneMode)
-		iptLock = &mockMutex{}
 		featureDetector = environment.NewFeatureDetector(nil)
 		featureDetector.NewCmd = dataplane.NewCmd
 		featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
 		table = NewTable(
 			"filter",
 			4,
-			rules.RuleHashPrefix,
-			iptLock,
+			rulesdefs.RuleHashPrefix,
 			featureDetector,
 			TableOptions{
-				HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
+				HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
 				NewCmdOverride:        dataplane.NewCmd,
 				SleepOverride:         dataplane.Sleep,
 				NowOverride:           dataplane.Now,
 				BackendMode:           dataplaneMode,
 				LookPathOverride:      testutils.LookPathNoLegacy,
-				OpRecorder:            logutils.NewSummarizer("test loop"),
+				OpRecorder:            logrusr.NewSummarizer("test loop"),
 			},
 		)
 	})
 
 	It("should insert rules immediately without Apply", func() {
-		rls := []Rule{
-			{Action: DropAction{}, Comment: []string{"my rule"}},
-			{Action: AcceptAction{}, Comment: []string{"my other rule"}},
+		rls := []generictables.Rule{
+			{Match: Match(), Action: DropAction{}, Comment: []string{"my rule"}},
+			{Match: Match(), Action: AcceptAction{}, Comment: []string{"my other rule"}},
 		}
 
 		hashes := CalculateRuleHashes("FORWARD", rls, featureDetector.GetFeatures())
@@ -1861,9 +1993,9 @@ func describeInsertEarlyRules(dataplaneMode string) {
 
 		Expect(dataplane.Chains).To(Equal(map[string][]string{
 			"FORWARD": {
-				"-m comment --comment \"" + rules.RuleHashPrefix + hashes[0] +
+				"-m comment --comment \"" + rulesdefs.RuleHashPrefix + hashes[0] +
 					"\" -m comment --comment \"my rule\" --jump DROP",
-				"-m comment --comment \"" + rules.RuleHashPrefix + hashes[1] +
+				"-m comment --comment \"" + rulesdefs.RuleHashPrefix + hashes[1] +
 					"\" -m comment --comment \"my other rule\" --jump ACCEPT",
 				"-m comment --comment \"some rule\"",
 			},
@@ -1871,9 +2003,9 @@ func describeInsertEarlyRules(dataplaneMode string) {
 	})
 
 	It("should find out if rules already present", func() {
-		rls := []Rule{
-			{Action: DropAction{}, Comment: []string{"my rule"}},
-			{Action: AcceptAction{}, Comment: []string{"my other rule"}},
+		rls := []generictables.Rule{
+			{Match: Match(), Action: DropAction{}, Comment: []string{"my rule"}},
+			{Match: Match(), Action: AcceptAction{}, Comment: []string{"my other rule"}},
 		}
 
 		hashes := CalculateRuleHashes("FORWARD", rls, featureDetector.GetFeatures())
@@ -1881,9 +2013,9 @@ func describeInsertEarlyRules(dataplaneMode string) {
 		// Init chains
 		dataplane.Chains = map[string][]string{
 			"FORWARD": {
-				"-m comment --comment \"" + rules.RuleHashPrefix + hashes[0] +
+				"-m comment --comment \"" + rulesdefs.RuleHashPrefix + hashes[0] +
 					"\" -m comment --comment \"my rule\" --jump DROP",
-				"-m comment --comment \"" + rules.RuleHashPrefix + hashes[1] +
+				"-m comment --comment \"" + rulesdefs.RuleHashPrefix + hashes[1] +
 					"\" -m comment --comment \"my other rule\" --jump ACCEPT",
 				"-m comment --comment \"some rule\"",
 			},
@@ -1895,22 +2027,132 @@ func describeInsertEarlyRules(dataplaneMode string) {
 	})
 }
 
-type mockMutex struct {
-	Held     bool
-	WasTaken bool
-}
+var _ = Describe("Table in cleanup-only mode", func() {
+	var dataplane *testutils.MockDataplane
+	var table *Table
 
-func (m *mockMutex) Lock() {
-	if m.Held {
-		Fail("Mutex already held")
+	newTableWithRefresh := func(cleanupOnly bool, refreshInterval time.Duration) *Table {
+		featureDetector := environment.NewFeatureDetector(nil)
+		featureDetector.NewCmd = dataplane.NewCmd
+		featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
+		return NewTable("filter", 4, rulesdefs.RuleHashPrefix, featureDetector, TableOptions{
+			HistoricChainPrefixes: rulesdefs.AllHistoricChainNamePrefixes,
+			RefreshInterval:       refreshInterval,
+			CleanupOnly:           cleanupOnly,
+			NewCmdOverride:        dataplane.NewCmd,
+			SleepOverride:         dataplane.Sleep,
+			NowOverride:           dataplane.Now,
+			LookPathOverride:      testutils.LookPathAll,
+			OpRecorder:            logrusr.NewSummarizer("test loop"),
+		})
 	}
-	m.Held = true
-	m.WasTaken = true
-}
 
-func (m *mockMutex) Unlock() {
-	if !m.Held {
-		Fail("Mutex not held")
+	newTable := func(cleanupOnly bool) *Table {
+		return newTableWithRefresh(cleanupOnly, 30*time.Second)
 	}
-	m.Held = false
-}
+
+	BeforeEach(func() {
+		dataplane = testutils.NewMockDataplane("filter", map[string][]string{
+			"FORWARD": {},
+		}, "legacy")
+	})
+
+	// A cleanup-only table names a backend that may have no kernel support, so an unreadable
+	// dataplane means there is nothing of ours there, not that Felix should die.
+	It("reschedules instead of panicking when the backend can't be read", func() {
+		dataplane.FailAllSaves = true
+		table = newTable(true)
+
+		var delay time.Duration
+		Expect(func() { delay = table.Apply() }).NotTo(Panic())
+		Expect(delay).To(Equal(30 * time.Second))
+	})
+
+	It("doesn't retry an unreadable backend until the next refresh", func() {
+		dataplane.FailAllSaves = true
+		table = newTable(true)
+		table.Apply()
+
+		saves := len(dataplane.CmdNames)
+		table.Apply()
+		Expect(dataplane.CmdNames).To(HaveLen(saves), "retried before the refresh interval was up")
+
+		dataplane.AdvanceTimeBy(31 * time.Second)
+		table.Apply()
+		Expect(len(dataplane.CmdNames)).To(BeNumerically(">", saves))
+	})
+
+	// Zero disables the periodic refresh, but a zero reschedule means the dataplane loop never
+	// comes back to us, so cleanup would stop for good on an idle node.
+	It("still reschedules with the refresh interval disabled", func() {
+		dataplane.FailAllSaves = true
+		table = newTableWithRefresh(true, 0)
+
+		// Matches defaultCleanupRetryInterval, which this external test package can't see.
+		const retryInterval = 180 * time.Second
+		Expect(table.Apply()).To(Equal(retryInterval))
+
+		saves := len(dataplane.CmdNames)
+		table.Apply()
+		Expect(dataplane.CmdNames).To(HaveLen(saves), "retried before the retry interval was up")
+
+		dataplane.AdvanceTimeBy(retryInterval + time.Second)
+		table.Apply()
+		Expect(len(dataplane.CmdNames)).To(BeNumerically(">", saves))
+	})
+
+	It("panics when a table it programs can't be read", func() {
+		dataplane.FailAllSaves = true
+		table = newTable(false)
+
+		Expect(func() { table.Apply() }).To(Panic())
+	})
+
+	// A cleanup-only table shares ip_version and table with the table Felix programs, so anything
+	// it publishes lands on the real table's series.
+	It("leaves the shared metrics alone", func() {
+		chainsGauge := func() (float64, bool) {
+			families, err := prometheus.DefaultGatherer.Gather()
+			Expect(err).NotTo(HaveOccurred())
+			for _, family := range families {
+				if family.GetName() != "felix_iptables_chains" {
+					continue
+				}
+				for _, metric := range family.GetMetric() {
+					labels := map[string]string{}
+					for _, l := range metric.GetLabel() {
+						labels[l.GetName()] = l.GetValue()
+					}
+					if labels["ip_version"] == "4" && labels["table"] == "filter" {
+						return metric.GetGauge().GetValue(), true
+					}
+				}
+			}
+			return 0, false
+		}
+
+		before, foundBefore := chainsGauge()
+
+		dataplane.Chains = map[string][]string{
+			"FORWARD":      {},
+			"cali-FORWARD": {},
+		}
+		table = newTable(true)
+		table.Apply()
+
+		after, foundAfter := chainsGauge()
+		Expect(foundAfter).To(Equal(foundBefore))
+		Expect(after).To(Equal(before))
+	})
+
+	It("still cleans up once the backend can be read", func() {
+		dataplane.Chains = map[string][]string{
+			"FORWARD":      {},
+			"cali-FORWARD": {},
+		}
+		table = newTable(true)
+		table.Apply()
+
+		Expect(dataplane.Chains).NotTo(HaveKey("cali-FORWARD"))
+	})
+})

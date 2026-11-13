@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,22 +23,34 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/bpf/bpfutils"
+	"github.com/projectcalico/calico/felix/bpf/utils"
 )
 
-// #cgo CFLAGS: -I${SRCDIR}/../../bpf-gpl/include/libbpf/src -I${SRCDIR}/../../bpf-gpl/include/libbpf/include/uapi -I${SRCDIR}/../../bpf-gpl -Werror
-// #cgo amd64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/include/libbpf/src/amd64 -lbpf -lelf -lz
-// #cgo arm64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/include/libbpf/src/arm64 -lbpf -lelf -lz
+// #cgo CFLAGS: -I${SRCDIR}/../../bpf-gpl/libbpf/src -I${SRCDIR}/../../bpf-gpl/libbpf/include/uapi -I${SRCDIR}/../../bpf-gpl -Werror
+// #cgo amd64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/amd64 -lbpf -lelf -lz
+// #cgo arm64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/arm64 -lbpf -lelf -lz
+// #cgo ppc64le LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/ppc64le -lbpf -lelf -lz
+// #cgo s390x LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/s390x -lbpf -lelf -lz
 // #include "libbpf_api.h"
 import "C"
 
 type Obj struct {
-	obj *C.struct_bpf_object
+	filename string
+	obj      *C.struct_bpf_object
+}
+
+func (o *Obj) Filename() string {
+	return o.filename
 }
 
 type Map struct {
 	bpfMap *C.struct_bpf_map
 	bpfObj *C.struct_bpf_object
+}
+
+type Program struct {
+	bpfProg *C.struct_bpf_program
+	bpfObj  *C.struct_bpf_object
 }
 
 type QdiskHook string
@@ -101,14 +113,40 @@ func (m *Map) IsJumpMap() bool {
 }
 
 func OpenObject(filename string) (*Obj, error) {
-	bpfutils.IncreaseLockedMemoryQuota()
+	utils.IncreaseLockedMemoryQuota()
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 	obj, err := C.bpf_obj_open(cFilename)
 	if obj == nil || err != nil {
 		return nil, fmt.Errorf("error opening libbpf object %w", err)
 	}
-	return &Obj{obj: obj}, nil
+
+	return &Obj{
+		filename: filename,
+		obj:      obj,
+	}, nil
+}
+
+func OpenObjectWithLogBuffer(filename string, buf []byte) (*Obj, error) {
+	if len(buf) == 0 {
+		return OpenObject(filename)
+	}
+
+	utils.IncreaseLockedMemoryQuota()
+	cFilename := C.CString(filename)
+
+	cBuf := (*C.char)(unsafe.Pointer(&buf[0]))
+
+	defer C.free(unsafe.Pointer(cFilename))
+	obj, err := C.bpf_obj_open_log_buf(cFilename, cBuf, C.size_t(len(buf)))
+	if obj == nil || err != nil {
+		return nil, fmt.Errorf("error opening libbpf object %w", err)
+	}
+
+	return &Obj{
+		filename: filename,
+		obj:      obj,
+	}, nil
 }
 
 func (o *Obj) Load() error {
@@ -117,6 +155,14 @@ func (o *Obj) Load() error {
 		return fmt.Errorf("error loading object %w", err)
 	}
 	return nil
+}
+
+// SetProgramAutoload sets whether a program should be automatically loaded.
+// When set to false, the program will not be loaded when Load() is called.
+func (o *Obj) SetProgramAutoload(progName string, autoload bool) {
+	cProgName := C.CString(progName)
+	defer C.free(unsafe.Pointer(cProgName))
+	C.bpf_set_program_autoload(o.obj, cProgName, C.bool(autoload))
 }
 
 // FirstMap returns first bpf map of the object.
@@ -140,6 +186,35 @@ func (m *Map) NextMap() (*Map, error) {
 		return nil, nil
 	}
 	return &Map{bpfMap: bpfMap, bpfObj: m.bpfObj}, nil
+}
+
+func (o *Obj) FirstProgram() (*Program, error) {
+	bpfProg, err := C.bpf_object__next_program(o.obj, nil)
+	if bpfProg == nil || err != nil {
+		return nil, fmt.Errorf("error getting first program %w", err)
+	}
+	return &Program{bpfProg: bpfProg, bpfObj: o.obj}, nil
+}
+
+func (p *Program) NextProgram() (*Program, error) {
+	{
+		bpfProg, err := C.bpf_object__next_program(p.bpfObj, p.bpfProg)
+		if err != nil {
+			return nil, fmt.Errorf("error getting next program %w", err)
+		}
+		if bpfProg == nil {
+			return nil, nil
+		}
+		return &Program{bpfProg: bpfProg, bpfObj: p.bpfObj}, nil
+	}
+}
+
+func (p *Program) Name() string {
+	name := C.bpf_program__name(p.bpfProg)
+	if name == nil {
+		return ""
+	}
+	return C.GoString(name)
 }
 
 func (o *Obj) ProgramFD(secname string) (int, error) {
@@ -166,23 +241,96 @@ func DetachClassifier(ifindex, handle, pref int, ingress bool) error {
 	return err
 }
 
+func (o *Obj) SetAttachType(progName string, attachType uint32) error {
+	cProgName := C.CString(progName)
+	defer C.free(unsafe.Pointer(cProgName))
+	_, err := C.bpf_set_attach_type(o.obj, cProgName, C.uint(attachType))
+	return err
+}
+
+func ProgQueryTcx(ifindex int, ingress bool) ([64]uint32, [64]uint32, uint32, error) {
+	attachType := C.BPF_TCX_EGRESS
+	if ingress {
+		attachType = C.BPF_TCX_INGRESS
+	}
+	return progQuery(ifindex, attachType)
+}
+
+// ProgQueryNetkit lists the programs attached to a netkit device's peer or
+// primary side.
+func ProgQueryNetkit(ifindex int, peer bool) ([64]uint32, [64]uint32, uint32, error) {
+	attachType := C.BPF_NETKIT_PRIMARY
+	if peer {
+		attachType = C.BPF_NETKIT_PEER
+	}
+	return progQuery(ifindex, attachType)
+}
+
+func progQuery(ifindex, attachType int) ([64]uint32, [64]uint32, uint32, error) {
+	var progIds, attachFlags [64]uint32
+	progCnt := uint32(64)
+	_, err := C.bpf_program_query(C.int(ifindex), C.int(attachType), 0,
+		(*C.uint)(unsafe.Pointer(&attachFlags[0])),
+		(*C.uint)(unsafe.Pointer(&progIds[0])),
+		(*C.uint)(unsafe.Pointer(&progCnt)))
+	return progIds, attachFlags, progCnt, err
+}
+
+func ProgName(id uint32) (string, error) {
+	buf := make([]byte, C.BPF_OBJ_NAME_LEN)
+	_, err := C.bpf_get_prog_name(C.uint(id), (*C.char)(unsafe.Pointer(&buf[0])))
+	return string(buf), err
+}
+
 // AttachClassifier return the program id and pref and handle of the qdisc
-func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, int, error) {
+func (o *Obj) AttachClassifier(secName, ifName string, ingress bool, prio int, handle uint32) error {
 	cSecName := C.CString(secName)
 	cIfName := C.CString(ifName)
 	defer C.free(unsafe.Pointer(cSecName))
 	defer C.free(unsafe.Pointer(cIfName))
 	ifIndex, err := C.if_nametoindex(cIfName)
 	if err != nil {
-		return -1, -1, -1, err
+		return err
 	}
 
-	ret, err := C.bpf_tc_program_attach(o.obj, cSecName, C.int(ifIndex), C.bool(ingress))
+	_, err = C.bpf_tc_program_attach(o.obj, cSecName, C.int(ifIndex), C.bool(ingress), C.int(prio), C.uint(handle))
 	if err != nil {
-		return -1, -1, -1, fmt.Errorf("error attaching tc program %w", err)
+		return fmt.Errorf("error attaching tc program %w", err)
 	}
 
-	return int(ret.prog_id), int(ret.priority), int(ret.handle), nil
+	return nil
+}
+
+func (o *Obj) AttachTCX(secName, ifName string) (*Link, error) {
+	cSecName := C.CString(secName)
+	cIfName := C.CString(ifName)
+	defer C.free(unsafe.Pointer(cSecName))
+	defer C.free(unsafe.Pointer(cIfName))
+	ifIndex, err := C.if_nametoindex(cIfName)
+	if err != nil {
+		return nil, fmt.Errorf("error get ifindex for %s:%w", ifName, err)
+	}
+	link, err := C.bpf_tcx_program_attach(o.obj, cSecName, C.int(ifIndex))
+	if err != nil {
+		return nil, fmt.Errorf("error attaching tcx program %w", err)
+	}
+	return &Link{link: link}, nil
+}
+
+func (o *Obj) AttachNetkit(secName, ifName string) (*Link, error) {
+	cSecName := C.CString(secName)
+	cIfName := C.CString(ifName)
+	defer C.free(unsafe.Pointer(cSecName))
+	defer C.free(unsafe.Pointer(cIfName))
+	ifIndex, err := C.if_nametoindex(cIfName)
+	if err != nil {
+		return nil, fmt.Errorf("error getting ifindex for %s: %w", ifName, err)
+	}
+	link, err := C.bpf_netkit_program_attach(o.obj, cSecName, C.int(ifIndex))
+	if err != nil {
+		return nil, fmt.Errorf("error attaching netkit program: %w", err)
+	}
+	return &Link{link: link}, nil
 }
 
 func (o *Obj) AttachXDP(ifName, progName string, oldID int, mode uint) (int, error) {
@@ -302,6 +450,48 @@ func (l *Link) Close() error {
 	return fmt.Errorf("link nil")
 }
 
+func (l *Link) Pin(path string) error {
+	if l.link == nil {
+		return fmt.Errorf("link nil")
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	errno := C.bpf_link__pin(l.link, cPath)
+	if errno != 0 {
+		return fmt.Errorf("failed to pin link to %s: %w", path, syscall.Errno(errno))
+	}
+	return nil
+}
+
+func OpenLink(path string) (*Link, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	link, err := C.bpf_link_open(cPath)
+	if err != nil {
+		return nil, err
+	}
+	return &Link{link: link}, nil
+}
+
+func (l *Link) Detach() error {
+	errno := C.bpf_link__detach(l.link)
+	if errno != 0 {
+		return fmt.Errorf("failed to detach link %w", syscall.Errno(errno))
+	}
+	return nil
+}
+
+func (l *Link) Update(obj *Obj, progName string) error {
+	cProgName := C.CString(progName)
+	defer C.free(unsafe.Pointer(cProgName))
+
+	_, err := C.bpf_update_link(l.link, obj.obj, cProgName)
+	if err != nil {
+		return fmt.Errorf("error updating link %w", err)
+	}
+	return nil
+}
+
 func CreateQDisc(ifName string) error {
 	cIfName := C.CString(ifName)
 	defer C.free(unsafe.Pointer(cIfName))
@@ -364,94 +554,137 @@ func (o *Obj) AttachCGroup(cgroup, progName string) (*Link, error) {
 
 	link, err := C.bpf_program_attach_cgroup(o.obj, C.int(fd), cProgName)
 	if err != nil {
-		link = nil
-		_, err2 := C.bpf_program_attach_cgroup_legacy(o.obj, C.int(fd), cProgName)
-		if err2 != nil {
-			return nil, fmt.Errorf("failed to attach %s to cgroup %s (legacy try %s): %w",
-				progName, cgroup, err2, err)
-		}
+		return nil, fmt.Errorf("failed to attach %s to cgroup %s : %w",
+			progName, cgroup, err)
 	}
-
 	return &Link{link: link}, nil
 }
 
 const (
-	// Set when IPv6 is enabled to configure bpf dataplane accordingly
-	GlobalsRPFOptionEnabled uint32 = C.CALI_GLOBALS_RPF_OPTION_ENABLED
-	GlobalsRPFOptionStrict  uint32 = C.CALI_GLOBALS_RPF_OPTION_STRICT
-	GlobalsNoDSRCidrs       uint32 = C.CALI_GLOBALS_NO_DSR_CIDRS
-	GlobalsLoUDPOnly        uint32 = C.CALI_GLOBALS_LO_UDP_ONLY
+	GlobalsIfaceEncaps                   uint32 = C.CALI_GLOBALS_IFACE_ENCAPS
+	GlobalsRPFOptionEnabled              uint32 = C.CALI_GLOBALS_RPF_OPTION_ENABLED
+	GlobalsRPFOptionStrict               uint32 = C.CALI_GLOBALS_RPF_OPTION_STRICT
+	GlobalsNoDSRCidrs                    uint32 = C.CALI_GLOBALS_NO_DSR_CIDRS
+	GlobalsLoUDPOnly                     uint32 = C.CALI_GLOBALS_LO_UDP_ONLY
+	GlobalsRedirectPeer                  uint32 = C.CALI_GLOBALS_REDIRECT_PEER
+	GlobalsFlowLogsEnabled               uint32 = C.CALI_GLOBALS_FLOWLOGS_ENABLED
+	GlobalsNATOutgoingExcludeHosts       uint32 = C.CALI_GLOBALS_NATOUTGOING_EXCLUDE_HOSTS
+	GlobalsSkipEgressRedirect            uint32 = C.CALI_GLOBALS_SKIP_EGRESS_REDIRECT
+	GlobalsIngressPacketRateConfigured   uint32 = C.CALI_GLOBALS_INGRESS_PACKET_RATE_CONFIGURED
+	GlobalsEgressPacketRateConfigured    uint32 = C.CALI_GLOBALS_EGRESS_PACKET_RATE_CONFIGURED
+	GlobalsWorkloadSrcSpoofingConfigured uint32 = C.CALI_GLOBALS_WORKLOAD_SRC_SPOOFING_CONFIGURED
+	GlobalsUDPGSOLinearize               uint32 = C.CALI_GLOBALS_UDP_GSO_LINEARIZE
+	GlobalsIngressConnLimitConfigured    uint32 = C.CALI_GLOBALS_INGRESS_CONN_LIMIT_CONFIGURED
+	GlobalsEgressConnLimitConfigured     uint32 = C.CALI_GLOBALS_EGRESS_CONN_LIMIT_CONFIGURED
+
+	AttachTypeTcxIngress uint32 = C.BPF_TCX_INGRESS
+	AttachTypeTcxEgress  uint32 = C.BPF_TCX_EGRESS
+	AttachTypeXDP        uint32 = C.BPF_XDP
+
+	AttachTypeNetkitPrimary uint32 = C.BPF_NETKIT_PRIMARY
+	AttachTypeNetkitPeer    uint32 = C.BPF_NETKIT_PEER
 )
 
-func TcSetGlobals(
-	m *Map,
-	globalData *TcGlobalData,
-) error {
-
-	cName := C.CString(globalData.IfaceName)
+func (t *TcGlobalData) Set(m *Map) error {
+	cName := C.CString(t.IfaceName)
 	defer C.free(unsafe.Pointer(cName))
 
-	cJumps := make([]C.uint, len(globalData.Jumps))
+	cJumps := make([]C.uint, len(t.Jumps))
 
-	for i, v := range globalData.Jumps {
+	for i, v := range t.Jumps {
 		cJumps[i] = C.uint(v)
 	}
 
-	cJumpsV6 := make([]C.uint, len(globalData.JumpsV6))
+	cJumpsV6 := make([]C.uint, len(t.JumpsV6))
 
-	for i, v := range globalData.JumpsV6 {
+	for i, v := range t.JumpsV6 {
 		cJumpsV6[i] = C.uint(v)
 	}
 
 	_, err := C.bpf_tc_set_globals(m.bpfMap,
 		cName,
-		(*C.char)(unsafe.Pointer(&globalData.HostIPv4[0])),
-		(*C.char)(unsafe.Pointer(&globalData.IntfIPv4[0])),
-		(*C.char)(unsafe.Pointer(&globalData.HostIPv6[0])),
-		(*C.char)(unsafe.Pointer(&globalData.IntfIPv6[0])),
-		C.uint(globalData.ExtToSvcMark),
-		C.ushort(globalData.Tmtu),
-		C.ushort(globalData.VxlanPort),
-		C.ushort(globalData.PSNatStart),
-		C.ushort(globalData.PSNatLen),
-		(*C.char)(unsafe.Pointer(&globalData.HostTunnelIPv4[0])),
-		(*C.char)(unsafe.Pointer(&globalData.HostTunnelIPv6[0])),
-		C.uint(globalData.Flags),
-		C.ushort(globalData.WgPort),
-		C.ushort(globalData.Wg6Port),
-		C.uint(globalData.NatIn),
-		C.uint(globalData.NatOut),
-		C.uint(globalData.LogFilterJmp),
+		(*C.char)(unsafe.Pointer(&t.HostIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.IntfIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.HostIPv6[0])),
+		(*C.char)(unsafe.Pointer(&t.IntfIPv6[0])),
+		(*C.char)(unsafe.Pointer(&t.HostTunnelIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.HostTunnelIPv6[0])),
+		C.uint(t.ExtToSvcMark),
+		C.ushort(t.Tmtu),
+		C.ushort(t.VxlanPort),
+		C.ushort(t.VxlanSrcPortMin),
+		C.ushort(t.VxlanSrcPortMax),
+		C.ushort(t.PSNatStart),
+		C.ushort(t.PSNatLen),
+		C.uint(t.Flags),
+		C.ushort(t.WgPort),
+		C.ushort(t.Wg6Port),
+		C.ushort(t.Profiling),
+		C.uint(t.NatIn),
+		C.uint(t.NatOut),
+		C.uint(t.OverlayTunnelID),
+		C.uint(t.LogFilterJmp),
 		&cJumps[0], // it is safe because we hold the reference here until we return.
 		&cJumpsV6[0],
+		C.short(t.DSCP),
+		C.short(t.IstioDSCP),
+		C.uint(t.MaglevLUTSize),
+		C.uint(t.IPFragTimeout),
+		C.uint(t.HostIfindex),
 	)
 
 	return err
 }
 
-func CTLBSetGlobals(m *Map, udpNotSeen time.Duration, excludeUDP bool) error {
-	udpNotSeen /= time.Second // Convert to seconds
-	_, err := C.bpf_ctlb_set_globals(m.bpfMap, C.uint(udpNotSeen), C.bool(excludeUDP))
+func (c *CTCleanupGlobalData) Set(m *Map) error {
+	_, err := C.bpf_ct_cleanup_set_globals(
+		m.bpfMap,
+		C.uint64_t(c.CreationGracePeriod.Nanoseconds()),
+
+		C.uint64_t(c.TCPSynSent.Nanoseconds()),
+		C.uint64_t(c.TCPEstablished.Nanoseconds()),
+		C.uint64_t(c.TCPFinsSeen.Nanoseconds()),
+		C.uint64_t(c.TCPResetSeen.Nanoseconds()),
+
+		C.uint64_t(c.UDPTimeout.Nanoseconds()),
+		C.uint64_t(c.GenericTimeout.Nanoseconds()),
+		C.uint64_t(c.ICMPTimeout.Nanoseconds()),
+	)
+	return err
+}
+
+func (c *CTLBGlobalData) Set(m *Map) error {
+	udpNotSeen := c.UDPNotSeen / time.Second // Convert to seconds
+	_, err := C.bpf_ctlb_set_globals(m.bpfMap, C.uint(udpNotSeen), C.bool(c.ExcludeUDP))
 
 	return err
 }
 
-func XDPSetGlobals(
-	m *Map,
-	globalData *XDPGlobalData,
-) error {
+// SetProgFlags writes the per-object load-time feature flags into the
+// program's .rodata.prog_flags section before load (see struct
+// prog_flags in globals.h).
+func (m *Map) SetProgFlags(noTracePrintk bool) error {
+	var noTrace C.uint8_t
+	if noTracePrintk {
+		noTrace = 1
+	}
+	_, err := C.bpf_set_prog_flags(m.bpfMap, noTrace)
 
-	cName := C.CString(globalData.IfaceName)
+	return err
+}
+
+func (x *XDPGlobalData) Set(m *Map) error {
+	cName := C.CString(x.IfaceName)
 	defer C.free(unsafe.Pointer(cName))
 
-	cJumps := make([]C.uint, len(globalData.Jumps))
-	cJumpsV6 := make([]C.uint, len(globalData.Jumps))
+	cJumps := make([]C.uint, len(x.Jumps))
+	cJumpsV6 := make([]C.uint, len(x.Jumps))
 
-	for i, v := range globalData.Jumps {
+	for i, v := range x.Jumps {
 		cJumps[i] = C.uint(v)
 	}
 
-	for i, v := range globalData.JumpsV6 {
+	for i, v := range x.JumpsV6 {
 		cJumpsV6[i] = C.uint(v)
 	}
 	_, err := C.bpf_xdp_set_globals(m.bpfMap,
@@ -466,7 +699,7 @@ func XDPSetGlobals(
 func NumPossibleCPUs() (int, error) {
 	ncpus := int(C.num_possible_cpu())
 	if ncpus < 0 {
-		return ncpus, fmt.Errorf("Invalid number of CPUs: %d", ncpus)
+		return ncpus, fmt.Errorf("invalid number of CPUs: %d", ncpus)
 	}
 	return ncpus, nil
 }
@@ -487,4 +720,67 @@ func ObjGet(path string) (int, error) {
 	fd, err := C.bpf_obj_get(cPath)
 
 	return int(fd), err
+}
+
+// MapUpdateBatch expects all keys, values in a single slice, bytes of a one
+// key/value appended back to back to the previous value.
+func MapUpdateBatch(fd int, k, v []byte, count int, flags uint64) (int, error) {
+	cK := C.CBytes(k)
+	defer C.free(cK)
+	cV := C.CBytes(v)
+	defer C.free(cV)
+
+	_, err := C.bpf_map_batch_update(C.int(fd), cK, cV, (*C.__u32)(unsafe.Pointer(&count)), C.__u64(flags))
+
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+var bpfMapTypeMap = map[string]int{
+	"unspec":           0,
+	"hash":             1,
+	"array":            2,
+	"prog_array":       3,
+	"perf_event_array": 4,
+	"percpu_hash":      5,
+	"percpu_array":     6,
+	"lru_hash":         9,
+	"lpm_trie":         11,
+	"ringbuf":          27,
+}
+
+func CreateBPFMap(mapType string, keySize int, valueSize int, maxEntries int, flags int, name string) (int, error) {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	fd := C.create_bpf_map(
+		C.enum_bpf_map_type(bpfMapTypeMap[mapType]),
+		C.uint(keySize),
+		C.uint(valueSize),
+		C.uint(maxEntries),
+		C.uint(flags),
+		cname,
+	)
+	if fd < 0 {
+		return int(fd), fmt.Errorf("failed to create bpf map")
+	}
+	return int(fd), nil
+}
+
+// MapDeleteBatch expects all key is in a single slice, bytes of a one
+// key appended back to back to the previous value.
+func MapDeleteBatch(fd int, k []byte, count int, flags uint64) (int, error) {
+	cK := C.CBytes(k)
+	defer C.free(cK)
+
+	_, err := C.bpf_map_batch_delete(C.int(fd), cK, (*C.__u32)(unsafe.Pointer(&count)), C.__u64(flags))
+
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }

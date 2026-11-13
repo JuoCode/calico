@@ -36,17 +36,29 @@ const (
 	XDPMaxEntries     = XDPMaxEntryPoints * MaxSubPrograms
 )
 
-var MapParameters = maps.MapParameters{
+var IngressMapParameters = maps.MapParameters{
 	Type:       "prog_array",
 	KeySize:    4,
 	ValueSize:  4,
 	MaxEntries: TCMaxEntries,
-	Name:       "cali_jump",
-	Version:    3,
+	Name:       "cali_jump_ing",
+	Version:    2,
 }
 
-func Map() maps.Map {
-	return maps.NewPinnedMap(MapParameters)
+var EgressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_jump_egr",
+	Version:    2,
+}
+
+func Maps() []maps.Map {
+	return []maps.Map{
+		maps.NewPinnedMap(IngressMapParameters),
+		maps.NewPinnedMap(EgressMapParameters),
+	}
 }
 
 var XDPMapParameters = maps.MapParameters{
@@ -60,6 +72,35 @@ var XDPMapParameters = maps.MapParameters{
 
 func XDPMap() maps.Map {
 	return maps.NewPinnedMap(XDPMapParameters)
+}
+
+// Netkit maps are identical to TC maps but pinned to a separate directory
+// so that netkit-attached programs (which have a different expected_attach_type)
+// get their own prog_array instances. The kernel requires all programs in a
+// prog_array to share the same expected_attach_type.
+var NetkitIngressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_j_nk_ing",
+	Version:    2,
+}
+
+var NetkitEgressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_j_nk_egr",
+	Version:    2,
+}
+
+func NetkitMaps() []maps.Map {
+	return []maps.Map{
+		maps.NewPinnedMap(NetkitIngressMapParameters),
+		maps.NewPinnedMap(NetkitEgressMapParameters),
+	}
 }
 
 func Key(idx int) []byte {

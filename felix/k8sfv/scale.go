@@ -19,7 +19,7 @@ import (
 	"math/rand"
 	"strconv"
 
-	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -45,7 +45,7 @@ func addEndpoints(
 	numEndpoints int,
 ) {
 	//last_time = time.Now()
-	for i := 0; i < numEndpoints; i++ {
+	for i := range numEndpoints {
 		endpoint_id := fmt.Sprintf("endpoint_%d", i+1)
 
 		ip := fmt.Sprintf("%d.%d.%d.%d",
@@ -72,14 +72,14 @@ func addEndpoints(
 		})
 	}
 
-	Eventually(getNumEndpointsDefault(-1), "30s", "1s").Should(
-		BeNumerically("==", numEndpoints),
+	gomega.Eventually(getNumEndpointsDefault(-1), "30s", "1s").Should(
+		gomega.BeNumerically("==", numEndpoints),
 		"Addition of pods wasn't reflected in Felix metrics",
 	)
 }
 
 func addNamespaces(clientset *kubernetes.Clientset, nsPrefix string) {
-	for ii := 0; ii < 1000; ii++ {
+	for ii := range 1000 {
 		nsName := fmt.Sprintf("%s-%03d", nsPrefix, ii%1000)
 		createNamespace(clientset, nsName, nil)
 	}

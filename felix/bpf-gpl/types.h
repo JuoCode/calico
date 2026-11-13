@@ -1,26 +1,30 @@
 // Project Calico BPF dataplane programs.
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
-#ifndef __CALI_BPF_TYPES_H__
-#define __CALI_BPF_TYPES_H__
+#ifndef __CALI_TYPES_H__
+#define __CALI_TYPES_H__
 
-#include <linux/types.h>
 #include <linux/bpf.h>
-#include <linux/pkt_cls.h>
-#ifdef IPVER6
-#include <linux/ipv6.h>
-#include <linux/icmpv6.h>
-#else
-#include <linux/ip.h>
-#include <linux/icmp.h>
-#endif
-#include <linux/tcp.h>
+#include <linux/if_ether.h>
 #include <linux/in.h>
+#include <linux/pkt_cls.h>
+#include <linux/tcp.h>
+#include <linux/types.h>
 #include <linux/udp.h>
-#include "bpf.h"
-#include "arp.h"
+#ifdef IPVER6
+#include <linux/icmpv6.h>
+#include <linux/ipv6.h>
+#else
+#include <linux/icmp.h>
+#include <linux/ip.h>
+#endif
+
+#include "cali_bpf.h"
 #include "conntrack_types.h"
+#include "events_type.h"
+#include "globals.h"
+#include "ip_addr.h"
 #include "nat_types.h"
 #include "reasons.h"
 
@@ -38,13 +42,23 @@
 #define UDP_SIZE (sizeof(struct udphdr))
 #define TCP_SIZE (sizeof(struct tcphdr))
 
+struct fwd {
+	int res;
+	__u32 mark;
+	enum calico_reason reason;
+	__u32 fib_flags;
+	bool fib;
+};
+
 #define MAX_RULE_IDS    32
 
 // struct cali_tc_state holds state that is passed between the BPF programs.
 // WARNING: must be kept in sync with
 // - the definitions in bpf/polprog/pol_prog_builder.go.
 // - the Go version of the struct in bpf/state/map.go
+// - the event handling logic in bpf/events/collector_policy_listener.go.
 struct cali_tc_state {
+	struct event_header eventhdr;
 	/* Initial IP read from the packet, updated to host's IP when doing NAT encap/ICMP error.
 	 * updated when doing CALI_CT_ESTABLISHED_SNAT handling. Used for FIB lookup. */
 	DECLARE_IP_ADDR(ip_src);
@@ -102,7 +116,7 @@ struct cali_tc_state {
 
 	__u64 flags;
 	/* Result of the conntrack lookup. */
-	struct calico_ct_result ct_result; /* 28 bytes */
+	struct calico_ct_result ct_result; /* 32 bytes */
 
 	/* Result of the NAT calculation.  Zeroed if there is no DNAT. */
 	struct calico_nat_dest nat_dest; /* 8 bytes */
@@ -112,9 +126,10 @@ struct cali_tc_state {
 	 * appropriate conntrack entry.
 	 */
 	DECLARE_IP_ADDR(ip_src_masq);
-#ifndef IPVER6
-	__u8 __pad_ipv4[48];
-#endif
+
+	__u32 nat_svc_id;
+
+	struct fwd fwd;
 };
 
 struct pkt_scratch {
@@ -147,16 +162,27 @@ enum cali_state_flags {
 	CALI_ST_CT_NP_LOOP	  = 0x80,
 	/* CALI_ST_CT_NP_REMOTE is set when host is accessing a remote nodeport. */
 	CALI_ST_CT_NP_REMOTE	  = 0x100,
-};
-
-struct fwd {
-	int res;
-	__u32 mark;
-	enum calico_reason reason;
-#if CALI_FIB_ENABLED
-	__u32 fib_flags;
-	bool fib;
-#endif
+	/* CALI_ST_NAT_EXCLUDE is set when there is a NAT hit, but we don't want to resolve (such as node local DNS). */
+	CALI_ST_NAT_EXCLUDE       = 0x200,
+	/* CALI_ST_LOG_PACKET is set by policy program if a log rule was hit. */
+	CALI_ST_LOG_PACKET        = 0x400,
+	/* CALI_ST_SKIP_REDIR_PEER is set when the packet is destined to a local VM workload */
+	CALI_ST_SKIP_REDIR_PEER	  = 0x800,
+	/* CALI_ST_SKIP_REDIR_ONCE skips redirection once for this particular packet */
+	CALI_ST_SKIP_REDIR_ONCE   = 0x1000,
+	/* CALI_ST_SET_DSCP is set if we need to update packet's DSCP */
+	CALI_ST_SET_DSCP   = 0x2000,
+	/* CALI_ST_FIRST_FRAG is set if this packet is the first fragment of a fragmented IP packet */
+	CALI_ST_FIRST_FRAG        = 0x4000,
+	/* CALI_ST_NO_L4_HDR is set when the packet has no L4 header (non-first IP fragment),
+	 * so nothing may read one, NAT included. */
+	CALI_ST_NO_L4_HDR	  = 0x8000,
+	/* CALI_ST_RST_NO_CT is set when the RST rejects a flow that has no CT
+	 * entry (the egress reject), so the destination must not police it. */
+	CALI_ST_RST_NO_CT	  = 0x10000,
+	/* CALI_ST_HOST_ORIGIN is set when a to-workload packet came from the
+	 * host namespace. */
+	CALI_ST_HOST_ORIGIN	  = 0x20000,
 };
 
 struct cali_tc_ctx {
@@ -180,7 +206,6 @@ struct cali_tc_ctx {
   const volatile struct cali_xdp_globals *xdp_globals; /* XXX we must split the state between tc/xdp */
 #endif
   struct calico_nat_dest *nat_dest;
-  struct fwd fwd;
   void *counters;
   struct pkt_scratch *scratch;
 };
@@ -189,17 +214,24 @@ struct cali_tc_ctx {
 	struct cali_tc_ctx NAME = ({						\
 			struct cali_tc_state *state = state_get();		\
 			if (!state) {						\
-				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "State map lookup failed: DROP\n");	\
-				bpf_exit(TC_ACT_SHOT);				\
-			}							\
-			void * counters = counters_get(skb->ifindex);		\
-			if (!counters) {					\
-				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "no counters: DROP\n");		\
+				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "State map lookup failed: DROP");	\
 				bpf_exit(TC_ACT_SHOT);				\
 			}							\
 			struct cali_tc_globals *gl = state_get_globals_tc();	\
 			if (!gl) {						\
-				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "no globals: DROP\n");		\
+				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "no globals: DROP");		\
+				bpf_exit(TC_ACT_SHOT);				\
+			}							\
+			/* Use host_ifindex from globals for the counters lookup.  \
+			 * For netkit, skb->ifindex is the peer ifindex which      \
+			 * differs from the primary (host-side) ifindex that the   \
+			 * maps are keyed by. host_ifindex is always the primary.  \
+			 */							\
+			__u32 __ifindex = gl->data.host_ifindex ?		\
+				gl->data.host_ifindex : skb->ifindex;		\
+			void * counters = counters_get(__ifindex);		\
+			if (!counters) {					\
+				CALI_LOG_IF(CALI_LOG_LEVEL_DEBUG, "no counters for %d: DROP", __ifindex);	\
 				bpf_exit(TC_ACT_SHOT);				\
 			}							\
 			struct pkt_scratch *scratch = (void *)(gl->__scratch); 	\
@@ -302,4 +334,4 @@ static CALI_BPF_INLINE int l4_hdr_len(struct cali_tc_ctx *ctx)
 #define IP_SET(var, val) ((var) = (val))
 
 
-#endif /* __CALI_BPF_TYPES_H__ */
+#endif /* __CALI_TYPES_H__ */

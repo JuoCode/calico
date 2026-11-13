@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,78 +16,306 @@ package calc
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/google/btree"
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 )
 
 type PolicySorter struct {
-	Tier *TierInfo
+	tiers       map[string]*TierInfo
+	sortedTiers *btree.BTreeG[tierInfoKey]
 }
 
 func NewPolicySorter() *PolicySorter {
 	return &PolicySorter{
-		Tier: &TierInfo{
-			Name:           "default",
-			Policies:       make(map[model.PolicyKey]*model.Policy),
-			SortedPolicies: btree.NewG[PolKV](2, PolKVLess),
-		},
+		tiers:       make(map[string]*TierInfo),
+		sortedTiers: btree.NewG(2, TierLess),
 	}
 }
 
-func policyTypesEqual(pol1, pol2 *model.Policy) bool {
-	if pol1.Types == nil {
-		return pol2.Types == nil
+func (poc *PolicySorter) Sorted() []*TierInfo {
+	var tiers []*TierInfo
+	if poc.sortedTiers.Len() > 0 {
+		tiers = make([]*TierInfo, 0, len(poc.tiers))
+		poc.sortedTiers.Ascend(func(t tierInfoKey) bool {
+			if ti := poc.tiers[t.Name]; ti != nil {
+				if ti.SortedPolicies != nil {
+					ti.OrderedPolicies = make([]PolKV, 0, len(ti.Policies))
+					ti.SortedPolicies.Ascend(func(kv PolKV) bool {
+						ti.OrderedPolicies = append(ti.OrderedPolicies, kv)
+						return true
+					})
+				}
+				tiers = append(tiers, ti)
+				return true
+			} else {
+				// A key for a tier that isn't found in the map is highly unexpected so panic
+				logrus.WithField("name", t.Name).Panic("Bug: tier present in map but not the sorted tree.")
+				return false
+			}
+		})
 	}
-	if pol2.Types == nil {
-		return false
-	}
-	types1 := set.FromArray(pol1.Types)
-	types2 := set.FromArray(pol2.Types)
-	return types1.Equals(types2)
-}
-
-func (poc *PolicySorter) Sorted() *TierInfo {
-	poc.Tier.OrderedPolicies = make([]PolKV, 0, len(poc.Tier.Policies))
-	poc.Tier.SortedPolicies.Ascend(func(kv PolKV) bool {
-		poc.Tier.OrderedPolicies = append(poc.Tier.OrderedPolicies, kv)
-		return true
-	})
-	return poc.Tier
+	return tiers
 }
 
 func (poc *PolicySorter) OnUpdate(update api.Update) (dirty bool) {
 	switch key := update.Key.(type) {
+	case model.TierKey:
+		tierName := key.Name
+		logCxt := logrus.WithField("tierName", tierName)
+		tierInfo := poc.tiers[tierName]
+		if update.Value != nil {
+			newTier := update.Value.(*model.Tier)
+			logCxt.WithFields(logrus.Fields{
+				"order":         newTier.Order,
+				"defaultAction": newTier.DefaultAction,
+			}).Debug("Tier update")
+			if tierInfo == nil {
+				tierInfo = NewTierInfo(key.Name)
+				poc.tiers[tierName] = tierInfo
+				dirty = true
+			} else {
+				oldKey := tierInfoKey{
+					Name:  tierInfo.Name,
+					Order: tierInfo.Order,
+					Valid: tierInfo.Valid,
+				}
+				poc.sortedTiers.Delete(oldKey)
+			}
+			if tierInfo.Order != newTier.Order {
+				tierInfo.Order = newTier.Order
+				dirty = true
+			}
+			if tierInfo.DefaultAction != newTier.DefaultAction {
+				tierInfo.DefaultAction = newTier.DefaultAction
+				dirty = true
+			}
+			tierInfo.Valid = true
+			newKey := tierInfoKey{
+				Name:  tierInfo.Name,
+				Order: tierInfo.Order,
+				Valid: tierInfo.Valid,
+			}
+			poc.sortedTiers.ReplaceOrInsert(newKey)
+		} else {
+			// Deletion.
+			if tierInfo != nil {
+				oldKey := tierInfoKey{
+					Name:  tierInfo.Name,
+					Order: tierInfo.Order,
+					Valid: tierInfo.Valid,
+				}
+				poc.sortedTiers.Delete(oldKey)
+				tierInfo.Valid = false
+				tierInfo.Order = nil
+				if len(tierInfo.Policies) == 0 {
+					delete(poc.tiers, tierName)
+				} else {
+					// Add back so that sort order is maintained correctly after manipulating Valid and
+					// Order fields above
+					newKey := tierInfoKey{
+						Name:  tierInfo.Name,
+						Order: tierInfo.Order,
+						Valid: tierInfo.Valid,
+					}
+					poc.sortedTiers.ReplaceOrInsert(newKey)
+				}
+				dirty = true
+			}
+		}
 	case model.PolicyKey:
 		var newPolicy *model.Policy
 		if update.Value != nil {
 			newPolicy = update.Value.(*model.Policy)
+			metadata := ExtractPolicyMetadata(newPolicy)
+			dirty = poc.UpdatePolicy(key, &metadata)
 		} else {
-			newPolicy = nil
+			dirty = poc.UpdatePolicy(key, nil)
 		}
-		dirty = poc.UpdatePolicy(key, newPolicy)
 	}
 	return
 }
 
-func (poc *PolicySorter) HasPolicy(key model.PolicyKey) (found bool) {
-	_, found = poc.Tier.Policies[key]
-	return found
+func TierLess(i, j tierInfoKey) bool {
+	if !i.Valid && j.Valid {
+		return false
+	} else if i.Valid && !j.Valid {
+		return true
+	}
+	if i.Order == nil && j.Order != nil {
+		return false
+	} else if i.Order != nil && j.Order == nil {
+		return true
+	}
+	if i.Order == j.Order || *i.Order == *j.Order {
+		return i.Name < j.Name
+	}
+	return *i.Order < *j.Order
 }
 
-func (poc *PolicySorter) UpdatePolicy(key model.PolicyKey, newPolicy *model.Policy) (dirty bool) {
-	oldPolicy := poc.Tier.Policies[key]
+func (poc *PolicySorter) HasPolicy(key model.PolicyKey) bool {
+	for _, tierInfo := range poc.tiers {
+		if _, ok := tierInfo.Policies[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+var polMetaDefaultOrder = math.Inf(1)
+
+func ExtractPolicyMetadata(policy *model.Policy) policyMetadata {
+	m := policyMetadata{Tier: policy.Tier}
+
+	if policy.Tier == "" {
+		// This shouldn't happen - all policies should have a tier assigned by now.
+		// Log a warning and assign to default tier to be safe.
+		logrus.WithField("policy", policy).Warn("Policy has no tier assigned")
+		m.Tier = names.DefaultTierName
+	}
+	if policy.Order == nil {
+		m.Order = polMetaDefaultOrder
+	} else {
+		m.Order = *policy.Order
+	}
+	if policy.DoNotTrack {
+		m.Flags |= policyMetaDoNotTrack
+	}
+	if policy.PreDNAT {
+		m.Flags |= policyMetaPreDNAT
+	}
+	if policy.ApplyOnForward {
+		m.Flags |= policyMetaApplyOnForward
+	}
+	if len(policy.Types) == 0 {
+		// Back compatibility: no Types means Ingress and Egress.
+		m.Flags |= policyMetaIngress | policyMetaEgress
+	}
+	for _, t := range policy.Types {
+		if strings.EqualFold(t, "ingress") {
+			m.Flags |= policyMetaIngress
+		} else if strings.EqualFold(t, "egress") {
+			m.Flags |= policyMetaEgress
+		}
+	}
+	return m
+}
+
+type policyMetadata struct {
+	Order float64 // Set to +Inf for default order.
+	Flags policyMetadataFlags
+	Tier  string
+}
+
+type policyMetadataFlags uint8
+
+const (
+	policyMetaDoNotTrack policyMetadataFlags = 1 << iota
+	policyMetaPreDNAT
+	policyMetaApplyOnForward
+	policyMetaIngress
+	policyMetaEgress
+)
+
+func (m *policyMetadata) Equals(other *policyMetadata) bool {
+	if m != nil && other != nil {
+		return *m == *other
+	}
+	return m == other
+}
+
+func (m *policyMetadata) DoNotTrack() bool {
+	return m != nil && m.Flags&policyMetaDoNotTrack != 0
+}
+
+func (m *policyMetadata) PreDNAT() bool {
+	return m != nil && m.Flags&policyMetaPreDNAT != 0
+}
+
+func (m *policyMetadata) ApplyOnForward() bool {
+	return m != nil && m.Flags&policyMetaApplyOnForward != 0
+}
+
+func (poc *PolicySorter) tierForPolicy(key model.PolicyKey, meta *policyMetadata) (string, *TierInfo) {
+	if meta != nil {
+		return meta.Tier, poc.tiers[meta.Tier]
+	}
+	for tierName, tierInfo := range poc.tiers {
+		if _, ok := tierInfo.Policies[key]; ok {
+			return tierName, tierInfo
+		}
+	}
+	return "", nil
+}
+
+func (poc *PolicySorter) UpdatePolicy(key model.PolicyKey, newPolicy *policyMetadata) (dirty bool) {
+	// Find the old tier info if it exists. If it does, and doesn't match the new tier info, we'll need to
+	// remove it from the old tier.
+	_, oldTierInfo := poc.tierForPolicy(key, nil)
+
+	tierName, tierInfo := poc.tierForPolicy(key, newPolicy)
+
+	if tierName == "" {
+		// Failed to find a tier name for this policy. This should not happen.
+		logrus.WithFields(logrus.Fields{
+			"policyKey": key,
+			"newPolicy": newPolicy,
+		}).Warn("Failed to find tier for policy during policy sorter update.")
+	}
+
+	// If the tier has changed, remove from old tier first.
+	if oldTierInfo != nil && oldTierInfo != tierInfo {
+		if logrus.IsLevelEnabled(logrus.DebugLevel) {
+			logrus.WithFields(logrus.Fields{
+				"policyKey":   key,
+				"oldTierName": oldTierInfo.Name,
+				"newTierName": tierName,
+			}).Debug("Policy tier changed, removing from old tier")
+		}
+
+		oldPolicy := oldTierInfo.Policies[key]
+		oldTiKey := tierInfoKey{
+			Name:  oldTierInfo.Name,
+			Order: oldTierInfo.Order,
+			Valid: oldTierInfo.Valid,
+		}
+		oldTierInfo.SortedPolicies.Delete(PolKV{Key: key, Value: &oldPolicy})
+		delete(oldTierInfo.Policies, key)
+		if len(oldTierInfo.Policies) == 0 && !oldTierInfo.Valid {
+			poc.sortedTiers.Delete(oldTiKey)
+			delete(poc.tiers, oldTierInfo.Name)
+		}
+		dirty = true
+	}
+
+	// Now add to new tier.
+	var tiKey tierInfoKey
+	var oldPolicy *policyMetadata
+	if tierInfo != nil {
+		if op, ok := tierInfo.Policies[key]; ok {
+			oldPolicy = &op
+		}
+		tiKey.Name = tierInfo.Name
+		tiKey.Order = tierInfo.Order
+		tiKey.Valid = tierInfo.Valid
+	}
 	if newPolicy != nil {
-		if oldPolicy == nil ||
-			oldPolicy.Order != newPolicy.Order ||
-			oldPolicy.DoNotTrack != newPolicy.DoNotTrack ||
-			oldPolicy.PreDNAT != newPolicy.PreDNAT ||
-			oldPolicy.ApplyOnForward != newPolicy.ApplyOnForward ||
-			!policyTypesEqual(oldPolicy, newPolicy) {
+		if tierInfo == nil {
+			tierInfo = NewTierInfo(tierName)
+			tiKey.Name = tierInfo.Name
+			tiKey.Valid = tierInfo.Valid
+			tiKey.Order = tierInfo.Order
+			poc.tiers[tierName] = tierInfo
+			poc.sortedTiers.ReplaceOrInsert(tiKey)
+		}
+		if oldPolicy == nil || !oldPolicy.Equals(newPolicy) {
 			dirty = true
 		}
 		if oldPolicy != nil {
@@ -95,18 +323,21 @@ func (poc *PolicySorter) UpdatePolicy(key model.PolicyKey, newPolicy *model.Poli
 			// combination of key + value so if for instance we add PolKV{k1, v1} then add PolKV{k1, v2} we'll simply have
 			// both KVs in the tree instead of only {k1, v2} like we want. By deleting first we guarantee that only the
 			// newest value remains in the tree.
-			poc.Tier.SortedPolicies.Delete(PolKV{Key: key, Value: oldPolicy})
+			tierInfo.SortedPolicies.Delete(PolKV{Key: key, Value: oldPolicy})
 		}
-		poc.Tier.SortedPolicies.ReplaceOrInsert(PolKV{Key: key, Value: newPolicy})
-		poc.Tier.Policies[key] = newPolicy
+		tierInfo.SortedPolicies.ReplaceOrInsert(PolKV{Key: key, Value: newPolicy})
+		tierInfo.Policies[key] = *newPolicy
 	} else {
-		if oldPolicy != nil {
-			poc.Tier.SortedPolicies.Delete(PolKV{Key: key, Value: oldPolicy})
-			delete(poc.Tier.Policies, key)
+		if tierInfo != nil && oldPolicy != nil {
+			tierInfo.SortedPolicies.Delete(PolKV{Key: key, Value: oldPolicy})
+			delete(tierInfo.Policies, key)
+			if len(tierInfo.Policies) == 0 && !tierInfo.Valid {
+				poc.sortedTiers.Delete(tiKey)
+				delete(poc.tiers, tierName)
+			}
 			dirty = true
 		}
 	}
-
 	return
 }
 
@@ -114,89 +345,81 @@ func (poc *PolicySorter) UpdatePolicy(key model.PolicyKey, newPolicy *model.Poli
 // the test package calc_test can also use it.
 type PolKV struct {
 	Key   model.PolicyKey
-	Value *model.Policy
-
-	// Caches for whether the policy governs ingress and/or egress traffic.
-	ingress *bool
-	egress  *bool
+	Value *policyMetadata
 }
 
-func (p PolKV) String() string {
+func (p *PolKV) String() string {
 	orderStr := "nil policy"
 	if p.Value != nil {
-		if p.Value.Order != nil {
-			orderStr = fmt.Sprintf("%v", *p.Value.Order)
-		} else {
+		if math.IsInf(p.Value.Order, 1) {
 			orderStr = "default"
+		} else {
+			orderStr = fmt.Sprint(p.Value.Order)
 		}
 	}
-	return fmt.Sprintf("%s(%s)", p.Key.Name, orderStr)
+
+	var parts []string
+	if p.Key.Kind != "" {
+		parts = append(parts, p.Key.Kind)
+	}
+	if p.Key.Namespace != "" {
+		parts = append(parts, p.Key.Namespace)
+	}
+	if p.Key.Name != "" {
+		parts = append(parts, p.Key.Name)
+	}
+	return fmt.Sprintf("%s(%s)", strings.Join(parts, "/"), orderStr)
 }
 
-func (p PolKV) governsType(wanted string) bool {
-	// Back-compatibility: no Types means Ingress and Egress.
-	if len(p.Value.Types) == 0 {
-		return true
+func (p *PolKV) GovernsIngress() bool {
+	if p.Value == nil {
+		return false
 	}
-	for _, t := range p.Value.Types {
-		if strings.EqualFold(t, wanted) {
-			return true
-		}
-	}
-	return false
+	return p.Value.Flags&policyMetaIngress != 0
 }
 
-func (p PolKV) GovernsIngress() bool {
-	if p.ingress == nil {
-		governsIngress := p.governsType("ingress")
-		p.ingress = &governsIngress
+func (p *PolKV) GovernsEgress() bool {
+	if p.Value == nil {
+		return false
 	}
-	return *p.ingress
-}
-
-func (p PolKV) GovernsEgress() bool {
-	if p.egress == nil {
-		governsEgress := p.governsType("egress")
-		p.egress = &governsEgress
-	}
-	return *p.egress
+	return p.Value.Flags&policyMetaEgress != 0
 }
 
 func PolKVLess(i, j PolKV) bool {
-	bothNil := i.Value.Order == nil && j.Value.Order == nil
-	bothSet := i.Value.Order != nil && j.Value.Order != nil
-	ordersEqual := bothNil || bothSet && (*i.Value.Order == *j.Value.Order)
-
-	if ordersEqual {
-		// Use name as tie-break.
-		result := i.Key.Name < j.Key.Name
-		return result
+	// We map the default order to +Inf, which compares equal to itself so,
+	// this "just works".
+	if i.Value.Order == j.Value.Order {
+		// Order is equal, use namespace/name/kind to break ties.
+		// We start with the most specific (name) to least specific (kind), as
+		// it's more intuitive to have policies sorted that way.
+		iStr := fmt.Sprintf("%s/%s/%s", i.Key.Name, i.Key.Namespace, i.Key.Kind)
+		jStr := fmt.Sprintf("%s/%s/%s", j.Key.Name, j.Key.Namespace, j.Key.Kind)
+		return iStr < jStr
 	}
-
-	// nil order maps to "infinity"
-	if i.Value.Order == nil {
-		return false
-	} else if j.Value.Order == nil {
-		return true
-	}
-
-	// Otherwise, use numeric comparison.
-	return *i.Value.Order < *j.Value.Order
+	return i.Value.Order < j.Value.Order
 }
 
 type TierInfo struct {
 	Name            string
 	Valid           bool
 	Order           *float64
-	Policies        map[model.PolicyKey]*model.Policy
+	DefaultAction   v3.Action
+	Policies        map[model.PolicyKey]policyMetadata
 	SortedPolicies  *btree.BTreeG[PolKV]
 	OrderedPolicies []PolKV
 }
 
+type tierInfoKey struct {
+	Name  string
+	Valid bool
+	Order *float64
+}
+
 func NewTierInfo(name string) *TierInfo {
 	return &TierInfo{
-		Name:     name,
-		Policies: make(map[model.PolicyKey]*model.Policy),
+		Name:           name,
+		Policies:       make(map[model.PolicyKey]policyMetadata),
+		SortedPolicies: btree.NewG[PolKV](2, PolKVLess),
 	}
 }
 
@@ -205,14 +428,14 @@ func (t TierInfo) String() string {
 	for ii, pol := range t.OrderedPolicies {
 		polType := "t"
 		if pol.Value != nil {
-			if pol.Value.DoNotTrack {
+			if pol.Value.DoNotTrack() {
 				polType = "u"
-			} else if pol.Value.PreDNAT {
+			} else if pol.Value.PreDNAT() {
 				polType = "p"
 			}
 
-			//Append ApplyOnForward flag.
-			if pol.Value.ApplyOnForward {
+			// Append ApplyOnForward flag.
+			if pol.Value.ApplyOnForward() {
 				polType = polType + "f"
 			}
 		}

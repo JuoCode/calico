@@ -15,21 +15,30 @@
 package commands
 
 import (
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/docopt/docopt-go"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/projectcalico/calico/felix/bpf/nat"
 )
 
+var natDumpGroupByService bool
+
 func init() {
+	natDumpCmd.Flags().BoolVar(&natDumpGroupByService, "group-by-service", false,
+		"group frontends that share the same service ID and print their backends once per group")
 	natCmd.AddCommand(natDumpCmd)
 	natCmd.AddCommand(natAffDumpCmd)
+	natCmd.AddCommand(natMaglevDumpCmd)
 
 	natSetCmd.AddCommand(newNatSetFrontend())
 	natSetCmd.AddCommand(newNatSetBackend())
@@ -51,10 +60,16 @@ var natCmd = &cobra.Command{
 }
 
 var natDumpCmd = &cobra.Command{
-	Use:   "dump",
+	Use:   "dump [<ip> <port> <proto>]",
 	Short: "dumps the nat tables",
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) != 0 && len(args) != 3 {
+			return fmt.Errorf("accepts 0 or 3 args (<ip> <port> <proto>), received %d", len(args))
+		}
+		return nil
+	},
 	Run: func(cmd *cobra.Command, args []string) {
-		if err := dump(cmd); err != nil {
+		if err := dump(cmd, args); err != nil {
 			log.WithError(err).Error("Failed to dump NAT maps")
 		}
 	},
@@ -70,6 +85,16 @@ var natAffDumpCmd = &cobra.Command{
 	},
 }
 
+var natMaglevDumpCmd = &cobra.Command{
+	Use:   "maglev",
+	Short: "dumps the maglev consistent-hash backend table",
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := dumpMaglev(cmd); err != nil {
+			log.WithError(err).Error("Failed to dump maglev map")
+		}
+	},
+}
+
 var natSetCmd = &cobra.Command{
 	Use:   "set",
 	Short: "sets an entry in the NAT tables",
@@ -80,22 +105,71 @@ var natDelCmd = &cobra.Command{
 	Short: "deletes an entry from the NAT tables",
 }
 
-func dumpAff(cmd *cobra.Command) (err error) {
+func dumpAff(cmd *cobra.Command) error {
+	if ipv6 != nil && *ipv6 {
+		affMap, err := nat.LoadAffinityMapV6(nat.AffinityMapV6())
+		if err != nil {
+			return err
+		}
+		return writeAff(cmd, makeAffinityJSON(affMap))
+	}
+
 	affMap, err := nat.LoadAffinityMap(nat.AffinityMap())
 	if err != nil {
 		return err
 	}
+	return writeAff(cmd, makeAffinityJSON(affMap))
+}
 
-	for k, v := range affMap {
-		cmd.Printf("%-40s %s\n", k, v)
+func writeAff(cmd *cobra.Command, entries []affinityEntryJSON) error {
+	if *jsonOutput {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(entries)
 	}
 
+	for _, e := range entries {
+		cmd.Printf("client %s svc proto %d %s -> %s ts %s\n",
+			e.ClientIP, e.Proto, net.JoinHostPort(e.Addr, fmt.Sprint(e.Port)),
+			net.JoinHostPort(e.Backend.Addr, fmt.Sprint(e.Backend.Port)), e.Timestamp)
+	}
 	cmd.Printf("\n")
 
 	return nil
 }
 
-func dump(cmd *cobra.Command) error {
+func dumpMaglev(cmd *cobra.Command) error {
+	if ipv6 != nil && *ipv6 {
+		mglvMap, err := nat.LoadMaglevMapV6(nat.MaglevMapV6())
+		if err != nil {
+			return err
+		}
+		return writeMaglev(cmd, makeMaglevJSON(mglvMap))
+	}
+
+	mglvMap, err := nat.LoadMaglevMap(nat.MaglevMap())
+	if err != nil {
+		return err
+	}
+	return writeMaglev(cmd, makeMaglevJSON(mglvMap))
+}
+
+func writeMaglev(cmd *cobra.Command, entries []maglevEntryJSON) error {
+	if *jsonOutput {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(entries)
+	}
+
+	for _, e := range entries {
+		cmd.Printf("svc %d ordinal %d -> %s\n",
+			e.SvcID, e.Ordinal, net.JoinHostPort(e.Addr, fmt.Sprint(e.Port)))
+	}
+
+	return nil
+}
+
+func dump(cmd *cobra.Command, args []string) error {
 	if ipv6 != nil && *ipv6 {
 		natMap, err := nat.LoadFrontendMapV6(nat.FrontendMapV6())
 		if err != nil {
@@ -107,7 +181,22 @@ func dump(cmd *cobra.Command) error {
 			return err
 		}
 
-		dumpNice[nat.FrontendKeyV6, nat.BackendValueV6](cmd.Printf, natMap, back)
+		filtered := map[nat.FrontendKeyV6]nat.FrontendValue(natMap)
+		if len(args) == 3 {
+			ip, port, proto, err := parseIPPortProto(args)
+			if err != nil {
+				return err
+			}
+			filtered, err = filterByServiceID(natMap, nat.NewNATKeyV6(ip, port, proto))
+			if err != nil {
+				return err
+			}
+		}
+
+		if *jsonOutput {
+			return dumpNATJSON(cmd, filtered, back, natDumpGroupByService)
+		}
+		dumpNice(cmd.Printf, filtered, back, natDumpGroupByService)
 	} else {
 		natMap, err := nat.LoadFrontendMap(nat.FrontendMap())
 		if err != nil {
@@ -119,15 +208,92 @@ func dump(cmd *cobra.Command) error {
 			return err
 		}
 
-		dumpNice[nat.FrontendKey, nat.BackendValue](cmd.Printf, natMap, back)
+		filtered := map[nat.FrontendKey]nat.FrontendValue(natMap)
+		if len(args) == 3 {
+			ip, port, proto, err := parseIPPortProto(args)
+			if err != nil {
+				return err
+			}
+			filtered, err = filterByServiceID(natMap, nat.NewNATKey(ip, port, proto))
+			if err != nil {
+				return err
+			}
+		}
+
+		if *jsonOutput {
+			return dumpNATJSON(cmd, filtered, back, natDumpGroupByService)
+		}
+		dumpNice(cmd.Printf, filtered, back, natDumpGroupByService)
 	}
 	return nil
 }
 
-type printfFn func(format string, i ...interface{})
+// parseIPPortProto parses a [<ip>, <port>, <proto>] slice into typed values.
+// proto accepts "tcp", "udp", or a decimal/hex protocol number.
+func parseIPPortProto(args []string) (net.IP, uint16, uint8, error) {
+	ip := net.ParseIP(args[0])
+	if ip == nil {
+		return nil, 0, 0, fmt.Errorf("invalid IP address: %q", args[0])
+	}
+	isV6 := ipv6 != nil && *ipv6
+	if isV6 && ip.To4() != nil {
+		return nil, 0, 0, fmt.Errorf("expected IPv6 address but got IPv4: %q (omit -6 for IPv4)", args[0])
+	}
+	if !isV6 && ip.To4() == nil {
+		return nil, 0, 0, fmt.Errorf("expected IPv4 address but got IPv6: %q (use -6 for IPv6)", args[0])
+	}
+
+	portNum, err := strconv.ParseUint(args[1], 0, 16)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("invalid port number: %q (must be 0-65535)", args[1])
+	}
+
+	var proto uint8
+	switch strings.ToLower(args[2]) {
+	case "udp":
+		proto = 17
+	case "tcp":
+		proto = 6
+	default:
+		protoNum, err := strconv.ParseUint(args[2], 0, 8)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("unknown protocol %q", args[2])
+		}
+		proto = uint8(protoNum)
+	}
+
+	return ip, uint16(portNum), proto, nil
+}
+
+// filterByServiceID returns all frontend entries whose service ID matches the
+// service ID of the given filterKey.  This lets callers discover every virtual
+// IP / port / protocol tuple that maps to the same set of backends.
+func filterByServiceID[FK nat.FrontendKeyComparable](natMap map[FK]nat.FrontendValue, filterKey FK) (map[FK]nat.FrontendValue, error) {
+	fv, ok := natMap[filterKey]
+	if !ok {
+		return nil, fmt.Errorf("frontend %v not found in NAT map", filterKey)
+	}
+
+	serviceID := fv.ID()
+
+	result := make(map[FK]nat.FrontendValue)
+	for k, v := range natMap {
+		if v.ID() == serviceID {
+			result[k] = v
+		}
+	}
+	return result, nil
+}
+
+type printfFn func(format string, i ...any)
 
 func dumpNice[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf printfFn,
-	natMap map[FK]nat.FrontendValue, back map[nat.BackendKey]BV) {
+	natMap map[FK]nat.FrontendValue, back map[nat.BackendKey]BV, groupByService bool) {
+	if groupByService {
+		dumpNiceGrouped(printf, natMap, back)
+		return
+	}
+
 	for nk, nv := range natMap {
 		valCount := nv.Count()
 		count := int(valCount)
@@ -140,8 +306,13 @@ func dumpNice[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf
 		if flags != "" {
 			flags = " flags " + flags
 		}
-		printf("%s port %d proto %d id %d count %d local %d%s\n",
+		printf("%s port %d proto %d id %d count %d local %d%s",
 			nk.Addr(), nk.Port(), nk.Proto(), id, count, local, flags)
+		srcCIDR := nk.SrcCIDR()
+		if srcCIDR.Prefix() != 0 {
+			printf(" src %s", srcCIDR)
+		}
+		printf("\n")
 		for i := 0; i < count; i++ {
 			bk := nat.NewNATBackendKey(id, uint32(i))
 			bv, ok := back[bk]
@@ -149,15 +320,317 @@ func dumpNice[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf
 			if !ok {
 				printf("is missing\n")
 			} else {
-				fmtStr := "%s:%d\n"
-				// Use "[]" with IPv6 addresses
-				if bv.Addr().To4() == nil {
-					fmtStr = "[%s]:%d\n"
-				}
-				printf(fmtStr, bv.Addr(), bv.Port())
+				ep := net.JoinHostPort(bv.Addr().String(), fmt.Sprint(bv.Port()))
+				printf("%s\n", ep)
 			}
 		}
 	}
+}
+
+// dumpNiceGrouped groups frontends sharing the same service ID and prints their
+// backends just once per group.  Frontend lines are printed first, then the
+// indented backend list follows.
+func dumpNiceGrouped[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf printfFn,
+	natMap map[FK]nat.FrontendValue, back map[nat.BackendKey]BV) {
+	// Group frontend keys by service ID so that siblings sharing the same
+	// backend pool (e.g. ClusterIP + NodePort) are printed together and the
+	// backend list is shown just once per group.
+	byID := make(map[uint32][]FK)
+	for nk := range natMap {
+		id := natMap[nk].ID()
+		byID[id] = append(byID[id], nk)
+	}
+
+	// Sort service IDs for deterministic output.
+	ids := make([]uint32, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b uint32) int { return cmp.Compare(a, b) })
+
+	for _, id := range ids {
+		keys := byID[id]
+		// Sort frontend keys within the group for deterministic output.
+		slices.SortFunc(keys, func(a, b FK) int {
+			return bytes.Compare(a.AsBytes(), b.AsBytes())
+		})
+
+		// Determine backend count from the first frontend in the group.
+		// All frontends in a service share the same backend pool, so the
+		// count should be identical; we use the first one.
+		firstVal := natMap[keys[0]]
+		count := int(firstVal.Count())
+		if firstVal.Count() == nat.BlackHoleCount {
+			count = -1
+		}
+
+		// Print every frontend line in the group.
+		for _, nk := range keys {
+			nv := natMap[nk]
+			local := nv.LocalCount()
+			flags := nv.FlagsAsString()
+			if flags != "" {
+				flags = " flags " + flags
+			}
+			printf("%s port %d proto %d id %d count %d local %d%s",
+				nk.Addr(), nk.Port(), nk.Proto(), id, count, local, flags)
+			srcCIDR := nk.SrcCIDR()
+			if srcCIDR.Prefix() != 0 {
+				printf(" src %s", srcCIDR)
+			}
+			printf("\n")
+		}
+
+		// Print the shared backend list once for the whole group.
+		for i := 0; i < count; i++ {
+			bk := nat.NewNATBackendKey(id, uint32(i))
+			bv, ok := back[bk]
+			printf("\t%d:%d\t ", id, i)
+			if !ok {
+				printf("is missing\n")
+			} else {
+				ep := net.JoinHostPort(bv.Addr().String(), fmt.Sprint(bv.Port()))
+				printf("%s\n", ep)
+			}
+		}
+	}
+}
+
+// JSON types for nat dump output.
+
+type natBackendJSON struct {
+	Addr string `json:"addr"`
+	Port uint16 `json:"port"`
+}
+
+type natFrontendJSON struct {
+	Addr    string `json:"addr"`
+	Port    uint16 `json:"port"`
+	Proto   uint8  `json:"proto"`
+	SrcCIDR string `json:"src_cidr,omitempty"`
+	ID      uint32 `json:"id"`
+	Count   int    `json:"count"`
+	Local   uint32 `json:"local"`
+	Flags   string `json:"flags,omitempty"`
+}
+
+// natServiceJSON is used in flat mode: one frontend with its backends.
+type natServiceJSON struct {
+	Frontend natFrontendJSON  `json:"frontend"`
+	Backends []natBackendJSON `json:"backends"`
+}
+
+// natServiceGroupJSON is used in --group-by-service mode.
+type natServiceGroupJSON struct {
+	ID        uint32            `json:"id"`
+	Frontends []natFrontendJSON `json:"frontends"`
+	Backends  []natBackendJSON  `json:"backends"`
+}
+
+// maglevEntryJSON is one (service, ordinal) -> backend slot of the maglev
+// consistent-hash table.
+type maglevEntryJSON struct {
+	SvcID   uint32 `json:"svc_id"`
+	Ordinal uint32 `json:"ordinal"`
+	Addr    string `json:"addr"`
+	Port    uint16 `json:"port"`
+}
+
+// maglevKey is the constraint for a maglev map key: comparable (so it can be a
+// Go map key) and exposing the maglev key accessors.
+type maglevKey interface {
+	comparable
+	nat.MaglevBackendKeyInterface
+}
+
+func makeMaglevJSON[K maglevKey, V nat.BackendValueInterface](m map[K]V) []maglevEntryJSON {
+	entries := make([]maglevEntryJSON, 0, len(m))
+	for k, v := range m {
+		entries = append(entries, maglevEntryJSON{
+			SvcID:   k.SvcID(),
+			Ordinal: k.Ordinal(),
+			Addr:    v.Addr().String(),
+			Port:    v.Port(),
+		})
+	}
+	// Sort by (service, ordinal) for deterministic output.
+	slices.SortFunc(entries, func(a, b maglevEntryJSON) int {
+		if a.SvcID != b.SvcID {
+			return cmp.Compare(a.SvcID, b.SvcID)
+		}
+		return cmp.Compare(a.Ordinal, b.Ordinal)
+	})
+	return entries
+}
+
+// affinityEntryJSON is one client -> backend affinity entry, keyed by the
+// client IP and the frontend service it is sticky to.
+type affinityEntryJSON struct {
+	ClientIP  string         `json:"client_ip"`
+	Proto     uint8          `json:"proto"`
+	Addr      string         `json:"addr"`
+	Port      uint16         `json:"port"`
+	Backend   natBackendJSON `json:"backend"`
+	Timestamp string         `json:"timestamp"`
+}
+
+// affinityKey is the constraint for an affinity map key: comparable and
+// exposing the affinity key accessors.
+type affinityKey interface {
+	comparable
+	nat.AffinityKeyInterface
+}
+
+func makeAffinityJSON[K affinityKey, V nat.AffinityValueInterface](m map[K]V) []affinityEntryJSON {
+	entries := make([]affinityEntryJSON, 0, len(m))
+	for k, v := range m {
+		fe := k.FrontendAffinityKey()
+		be := v.Backend()
+		entries = append(entries, affinityEntryJSON{
+			ClientIP:  k.ClientIP().String(),
+			Proto:     fe.Proto(),
+			Addr:      fe.Addr().String(),
+			Port:      fe.Port(),
+			Backend:   natBackendJSON{Addr: be.Addr().String(), Port: be.Port()},
+			Timestamp: v.Timestamp().String(),
+		})
+	}
+	// Sort by (service addr, port, proto, client) for deterministic output.
+	// Proto is part of the sort key because a service can be sticky on the same
+	// addr+port for more than one protocol; without it those entries would
+	// compare equal and order non-deterministically.
+	slices.SortFunc(entries, func(a, b affinityEntryJSON) int {
+		if c := cmp.Compare(a.Addr, b.Addr); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Port, b.Port); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Proto, b.Proto); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ClientIP, b.ClientIP)
+	})
+	return entries
+}
+
+func dumpNATJSON[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](
+	cmd *cobra.Command,
+	natMap map[FK]nat.FrontendValue,
+	back map[nat.BackendKey]BV,
+	groupByService bool,
+) error {
+	if groupByService {
+		return dumpNATGroupedJSON(cmd, natMap, back)
+	}
+	return dumpNATFlatJSON(cmd, natMap, back)
+}
+
+func makeFrontendJSON[FK nat.FrontendKeyComparable](nk FK, nv nat.FrontendValue) natFrontendJSON {
+	count := int(nv.Count())
+	if nv.Count() == nat.BlackHoleCount {
+		count = -1
+	}
+	fe := natFrontendJSON{
+		Addr:  nk.Addr().String(),
+		Port:  nk.Port(),
+		Proto: nk.Proto(),
+		ID:    nv.ID(),
+		Count: count,
+		Local: nv.LocalCount(),
+		Flags: nv.FlagsAsString(),
+	}
+	if srcCIDR := nk.SrcCIDR(); srcCIDR.Prefix() != 0 {
+		fe.SrcCIDR = srcCIDR.String()
+	}
+	return fe
+}
+
+func makeBackendsJSON[BV nat.BackendValueInterface](id uint32, count int, back map[nat.BackendKey]BV) []natBackendJSON {
+	var backends []natBackendJSON
+	for i := 0; i < count; i++ {
+		bk := nat.NewNATBackendKey(id, uint32(i))
+		bv, ok := back[bk]
+		if !ok {
+			backends = append(backends, natBackendJSON{Addr: "missing"})
+		} else {
+			backends = append(backends, natBackendJSON{
+				Addr: bv.Addr().String(),
+				Port: bv.Port(),
+			})
+		}
+	}
+	return backends
+}
+
+func dumpNATFlatJSON[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](
+	cmd *cobra.Command,
+	natMap map[FK]nat.FrontendValue,
+	back map[nat.BackendKey]BV,
+) error {
+	var services []natServiceJSON
+	for nk, nv := range natMap {
+		fe := makeFrontendJSON(nk, nv)
+		count := fe.Count
+		if count < 0 {
+			count = 0
+		}
+		services = append(services, natServiceJSON{
+			Frontend: fe,
+			Backends: makeBackendsJSON(nv.ID(), count, back),
+		})
+	}
+
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(services)
+}
+
+func dumpNATGroupedJSON[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](
+	cmd *cobra.Command,
+	natMap map[FK]nat.FrontendValue,
+	back map[nat.BackendKey]BV,
+) error {
+	byID := make(map[uint32][]FK)
+	for nk := range natMap {
+		id := natMap[nk].ID()
+		byID[id] = append(byID[id], nk)
+	}
+
+	ids := make([]uint32, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b uint32) int { return cmp.Compare(a, b) })
+
+	var groups []natServiceGroupJSON
+	for _, id := range ids {
+		keys := byID[id]
+		slices.SortFunc(keys, func(a, b FK) int {
+			return bytes.Compare(a.AsBytes(), b.AsBytes())
+		})
+
+		firstVal := natMap[keys[0]]
+		count := int(firstVal.Count())
+		if firstVal.Count() == nat.BlackHoleCount {
+			count = 0
+		}
+
+		var frontends []natFrontendJSON
+		for _, nk := range keys {
+			frontends = append(frontends, makeFrontendJSON(nk, natMap[nk]))
+		}
+
+		groups = append(groups, natServiceGroupJSON{
+			ID:        id,
+			Frontends: frontends,
+			Backends:  makeBackendsJSON(id, count, back),
+		})
+	}
+
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(groups)
 }
 
 type natFrontend struct {
@@ -184,8 +657,8 @@ func newNatSetFrontend() *cobra.Command {
 		},
 	}
 
-	cmd.Command.Args = cmd.ArgsSet
-	cmd.Command.Run = cmd.RunSet
+	cmd.Args = cmd.ArgsSet
+	cmd.Run = cmd.RunSet
 
 	return cmd.Command
 }
@@ -197,17 +670,17 @@ func (cmd *natFrontend) checkArgsCommon() error {
 	case "tcp":
 		cmd.proto = 6
 	default:
-		return errors.Errorf("unknown protocol %s", proto)
+		return fmt.Errorf("unknown protocol %s", proto)
 	}
 
 	cmd.ip = net.ParseIP(cmd.IP)
 	if cmd.ip == nil {
-		return errors.Errorf("ip: %q is not an ip", cmd.IP)
+		return fmt.Errorf("ip: %q is not an ip", cmd.IP)
 	}
 
 	port, err := strconv.ParseUint(cmd.Port, 0, 16)
 	if err != nil {
-		return errors.Errorf("port: %q is not 16-bit uint", cmd.Port)
+		return fmt.Errorf("port: %q is not 16-bit uint", cmd.Port)
 	}
 	cmd.port = uint16(port)
 
@@ -219,12 +692,12 @@ func (cmd *natFrontend) ArgsSet(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	if err := cmd.checkArgsCommon(); err != nil {
@@ -233,13 +706,13 @@ func (cmd *natFrontend) ArgsSet(c *cobra.Command, args []string) error {
 
 	id, err := strconv.ParseUint(cmd.ID, 0, 32)
 	if err != nil {
-		return errors.Errorf("id: %q is not 32-bit uint", cmd.ID)
+		return fmt.Errorf("id: %q is not 32-bit uint", cmd.ID)
 	}
 	cmd.id = uint32(id)
 
 	count, err := strconv.ParseUint(cmd.Count, 0, 16)
 	if err != nil {
-		return errors.Errorf("count: %q is not 32-bit uint", cmd.Count)
+		return fmt.Errorf("count: %q is not 32-bit uint", cmd.Count)
 	}
 	cmd.count = uint32(count)
 
@@ -270,8 +743,8 @@ func newNatDelFrontend() *cobra.Command {
 		},
 	}
 
-	cmd.Command.Args = cmd.ArgsDel
-	cmd.Command.Run = cmd.RunDel
+	cmd.Args = cmd.ArgsDel
+	cmd.Run = cmd.RunDel
 
 	return cmd.Command
 }
@@ -281,12 +754,12 @@ func (cmd *natFrontend) ArgsDel(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	return cmd.checkArgsCommon()
@@ -328,8 +801,8 @@ func newNatSetBackend() *cobra.Command {
 		},
 	}
 
-	cmd.Command.Args = cmd.ArgsSet
-	cmd.Command.Run = cmd.RunSet
+	cmd.Args = cmd.ArgsSet
+	cmd.Run = cmd.RunSet
 
 	return cmd.Command
 }
@@ -337,13 +810,13 @@ func newNatSetBackend() *cobra.Command {
 func (cmd *natBackend) checkArgsCommon() error {
 	id, err := strconv.ParseUint(cmd.ID, 0, 32)
 	if err != nil {
-		return errors.Errorf("id: %q is not 32-bit uint", cmd.ID)
+		return fmt.Errorf("id: %q is not 32-bit uint", cmd.ID)
 	}
 	cmd.id = uint32(id)
 
 	idx, err := strconv.ParseUint(cmd.Idx, 0, 32)
 	if err != nil {
-		return errors.Errorf("idx: %q is not 32-bit uint", cmd.Idx)
+		return fmt.Errorf("idx: %q is not 32-bit uint", cmd.Idx)
 	}
 	cmd.idx = uint32(idx)
 
@@ -355,22 +828,22 @@ func (cmd *natBackend) ArgsSet(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	cmd.ip = net.ParseIP(cmd.IP)
 	if cmd.ip == nil {
-		return errors.Errorf("ip: %q is not an ip", cmd.IP)
+		return fmt.Errorf("ip: %q is not an ip", cmd.IP)
 	}
 
 	port, err := strconv.ParseUint(cmd.Port, 0, 16)
 	if err != nil {
-		return errors.Errorf("port: %q is not 16-bit uint", cmd.Port)
+		return fmt.Errorf("port: %q is not 16-bit uint", cmd.Port)
 	}
 	cmd.port = uint16(port)
 
@@ -401,8 +874,8 @@ func newNatDelBackend() *cobra.Command {
 		},
 	}
 
-	cmd.Command.Args = cmd.ArgsDel
-	cmd.Command.Run = cmd.RunDel
+	cmd.Args = cmd.ArgsDel
+	cmd.Run = cmd.RunDel
 
 	return cmd.Command
 }
@@ -412,12 +885,12 @@ func (cmd *natBackend) ArgsDel(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	return cmd.checkArgsCommon()

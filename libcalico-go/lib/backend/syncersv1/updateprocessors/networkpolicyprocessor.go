@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,20 +28,31 @@ import (
 
 // Create a new SyncerUpdateProcessor to sync NetworkPolicy data in v1 format for
 // consumption by Felix.
-func NewNetworkPolicyUpdateProcessor() watchersyncer.SyncerUpdateProcessor {
-	return NewSimpleUpdateProcessor(apiv3.KindNetworkPolicy, convertNetworkPolicyV2ToV1Key, convertNetworkPolicyV2ToV1Value)
+func NewNetworkPolicyUpdateProcessor(keyKind string) watchersyncer.SyncerUpdateProcessor {
+	return NewSimpleUpdateProcessor(
+		keyKind,
+		npKeyConverter(keyKind),
+		ConvertNetworkPolicyV3ToV1Value,
+	)
 }
 
-func convertNetworkPolicyV2ToV1Key(v3key model.ResourceKey) (model.Key, error) {
-	if v3key.Name == "" || v3key.Namespace == "" {
-		return model.PolicyKey{}, errors.New("Missing Name or Namespace field to create a v1 NetworkPolicy Key")
+// npKeyConverter returns a function that converts a v3 ResourceKey to a v1 Key
+// of the specified kind. We multiplex several kinds of policies into the same model.PolicyKey,
+// and so callers must specify the exact kind to use.
+func npKeyConverter(kind string) func(model.ResourceKey) (model.Key, error) {
+	return func(v3key model.ResourceKey) (model.Key, error) {
+		if v3key.Name == "" || v3key.Namespace == "" {
+			return model.PolicyKey{}, errors.New("Missing Name or Namespace field to create a v1 NetworkPolicy Key")
+		}
+		return model.PolicyKey{
+			Name:      v3key.Name,
+			Namespace: v3key.Namespace,
+			Kind:      kind,
+		}, nil
 	}
-	return model.PolicyKey{
-		Name: v3key.Namespace + "/" + v3key.Name,
-	}, nil
 }
 
-func convertNetworkPolicyV2ToV1Value(val interface{}) (interface{}, error) {
+func ConvertNetworkPolicyV3ToV1Value(val any) (any, error) {
 	v3res, ok := val.(*apiv3.NetworkPolicy)
 	if !ok {
 		return nil, errors.New("Value is not a valid NetworkPolicy resource value")
@@ -63,28 +74,36 @@ func convertNetworkPolicyV2ToV1Value(val interface{}) (interface{}, error) {
 
 	v1value := &model.Policy{
 		Namespace:        v3res.Namespace,
+		Tier:             tierOrDefault(spec.Tier),
 		Order:            spec.Order,
-		InboundRules:     RulesAPIV2ToBackend(spec.Ingress, v3res.Namespace),
-		OutboundRules:    RulesAPIV2ToBackend(spec.Egress, v3res.Namespace),
+		InboundRules:     RulesAPIV3ToBackend(spec.Ingress, v3res.Namespace),
+		OutboundRules:    RulesAPIV3ToBackend(spec.Egress, v3res.Namespace),
 		Selector:         selector,
-		Types:            policyTypesAPIV2ToBackend(spec.Types),
-		ApplyOnForward:   true,
+		Types:            policyTypesAPIV3ToBackend(spec.Types),
+		ApplyOnForward:   false,
 		PerformanceHints: v3res.Spec.PerformanceHints,
 	}
 
 	return v1value, nil
 }
 
-// policyTypesAPIV2ToBackend converts the policy type field value from the API
+// policyTypesAPIV3ToBackend converts the policy type field value from the API
 // value to the equivalent backend value.
-func policyTypesAPIV2ToBackend(ptypes []apiv3.PolicyType) []string {
+func policyTypesAPIV3ToBackend(ptypes []apiv3.PolicyType) []string {
 	var v1ptypes []string
 	for _, ptype := range ptypes {
-		v1ptypes = append(v1ptypes, policyTypeAPIV2ToBackend(ptype))
+		v1ptypes = append(v1ptypes, policyTypeAPIV3ToBackend(ptype))
 	}
 	return v1ptypes
 }
 
-func policyTypeAPIV2ToBackend(ptype apiv3.PolicyType) string {
+func policyTypeAPIV3ToBackend(ptype apiv3.PolicyType) string {
 	return strings.ToLower(string(ptype))
+}
+
+func tierOrDefault(tier string) string {
+	if tier == "" {
+		return "default"
+	}
+	return tier
 }

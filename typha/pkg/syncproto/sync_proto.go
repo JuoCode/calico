@@ -184,8 +184,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
-
+	"github.com/projectcalico/calico/lib/logrusr"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -209,7 +208,7 @@ Typha->Felix: KVs * n
 const DefaultPort = 5473
 
 type Envelope struct {
-	Message interface{}
+	Message any
 }
 
 // logrus only looks for a String() method on the top-level object, make sure we call through to the wrapped object.
@@ -230,22 +229,47 @@ const (
 	NumSyncerTypes = iota
 )
 
-var (
-	// AllSyncerTypes contains each of the SyncerType constants. We use an array rather than a slice for a
-	// compile-time length check.
-	AllSyncerTypes = [NumSyncerTypes]SyncerType{
-		SyncerTypeFelix,
-		SyncerTypeBGP,
-		SyncerTypeTunnelIPAllocation,
-		SyncerTypeNodeStatus,
-	}
-)
+// AllSyncerTypes contains each of the SyncerType constants. We use an array rather than a slice for a
+// compile-time length check.
+var AllSyncerTypes = [NumSyncerTypes]SyncerType{
+	SyncerTypeFelix,
+	SyncerTypeBGP,
+	SyncerTypeTunnelIPAllocation,
+	SyncerTypeNodeStatus,
+}
 
 type CompressionAlgorithm string
 
 const (
+	// CompressionNone is the zero value: the stream carries plain bytes.
+	// It is a peer of the real algorithms everywhere an algorithm is
+	// chosen, advertised or looked up, so that the uncompressed case needs
+	// no special handling.
+	CompressionNone   CompressionAlgorithm = ""
 	CompressionSnappy CompressionAlgorithm = "snappy"
+	CompressionZstd   CompressionAlgorithm = "zstd"
+
+	NumCompressionAlgorithms = 2
 )
+
+// AllCompressionAlgorithms contains each of the compression algorithms a
+// stream can be encoded with, in no particular order.  It excludes
+// CompressionNone, which is not something a peer advertises support for.  We
+// use an array rather than a slice so that it is copied, not aliased, when a
+// caller takes it.
+var AllCompressionAlgorithms = [NumCompressionAlgorithms]CompressionAlgorithm{
+	CompressionSnappy,
+	CompressionZstd,
+}
+
+// MetricLabelValue returns the value used for the "compression" label on
+// Prometheus metrics: the algorithm name, or "none" for CompressionNone.
+func (a CompressionAlgorithm) MetricLabelValue() string {
+	if a == CompressionNone {
+		return "none"
+	}
+	return string(a)
+}
 
 // MsgClientHello is the first message sent by the client after it opens the connection.  It begins the handshake.
 // It includes a request to use a particular kind of syncer and tells the server what features are supported.
@@ -258,8 +282,18 @@ type MsgClientHello struct {
 	// SyncerTypeFelix.
 	SyncerType SyncerType
 
-	SupportsDecoderRestart         bool
+	SupportsDecoderRestart bool
+
+	// SupportedCompressionAlgorithms is the set of algorithms the client can
+	// decode.  The server picks one (or none) using its own preference order
+	// and reports its choice in MsgDecoderRestart.  Requires
+	// SupportsDecoderRestart.
 	SupportedCompressionAlgorithms []CompressionAlgorithm
+
+	// SupportsModernPolicyKeys tells the server whether this client supports modern PolicyKey
+	// syntax, i.e., using Kind/Namespace/Name instead of Tier/Name. If the client does not set this field,
+	// Typha will reject the connection attempt and wait for the client to be upgraded.
+	SupportsModernPolicyKeys bool
 
 	ClientConnID uint64
 }
@@ -287,18 +321,21 @@ type MsgDecoderRestart struct {
 
 // MsgACK is a general-purpose ACK message, currently used during the initial handshake to acknowledge the
 // switch to compressed mode.
-type MsgACK struct {
-}
+type MsgACK struct{}
+
 type MsgSyncStatus struct {
 	SyncStatus api.SyncStatus
 }
+
 type MsgPing struct {
 	Timestamp time.Time
 }
+
 type MsgPong struct {
 	PingTimestamp time.Time
 	PongTimestamp time.Time
 }
+
 type MsgKVs struct {
 	KVs []SerializedUpdate
 }
@@ -307,7 +344,7 @@ func (m MsgKVs) String() string {
 	var b strings.Builder
 	const limit = 10
 	b.WriteString("syncproto.MsgKVs{Num:")
-	b.WriteString(fmt.Sprint(len(m.KVs)))
+	fmt.Fprint(&b, len(m.KVs))
 	b.WriteString(",KVs:[]{")
 	for i, kv := range m.KVs {
 		if i > 0 {
@@ -377,15 +414,15 @@ func SerializeUpdate(u api.Update) (su SerializedUpdate, err error) {
 type SerializedUpdate struct {
 	Key               string
 	Value             []byte
-	Revision          interface{}
+	Revision          any
 	V3ResourceVersion string
 	TTL               time.Duration
 	UpdateType        api.UpdateType
 }
 
-var ErrBadKey = errors.New("Unable to parse key.")
+var ErrBadKey = errors.New("unable to parse key")
 
-var kvRLL = logutils.NewRateLimitedLogger()
+var kvRLL = logrusr.NewRateLimitedLogger()
 
 func (s SerializedUpdate) ToUpdate() (api.Update, error) {
 	// Parse the key.
@@ -396,7 +433,7 @@ func (s SerializedUpdate) ToUpdate() (api.Update, error) {
 			"is the same version as this component.")
 		return api.Update{}, ErrBadKey
 	}
-	var parsedValue interface{}
+	var parsedValue any
 	if s.Value != nil {
 		var err error
 		parsedValue, err = model.ParseValue(parsedKey, s.Value)
@@ -411,6 +448,13 @@ func (s SerializedUpdate) ToUpdate() (api.Update, error) {
 			}
 		}
 	}
+
+	// If the key supports upgrade, do it now that we've used the key to parse the value.
+	if k, ok := parsedKey.(model.LegacyKey); ok {
+		parsedKey = k.Upgrade()
+		log.Debugf("Upgraded legacy key %+v to %+v", k, parsedKey)
+	}
+
 	revStr := ""
 	switch r := s.Revision.(type) {
 	case string:

@@ -18,11 +18,40 @@ Calico’s flexible architecture supports a wide range of deployment options, us
 
 # Installing
 
+Install so any Calico resources you care about (for example a
+`FelixConfiguration`) exist before the operator starts reconciling:
+
 1. Add the projectcalico helm repository.
 
    ```
    helm repo add projectcalico https://docs.tigera.io/calico/charts
    ```
+
+1. Install the Calico CRDs. As of Calico v3.32, CRDs are no longer bundled in this chart and must be installed separately from the `crd.projectcalico.org.v1` chart. See [Custom Resource Definitions](#custom-resource-definitions) below for why.
+
+   ```
+   helm template calico-crds projectcalico/crd.projectcalico.org.v1 | kubectl apply --server-side -f -
+   ```
+
+1. (Optional) Apply any Calico custom resources you want in place before the
+   operator runs. Helm sorts unknown kinds last, so resources created by this
+   chart can land after the operator Deployment is already up. Applying them
+   yourself here guarantees order. Example:
+
+   ```
+   kubectl apply -f - <<EOF
+   apiVersion: projectcalico.org/v3
+   kind: FelixConfiguration
+   metadata:
+     name: default
+   spec:
+     usageReportingEnabled: false
+   EOF
+   ```
+
+   Use `projectcalico.org/v3` when the v3 API is available (for example after
+   installing the Calico API server); otherwise use the CRD group
+   `crd.projectcalico.org/v1`.
 
 1. Create the tigera-operator namespace.
 
@@ -36,6 +65,22 @@ Calico’s flexible architecture supports a wide range of deployment options, us
    helm install calico projectcalico/tigera-operator --namespace tigera-operator
    ```
 
+> **Note:** `defaultFelixConfiguration` in `values.yaml` is deprecated. Prefer
+> applying a `FelixConfiguration` in step 3 above. The chart field remains for a
+> deprecation window so existing values files keep working.
+
+# Custom Resource Definitions
+
+This chart does not install the Calico CRDs (the `crd.projectcalico.org` and `operator.tigera.io` API groups). Helm does not upgrade or delete CRDs that live in a chart's `crds/` directory, which makes CRD lifecycle management awkward over the life of a cluster. Following [Helm's CRD best practices](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/), the CRDs are shipped in a separate `crd.projectcalico.org.v1` chart that you install and upgrade yourself.
+
+To install or upgrade the CRDs:
+
+```
+helm template calico-crds projectcalico/crd.projectcalico.org.v1 | kubectl apply --server-side -f -
+```
+
+`helm template | kubectl apply --server-side` is used rather than `helm install` because some Calico CRDs exceed the size limit for client-side apply.
+
 # Upgrading
 
 Prior to release v3.23, the Calico helm chart itself deployed the `tigera-operator` namespace and required that the helm release was
@@ -44,6 +89,16 @@ of the chart into the `tigera-operator` namespace.
 
 When upgrading from a version of Calico v3.22 or lower to a version of Calico v3.23 or greater, you must complete the following steps to migrate
 ownership of the helm resources to the new chart location.
+
+## Upgrade OwnerReferences
+
+If you do not use OwnerReferences on resources in the projectcalico.org/v3 API group, you can skip this section.
+
+Starting in Calico v3.28, a change in the way UIDs are generated for projectcalico.org/v3 resources requires that you update any OwnerReferences that refer to projectcalico.org/v3 resources as an owner. After upgrade, the UID for all projectcalico.org/v3 resources will be changed, resulting in any owned resources being garbage collected by Kubernetes.
+
+1. Remove any OwnerReferences from resources in your cluster that have apiGroup: projectcalico.org/v3.
+2. Perform the upgrade normally.
+3. Add new OwnerReferences to your resources referencing the new UID.
 
 ## Upgrade from Calico versions prior to v3.23.0
 
@@ -76,6 +131,12 @@ ownership of the helm resources to the new chart location.
 
 ## All other upgrades
 
+1. Update the Calico CRDs. Helm will not do this for you (see [Custom Resource Definitions](#custom-resource-definitions)), so apply them before upgrading the operator chart.
+
+   ```bash
+   helm template calico-crds projectcalico/crd.projectcalico.org.v1 | kubectl apply --server-side -f -
+   ```
+
 1. Run the helm upgrade:
 
    ```bash
@@ -96,7 +157,7 @@ imagePullSecrets: {}
 
 # Configures general installation parameters for Calico. Schema is based
 # on the operator.tigera.io/Installation API documented
-# here: https://docs.tigera.io/calico/latest/reference/installation/api#operator.tigera.io/v1.InstallationSpec
+# here: https://docs.tigera.io/calico/latest/reference/installation/api#installationspec
 installation:
   enabled: true
   kubernetesProvider: ""
@@ -107,6 +168,10 @@ installation:
   #
   # Example: --set installation.imagePullSecrets[0].name=my-existing-secret
   imagePullSecrets: []
+
+  # Configure the kubelet volume plugin path used by the CSI driver.
+  # Set to "None" to disable the CSI driver. If this field is left unset, /var/lib/kubelet is used and CSI is enabled.
+  kubeletVolumePluginPath: "None"
 
 # Configures general installation parameters for Calico. Schema is based
 # on the operator.tigera.io/Installation API documented
@@ -132,12 +197,25 @@ certs:
 resources: {}
 
 # Tolerations for the tigera/operator pod itself.
-# By default, will schedule on all possible place.
+# By default, will schedule on nodes that are not yet ready, but not on cordoned nodes.
 tolerations:
-- effect: NoExecute
+- key: CriticalAddonsOnly
   operator: Exists
-- effect: NoSchedule
+- key: node-role.kubernetes.io/master
   operator: Exists
+  effect: NoSchedule
+- key: node-role.kubernetes.io/control-plane
+  operator: Exists
+  effect: NoSchedule
+- key: node.kubernetes.io/not-ready
+  operator: Exists
+  effect: NoSchedule
+- key: node.kubernetes.io/network-unavailable
+  operator: Exists
+  effect: NoSchedule
+- key: node.cloudprovider.kubernetes.io/uninitialized
+  operator: Exists
+  effect: NoSchedule
 
 # NodeSelector for the tigera/operator pod itself.
 nodeSelector:
@@ -149,15 +227,32 @@ podAnnotations: {}
 # Custom labels for the tigera/operator pod itself
 podLabels: {}
 
+# Deployment strategy for the tigera-operator deployment.
+# By default no strategy is set and the Kubernetes default (RollingUpdate) applies.
+# Example: with Helm 3 `--wait` readiness checks, let the install complete before
+# any node can run the operator pod:
+#   strategy:
+#     rollingUpdate:
+#       maxUnavailable: 1
+strategy: {}
+
+# Security context applied to all containers in the tigera-operator deployment.
+# By default no security context is set; override to harden the operator pod.
+# Example hardened config:
+#   containerSecurityContext:
+#     allowPrivilegeEscalation: false
+#     runAsNonRoot: true
+#     runAsUser: 10000
+#     runAsGroup: 10000
+#     readOnlyRootFilesystem: true
+containerSecurityContext: {}
+
 # Configuration for the tigera operator images to deploy.
 tigeraOperator:
-  image: tigera/operator
+  image: calico/operator
   registry: quay.io
 calicoctl:
-  image: docker.io/calico/ctl
-
-# Configuration for the Calico CSI plugin - setting to None will disable the plugin, default: /var/lib/kubelet
-kubeletVolumePluginPath: None   
+  image: quay.io/calico/calico
 
 # Optionally configure the host and port used to access the Kubernetes API server.
 kubernetesServiceEndpoint:

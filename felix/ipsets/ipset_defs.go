@@ -16,18 +16,16 @@ package ipsets
 
 import (
 	"fmt"
-	"math"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
-
 	"github.com/projectcalico/calico/felix/ip"
-	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
+	"github.com/projectcalico/calico/felix/proto"
+	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 )
 
 var (
@@ -89,14 +87,10 @@ var AllIPSetTypes = []IPSetType{
 	IPSetTypeHashNetNet,
 }
 
-func (t IPSetType) SetType() string {
-	return string(t)
-}
-
 type V4IPPort struct {
 	IP       ip.V4Addr
 	Port     uint16
-	Protocol labelindex.IPSetPortProtocol
+	Protocol ipsetmember.Protocol
 }
 
 func (p V4IPPort) String() string {
@@ -106,7 +100,7 @@ func (p V4IPPort) String() string {
 type V6IPPort struct {
 	IP       ip.V6Addr
 	Port     uint16
-	Protocol labelindex.IPSetPortProtocol
+	Protocol ipsetmember.Protocol
 }
 
 func (p V6IPPort) String() string {
@@ -139,94 +133,10 @@ func (t IPSetType) IsMemberIPV6(member string) bool {
 
 		return cidr1
 	case IPSetTypeBitmapPort:
-		return strings.HasPrefix("v6,", member)
+		return strings.HasPrefix(member, "v6,")
 	}
 	log.WithField("type", string(t)).Panic("Unknown IPSetType")
 	return false
-}
-
-// CanonicaliseMember converts the string representation of an IP set member to a canonical
-// object of some kind.  The object is required to by hashable.
-func (t IPSetType) CanonicaliseMember(member string) IPSetMember {
-	switch t {
-	case IPSetTypeHashIP:
-		// Convert the string into our ip.Addr type, which is backed by an array.
-		ipAddr := ip.FromIPOrCIDRString(member)
-		if ipAddr == nil {
-			// This should be prevented by validation in libcalico-go.
-			log.WithField("ip", member).Panic("Failed to parse IP")
-		}
-		return ipAddr
-	case IPSetTypeHashIPPort:
-		// The member should be of the format <IP>,(tcp|udp):<port number>
-		parts := strings.Split(member, ",")
-		if len(parts) != 2 {
-			log.WithField("member", member).Panic("Failed to parse IP,port IP set member")
-		}
-		ipAddr := ip.FromString(parts[0])
-		if ipAddr == nil {
-			// This should be prevented by validation.
-			log.WithField("member", member).Panic("Failed to parse IP part of IP,port member")
-		}
-		// parts[1] should contain "(tcp|udp|sctp):<port number>"
-		parts = strings.Split(parts[1], ":")
-		var proto labelindex.IPSetPortProtocol
-		switch strings.ToLower(parts[0]) {
-		case "udp":
-			proto = labelindex.ProtocolUDP
-		case "tcp":
-			proto = labelindex.ProtocolTCP
-		case "sctp":
-			proto = labelindex.ProtocolSCTP
-		default:
-			log.WithField("member", member).Panic("Unknown protocol")
-		}
-		port, err := strconv.Atoi(parts[1])
-		if err != nil {
-			log.WithField("member", member).WithError(err).Panic("Bad port")
-		}
-		if port > math.MaxUint16 || port < 0 {
-			log.WithField("member", member).Panic("Bad port range (should be between 0 and 65535)")
-		}
-		// Return a dedicated struct for V4 or V6.  This slightly reduces occupancy over storing
-		// the address as an interface by storing one fewer interface headers.  That is worthwhile
-		// because we store many IP set members.
-		if ipAddr.Version() == 4 {
-			return V4IPPort{
-				IP:       ipAddr.(ip.V4Addr),
-				Port:     uint16(port),
-				Protocol: proto,
-			}
-		} else {
-			return V6IPPort{
-				IP:       ipAddr.(ip.V6Addr),
-				Port:     uint16(port),
-				Protocol: proto,
-			}
-		}
-	case IPSetTypeHashNet:
-		// Convert the string into our ip.CIDR type, which is backed by a struct.  When
-		// pretty-printing, the hash:net ipset type prints IPs with no "/32" or "/128"
-		// suffix.
-		return ip.MustParseCIDROrIP(member)
-	case IPSetTypeBitmapPort:
-		// Trim the family if it exists
-		if member[0] == 'v' {
-			member = member[3:]
-		}
-		port, err := strconv.Atoi(member)
-		if err == nil && port >= 0 && port <= 0xffff {
-			return Port(port)
-		}
-	case IPSetTypeHashNetNet:
-		cidrs := strings.Split(member, ",")
-		return netNet{
-			cidr1: ip.MustParseCIDROrIP(cidrs[0]),
-			cidr2: ip.MustParseCIDROrIP(cidrs[1]),
-		}
-	}
-	log.WithField("type", string(t)).Panic("Unknown IPSetType")
-	return nil
 }
 
 type rawIPSetMember string
@@ -270,6 +180,7 @@ func (f IPFamily) IsValid() bool {
 	}
 	return false
 }
+
 func (f IPFamily) Version() int {
 	switch f {
 	case IPFamilyV4:
@@ -282,11 +193,12 @@ func (f IPFamily) Version() int {
 
 // IPSetMetadata contains the metadata for a particular IP set, such as its name, type and size.
 type IPSetMetadata struct {
-	SetID    string
-	Type     IPSetType
-	MaxSize  int
-	RangeMin int
-	RangeMax int
+	SetID      string
+	Type       IPSetType
+	UpdateType proto.IPSetUpdate_IPSetType
+	MaxSize    int
+	RangeMin   int
+	RangeMax   int
 }
 
 // IPVersionConfig wraps up the metadata for a particular IP version.  It can be used by

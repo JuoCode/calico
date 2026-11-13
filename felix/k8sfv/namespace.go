@@ -65,7 +65,7 @@ func createNamespaceInt(
 		np := namespacePolicy{}
 		np.Ingress.Isolation = isolation
 		annotation, _ := json.Marshal(np)
-		ns_in.ObjectMeta.Annotations = map[string]string{
+		ns_in.Annotations = map[string]string{
 			"net.beta.kubernetes.io/network-policy": string(annotation),
 		}
 	}
@@ -85,8 +85,8 @@ func cleanupAllNamespaces(clientset *kubernetes.Clientset, nsPrefix string) {
 	}
 	log.WithField("count", len(nsList.Items)).Info("Namespaces present")
 	for _, ns := range nsList.Items {
-		if strings.HasPrefix(ns.ObjectMeta.Name, nsPrefix) {
-			err = clientset.CoreV1().Namespaces().Delete(context.Background(), ns.ObjectMeta.Name, deleteImmediately)
+		if strings.HasPrefix(ns.Name, nsPrefix) {
+			err = clientset.CoreV1().Namespaces().Delete(context.Background(), ns.Name, deleteImmediately)
 			panicIfError(err)
 		} else {
 			log.WithField("name", ns.ObjectMeta.Name).Debug("Namespace skipped")
@@ -107,9 +107,9 @@ func createNetworkPolicy(clientset *kubernetes.Clientset, namespace string) {
 			// An empty PodSelector selects all pods in this Namespace.
 			PodSelector: metav1.LabelSelector{},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				networkingv1.NetworkPolicyIngressRule{
+				{
 					From: []networkingv1.NetworkPolicyPeer{
-						networkingv1.NetworkPolicyPeer{
+						{
 							// An empty PodSelector selects all pods in this Namespace.
 							PodSelector: &metav1.LabelSelector{},
 						},

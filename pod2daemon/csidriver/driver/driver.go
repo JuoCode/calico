@@ -67,6 +67,7 @@ type ConfigurationOptions struct {
 }
 
 type Driver struct {
+	csi.UnimplementedIdentityServer
 	nodeService
 
 	server  *grpc.Server
@@ -109,12 +110,12 @@ func RetrieveConfig() (*ConfigurationOptions, error) {
 		// Read the config from the file.
 		bytes, err := os.ReadFile(configFile)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to read configuration at %s: %v", configFile, err)
+			return nil, fmt.Errorf("unable to read configuration at %s: %v", configFile, err)
 		}
 
 		err = json.Unmarshal(bytes, &config)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to parse configuration at %s: %v", configFile, err)
+			return nil, fmt.Errorf("unable to parse configuration at %s: %v", configFile, err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -142,7 +143,7 @@ func RetrieveConfig() (*ConfigurationOptions, error) {
 	}
 
 	// Convert to absolute paths.
-	var prefix string = ""
+	prefix := ""
 	if !strings.HasPrefix(config.NodeAgentWorkloadHomeDir, "/") {
 		prefix = "/"
 	}

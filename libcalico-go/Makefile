@@ -2,9 +2,13 @@ include ../metadata.mk
 
 PACKAGE_NAME = github.com/projectcalico/calico/libcalico-go
 
-LOCAL_CHECKS = goimports check-gen-files
+LOCAL_CHECKS = check-gen-files
 
 KIND_CONFIG = $(KIND_DIR)/kind-single.config
+
+NETPOL_CNP_VER = v0.3.0
+NETPOL_CNP_CRD_URL = https://raw.githubusercontent.com/kubernetes-sigs/network-policy-api/refs/tags/$(NETPOL_CNP_VER)/config/crd/standard
+NETPOL_CNP_CRD = policy.networking.k8s.io_clusternetworkpolicies.yaml
 
 ###############################################################################
 # Download and include ../lib.Makefile
@@ -18,82 +22,90 @@ include ../lib.Makefile
 BINDIR?=bin
 
 # Create a list of files upon which the generated file depends, skip the generated file itself
-UPGRADE_SRCS := $(filter-out ./lib/upgrade/migrator/clients/v1/k8s/custom/zz_generated.deepcopy.go, \
-                             $(wildcard ./lib/upgrade/migrator/clients/v1/k8s/custom/*.go))
-
-# Create a list of files upon which the generated file depends, skip the generated file itself
-APIS_SRCS := $(filter-out ./lib/apis/v3/zz_generated.deepcopy.go, $(wildcard ./lib/apis/v3/*.go))
+APIS_SRCS := $(filter-out ./lib/apis/internalapi/zz_generated.deepcopy.go, $(wildcard ./lib/apis/internalapi/*.go))
+MODEL_SRCS := $(filter-out ./lib/backend/model/zz_generated.deepcopy.go, $(wildcard ./lib/backend/model/*.go))
 
 .PHONY: clean
 clean:
 	rm -rf $(BINDIR) checkouts
-	find . -name '*.coverprofile' -type f -delete
+	find . -name 'coverprofile.out' -type f -delete
 
 ###############################################################################
 # Building the binary
 ###############################################################################
-GENERATED_FILES:=./lib/apis/v3/zz_generated.deepcopy.go \
-	./lib/upgrade/migrator/clients/v1/k8s/custom/zz_generated.deepcopy.go \
-	./lib/apis/v3/openapi_generated.go \
-	./lib/apis/v1/openapi_generated.go
+GENERATED_FILES:=./lib/apis/internalapi/zz_generated.deepcopy.go \
+	./lib/apis/internalapi/generated.openapi.go \
+	./lib/apis/v1/generated.openapi.go \
+	./lib/backend/model/zz_generated.deepcopy.go \
+	./lib/selector/tokenizer/kind_string.go
 
 .PHONY: gen-files
 ## Force rebuild generated go utilities (e.g. deepcopy-gen) and generated files
 gen-files: gen-crds
 	rm -rf $(GENERATED_FILES)
 	$(MAKE) $(GENERATED_FILES)
-	$(MAKE) fix
+	$(MAKE) fix-changed
 
 ## Force a rebuild of custom resource definition yamls
 gen-crds:
-	rm -rf config
-	$(DOCKER_GO_BUILD) sh -c '$(GIT_CONFIG_SSH) controller-gen  crd:crdVersions=v1 paths=./lib/apis/... output:crd:dir=config/crd/'
-	@rm config/crd/_.yaml
-	# Patch in manual tweaks to the generated CRDs.
-	patch -s -p0 < ./config.patch
-	# The first two lines are a newline and a yaml separator - remove them.
-	$(DOCKER_GO_BUILD) sh -c 'find ./config/crd -name "*.yaml" | xargs sed -i -e 1,2d'
+	# Keep embed.go, which lives with the CRDs it embeds.
+	rm -f config/crd/*.yaml
+	# Generate CRDs using the in-repo Calico-patched controller-gen.
+	$(MAKE) -C $(REPO_ROOT) $(CALICO_CONTROLLER_GEN_BIN)
+	$(DOCKER_GO_BUILD) sh -c '$(GIT_CONFIG_SSH) $(CALICO_CONTROLLER_GEN) crd:allowDangerousTypes=true,crdVersions=v1 paths=./lib/apis/... output:crd:dir=config/crd/'
+	rm -f config/crd/_.yaml
+	rm -f config/crd/_nodes.yaml
+	# Remove the first yaml separator line.
+	$(DOCKER_GO_BUILD) sh -c 'find ./config/crd -name "*.yaml" | xargs sed -i 1d'
+	# Add K8S ClusterNetworkPolicy CRD
+	$(call fetch_file,$(NETPOL_CNP_CRD_URL)/$(NETPOL_CNP_CRD),./config/crd/$(NETPOL_CNP_CRD))
+	# Run prettier to fix indentation
+	docker run --rm --user $(id -u):$(id -g) -v $(CURDIR)/config/crd/:/work/config/crd/ tmknom/prettier --write --parser=yaml "/work/config/crd/*.yaml"
 
-./lib/upgrade/migrator/clients/v1/k8s/custom/zz_generated.deepcopy.go: $(UPGRADE_SRCS)
+./lib/apis/internalapi/zz_generated.deepcopy.go: $(APIS_SRCS)
 	$(DOCKER_GO_BUILD) sh -c 'deepcopy-gen \
 		--v 1 --logtostderr \
 		--go-header-file "./docs/boilerplate.go.txt" \
-		--input-dirs "$(PACKAGE_NAME)/lib/upgrade/migrator/clients/v1/k8s/custom" \
-		--bounding-dirs "github.com/projectcalico/calico/libcalico-go" \
-		--output-file-base zz_generated.deepcopy'
+		--output-file zz_generated.deepcopy.go \
+		"$(PACKAGE_NAME)/lib/apis/internalapi"'
 
-./lib/apis/v3/zz_generated.deepcopy.go: $(APIS_SRCS)
+./lib/backend/model/zz_generated.deepcopy.go: $(MODEL_SRCS)
 	$(DOCKER_GO_BUILD) sh -c 'deepcopy-gen \
 		--v 1 --logtostderr \
 		--go-header-file "./docs/boilerplate.go.txt" \
-		--input-dirs "$(PACKAGE_NAME)/lib/apis/v3" \
-		--bounding-dirs "github.com/projectcalico/calico/libcalico-go" \
-		--output-file-base zz_generated.deepcopy'
+		--output-file zz_generated.deepcopy.go \
+		"$(PACKAGE_NAME)/lib/backend/model"'
 
 # Generate OpenAPI spec
-./lib/apis/v3/openapi_generated.go: $(APIS_SRCS)
+./lib/apis/internalapi/generated.openapi.go: $(APIS_SRCS)
 	$(DOCKER_GO_BUILD) \
            sh -c 'openapi-gen \
                 --v 1 --logtostderr \
                 --go-header-file "./docs/boilerplate.go.txt" \
-                --input-dirs "$(PACKAGE_NAME)/lib/apis/v3,$(PACKAGE_NAME)/lib/apis/v1" \
-                --output-package "$(PACKAGE_NAME)/lib/apis/v3"'
+				--output-dir "./lib/apis/internalapi" \
+                --output-pkg "$(PACKAGE_NAME)/lib/apis/internalapi" \
+                "$(PACKAGE_NAME)/lib/apis/internalapi" \
+				"$(PACKAGE_NAME)/lib/apis/v1"'
 
 	$(DOCKER_GO_BUILD) \
            sh -c 'openapi-gen \
                 --v 1 --logtostderr \
                 --go-header-file "./docs/boilerplate.go.txt" \
-                --input-dirs "$(PACKAGE_NAME)/lib/apis/v1" \
-                --output-package "$(PACKAGE_NAME)/lib/apis/v1"'
+				--output-dir "./lib/apis/v1" \
+                --output-pkg "$(PACKAGE_NAME)/lib/apis/v1" \
+                "$(PACKAGE_NAME)/lib/apis/v1"'
+
+./lib/selector/tokenizer/kind_string.go: ./lib/selector/tokenizer/tokenizer.go
+	$(DOCKER_GO_BUILD) go generate ./lib/selector/tokenizer
 
 ###############################################################################
 # Static checks
 ###############################################################################
 # TODO: re-enable all linters
-LINT_ARGS += --disable gosimple,unused,structcheck,errcheck,deadcode,varcheck,ineffassign,staticcheck,govet
+LINT_ARGS += --disable unused,errcheck,ineffassign,staticcheck
 
 .PHONY: check-gen-files
-check-gen-files: $(GENERATED_FILES) fix gen-crds
+check-gen-files: $(GENERATED_FILES) fix-changed gen-crds
 	git diff --exit-code -- $(GENERATED_FILES) || (echo "The generated targets changed, please 'make gen-files' and commit the results"; exit 1)
 	@if [ "$$(git status --porcelain config/crd)" != "" ]; then \
 	echo "The following CRD file updates to be added"; git status --porcelain config/crd; exit 1; fi
@@ -117,21 +129,30 @@ ut-cover:
 
 WHAT?=.
 GINKGO_FOCUS?=.*
+GINKGO_SKIP?=
 
 .PHONY:ut
 ## Run the fast set of unit tests in a container.
 ut:
+	mkdir -p report
 	$(DOCKER_RUN) --privileged $(CALICO_BUILD) \
-		sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r -skip "\[Datastore\]" -focus="$(GINKGO_FOCUS)" $(WHAT)'
+		sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r --junit-report=libcalico_go_ut.xml --output-dir=report/ --skip "\[Datastore\]" --focus="$(GINKGO_FOCUS)" $(GINKGO_ARGS) $(WHAT)'
+
+BENCH?=.
+BENCHTIME?=1s
+BENCHCOUNT?=1
+BENCHARGS?=
+
+.PHONY:benchmark
+## Run Go benchmarks in a container, e.g. make benchmark WHAT=./lib/ipam/accounting/ BENCHCOUNT=10. BENCHARGS passes extra go test flags, such as -memprofile.
+benchmark:
+	$(DOCKER_RUN) $(CALICO_BUILD) \
+		sh -c 'cd /go/src/$(PACKAGE_NAME) && go test -run=^$$ -bench="$(BENCH)" -benchmem -benchtime=$(BENCHTIME) -count=$(BENCHCOUNT) $(BENCHARGS) $(WHAT)'
 
 .PHONY:fv
 ## Run functional tests against a real datastore in a container.
 fv: fv-setup
-	$(DOCKER_RUN) --privileged \
-		-e KUBECONFIG=/kubeconfig.yaml \
-		-v $(KIND_KUBECONFIG):/kubeconfig.yaml \
-		--dns $(shell docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' coredns) \
-		$(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r -focus "$(GINKGO_FOCUS).*\[Datastore\]|\[Datastore\].*$(GINKGO_FOCUS)" $(WHAT)'
+	$(MAKE) fv-fast
 	$(MAKE) fv-teardown
 
 ## Run the setup required to run the FVs, but don't run any FVs.
@@ -144,11 +165,13 @@ fv-teardown: stop-etcd stop-etcd-tls kind-cluster-destroy stop-coredns
 ## Run the FVs without any setup or teardown. Useful when writing FVs.
 .PHONY:fv-fast
 fv-fast:
+	mkdir -p report
 	$(DOCKER_RUN) --privileged \
 		-e KUBECONFIG=/kubeconfig.yaml \
+		-e CALICO_API_GROUP=$(CALICO_API_GROUP) \
 		-v $(KIND_KUBECONFIG):/kubeconfig.yaml \
 		--dns $(shell docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' coredns) \
-		$(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r -focus "$(GINKGO_FOCUS).*\[Datastore\]|\[Datastore\].*$(GINKGO_FOCUS)" $(WHAT)'
+		$(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r --junit-report=libcalico_go_fv.xml --output-dir=report/ -skip "$(GINKGO_SKIP)" -focus "$(GINKGO_FOCUS).*\[Datastore\]|\[Datastore\].*$(GINKGO_FOCUS)" $(GINKGO_ARGS) $(WHAT)'
 
 # Create a kind cluster, and deploy some resources required for the libcalico-go tests.
 # TODO: Remove the need for this extra target, these should be created by the tests that need them.

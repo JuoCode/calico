@@ -24,15 +24,25 @@ CFLAGS +=  \
 	-Werror \
 	-fno-stack-protector \
 	-O2 \
-	-target bpf \
 	-emit-llvm \
 	-g
 
-# Workaround for Ubuntu placing "asm/types.h" in /usr/include/x86_64-linux-gnu
-TRIPLET := $(shell gcc -dumpmachine)
-CFLAGS += -I/usr/include/$(TRIPLET)
+BPF_TARGET := bpf
+ifeq ($(ARCH),s390x)
+BPF_TARGET := bpfeb
+endif
+CFLAGS += -target $(BPF_TARGET)
 
-CC := clang-16
+# Host architecture define — BPF compilation uses "-target bpf" which
+# doesn't define the host arch, but glibc's gnu/stubs.h needs it to
+# select the right stubs file.  Since BPF always compiles natively,
+# derive this from the build host.
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_ARCH),x86_64)
+CFLAGS += -D__x86_64__
+endif
+
+CC := clang
 LD := llc
 
 C_FILES:=filter.c redir.c sockops.c
@@ -44,7 +54,7 @@ all: $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 bin/%.o: %.ll | bin
-	$(LD) -march=bpf -filetype=obj -o $@ $<
+	$(LD) -march=$(BPF_TARGET) -filetype=obj -o $@ $<
 
 bin:
 	mkdir -p bin

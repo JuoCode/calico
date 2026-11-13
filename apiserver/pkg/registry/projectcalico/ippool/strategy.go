@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 package ippool
 
@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -13,8 +14,6 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 type apiServerStrategy struct {
@@ -32,20 +31,25 @@ func (apiServerStrategy) NamespaceScoped() bool {
 }
 
 func (apiServerStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	pool := obj.(*calico.IPPool)
+	pool.Status = nil
 }
 
 func (apiServerStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPool := obj.(*calico.IPPool)
+	oldPool := old.(*calico.IPPool)
+	newPool.Status = oldPool.Status
 }
 
 func (apiServerStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	return field.ErrorList{}
 }
 
-func (apiServerStrategy) AllowCreateOnUpdate() bool {
+func (apiServerStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (apiServerStrategy) AllowUnconditionalUpdate() bool {
+func (apiServerStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -64,12 +68,31 @@ func (apiServerStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 	return field.ErrorList{}
 }
 
+type apiServerStatusStrategy struct {
+	apiServerStrategy
+}
+
+func NewStatusStrategy(strategy apiServerStrategy) apiServerStatusStrategy {
+	return apiServerStatusStrategy{strategy}
+}
+
+func (apiServerStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPool := obj.(*calico.IPPool)
+	oldPool := old.(*calico.IPPool)
+	newPool.Spec = oldPool.Spec
+	newPool.Labels = oldPool.Labels
+}
+
+func (apiServerStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return field.ErrorList{}
+}
+
 func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	apiserver, ok := obj.(*calico.IPPool)
 	if !ok {
 		return nil, nil, fmt.Errorf("given object is not a IPPool")
 	}
-	return labels.Set(apiserver.ObjectMeta.Labels), IPPoolToSelectableFields(apiserver), nil
+	return labels.Set(apiserver.Labels), IPPoolToSelectableFields(apiserver), nil
 }
 
 // MatchIPPool is the filter used by the generic etcd backend to watch events

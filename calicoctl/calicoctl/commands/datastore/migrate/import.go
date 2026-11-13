@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,64 +22,32 @@ import (
 	"os"
 	"strings"
 
-	"github.com/docopt/docopt-go"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	yaml "github.com/projectcalico/go-yaml-wrapper"
+	"sigs.k8s.io/yaml"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/crds"
-	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
+	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
+	lcconfig "github.com/projectcalico/calico/libcalico-go/config"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	calicoErrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
-func Import(args []string) error {
-	doc := `Usage:
-  <BINARY_NAME> datastore migrate import --filename=<FILENAME> [--config=<CONFIG>] [--allow-version-mismatch]
-
-Options:
-  -h --help                    Show this screen.
-  -f --filename=<FILENAME>     Filename to use to import resources.  If set to
-                               "-" loads from stdin.
-  -c --config=<CONFIG>         Path to the file containing connection
-                               configuration in YAML or JSON format.
-                               [default: ` + constants.DefaultConfigPath + `]
-     --allow-version-mismatch  Allow client and cluster versions mismatch.
-
-Description:
-  Import the contents of the etcdv3 datastore from the file created by the
-  export command.
-`
-	// Replace all instances of BINARY_NAME with the name of the binary.
-	name, _ := util.NameAndDescription()
-	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", name)
-
-	parsedArgs, err := docopt.ParseArgs(doc, args, "")
-	if err != nil {
-		return fmt.Errorf("Invalid option: 'calicoctl %s'. Use flag '--help' to read about a specific subcommand.", strings.Join(args, " "))
-	}
-	if len(parsedArgs) == 0 {
-		return nil
-	}
-
-	// Note: Intentionally not check version mismatch for this command
-
-	cf := parsedArgs["--config"].(string)
-	cfg, err := clientmgr.LoadClientConfig(cf)
+// Import imports the contents of the etcdv3 datastore from a file created by
+// Export. Version mismatch is intentionally not checked for this command.
+func Import(config, filename string) error {
+	cfg, err := clientmgr.LoadClientConfig(config)
 	if err != nil {
 		log.Info("Error loading config")
 		return err
@@ -98,55 +66,53 @@ Description:
 
 	// Check that the datastore configured datastore is kubernetes
 	if cfg.Spec.DatastoreType != apiconfig.Kubernetes {
-		return fmt.Errorf("Invalid datastore type: %s to import to for datastore migration. Datastore type must be kubernetes", cfg.Spec.DatastoreType)
+		return fmt.Errorf("invalid datastore type: %s to import to for datastore migration. Datastore type must be kubernetes", cfg.Spec.DatastoreType)
 	}
 
 	err = importCRDs(cfg)
 	if err != nil {
-		return fmt.Errorf("Error applying the CRDs necessary to begin datastore import: %s", err)
+		return fmt.Errorf("error applying the CRDs necessary to begin datastore import: %s", err)
 	}
 
-	err = checkCalicoResourcesNotExist(parsedArgs, client)
+	err = checkCalicoResourcesNotExist(config, client)
 	if err != nil {
 		// TODO: Add something like 'calicoctl datastore migrate clean' to delete all the CRDs to wipe out the Calico resources.
-		return fmt.Errorf("Datastore already has Calico resources: %s. Clear out all Calico resources by deleting all Calico CRDs.", err)
+		return fmt.Errorf("datastore already has Calico resources: %s. Clear out all Calico resources by deleting all Calico CRDs", err)
 	}
 
 	// Ensure that the cluster info resource is initialized.
 	ctx := context.Background()
 	if err := client.EnsureInitialized(ctx, "", ""); err != nil {
-		return fmt.Errorf("Unable to initialize cluster information for the datastore migration: %s", err)
+		return fmt.Errorf("unable to initialize cluster information for the datastore migration: %s", err)
 	}
 
 	// Make sure that the datastore is locked. Since the call to EnsureInitialized
 	// should initialize it to unlocked, lock it before we continue.
 	locked, err := common.CheckLocked(ctx, client)
 	if err != nil {
-		return fmt.Errorf("Error while checking if datastore was locked: %s", err)
+		return fmt.Errorf("error while checking if datastore was locked: %s", err)
 	} else if !locked {
-		err := Lock([]string{"datastore", "migrate", "lock", "-c", cf})
-		if err != nil {
-			return fmt.Errorf("Error while attempting to lock the datastore for import: %s", err)
+		if err := Lock(config, false); err != nil {
+			return fmt.Errorf("error while attempting to lock the datastore for import: %s", err)
 		}
 	}
 
 	// Split file into v3 API, ClusterGUID, and IPAM components
-	filename := parsedArgs["--filename"].(string)
 	v3Yaml, clusterInfoJson, ipamJson, err := splitImportFile(filename)
 	if err != nil {
-		return fmt.Errorf("Error while reading migration file: %s\n", err)
+		return fmt.Errorf("error while reading migration file: %s", err)
 	}
 
 	// Apply v3 API resources
 	err = updateV3Resources(cfg, v3Yaml)
 	if err != nil {
-		return fmt.Errorf("Failed to import v3 resources: %s\n", err)
+		return fmt.Errorf("failed to import v3 resources: %s", err)
 	}
 
 	// Update the clusterinfo resource with the data from the old datastore.
 	err = updateClusterInfo(ctx, client, clusterInfoJson)
 	if err != nil {
-		return fmt.Errorf("Failed to update cluster information: %s", err)
+		return fmt.Errorf("failed to update cluster information: %s", err)
 	}
 
 	// Import IPAM components
@@ -154,16 +120,16 @@ Description:
 	ipam := NewMigrateIPAM(client)
 	err = json.Unmarshal(ipamJson, ipam)
 	if err != nil {
-		return fmt.Errorf("Failed to read IPAM resources: %s\n", err)
+		return fmt.Errorf("failed to read IPAM resources: %s", err)
 	}
 	results := ipam.PushToDatastore()
 
 	// Handle the IPAM results
 	if results.numHandled == 0 {
 		if results.numResources == 0 {
-			return fmt.Errorf("No IPAM resources specified in file")
+			return fmt.Errorf("no IPAM resources specified in file")
 		} else {
-			return fmt.Errorf("Failed to import any IPAM resources: %v", results.resErrs)
+			return fmt.Errorf("failed to import any IPAM resources: %v", results.resErrs)
 		}
 	} else if len(results.resErrs) == 0 {
 		fmt.Printf("Successfully applied %d IPAM resource(s)\n", results.numHandled)
@@ -172,7 +138,7 @@ Description:
 			fmt.Printf("Partial success: ")
 			fmt.Printf("applied the first %d out of %d resources:\n", results.numHandled, results.numResources)
 		}
-		return fmt.Errorf("Hit error(s): %v", results.resErrs)
+		return fmt.Errorf("hit error(s): %v", results.resErrs)
 	}
 
 	fmt.Print("Datastore information successfully imported. Please refer to the datastore migration documentation for next steps.\n")
@@ -194,7 +160,7 @@ func splitImportFile(filename string) ([]byte, []byte, []byte, error) {
 
 	split := bytes.Split(b, []byte("===\n"))
 	if len(split) != 3 {
-		return nil, nil, nil, fmt.Errorf("Imported file: %s is improperly formatted. Try recreating with 'calicoctl export'", fname)
+		return nil, nil, nil, fmt.Errorf("imported file: %s is improperly formatted. Try recreating with 'calicoctl export'", fname)
 	}
 
 	// First chunk should be the v3 resource YAML.
@@ -203,7 +169,7 @@ func splitImportFile(filename string) ([]byte, []byte, []byte, error) {
 	return split[0], split[1], split[2], nil
 }
 
-func checkCalicoResourcesNotExist(args map[string]interface{}, c client.Interface) error {
+func checkCalicoResourcesNotExist(config string, c client.Interface) error {
 	// Loop through all the v3 resources to see if anything is returned
 	extendedV3Resources := append(allV3Resources, "clusterinfo")
 	for _, r := range extendedV3Resources {
@@ -213,10 +179,10 @@ func checkCalicoResourcesNotExist(args map[string]interface{}, c client.Interfac
 		}
 
 		// Create mocked args in order to retrieve Get resources.
-		mockArgs := map[string]interface{}{
+		mockArgs := map[string]any{
 			"<KIND>":   r,
 			"<NAME>":   []string{},
-			"--config": args["--config"].(string),
+			"--config": config,
 			"--export": false,
 			"--output": "ps",
 			"get":      true,
@@ -232,33 +198,53 @@ func checkCalicoResourcesNotExist(args map[string]interface{}, c client.Interfac
 		// Loop through the result lists and see if anything exists
 		for _, resource := range results.Resources {
 			if meta.LenList(resource) > 0 {
-				if r == "networkpolicies" {
+				switch r {
+				case "networkpolicies":
 					// For networkpolicies, having K8s network policies should not throw an error
 					objs, err := meta.ExtractList(resource)
 					if err != nil {
-						return fmt.Errorf("Error extracting network policies for inspection: %s", err)
+						return fmt.Errorf("error extracting network policies for inspection: %s", err)
 					}
 
 					for _, obj := range objs {
 						metaObj, ok := obj.(v1.ObjectMetaAccessor)
 						if !ok {
-							return fmt.Errorf("Unable to convert Calico network policy for inspection")
+							return fmt.Errorf("unable to convert Calico network policy for inspection")
 						}
 
 						// Make sure that the network policy is a K8s network policy
-						if !strings.HasPrefix(metaObj.GetObjectMeta().GetName(), conversion.K8sNetworkPolicyNamePrefix) {
-							return fmt.Errorf("Found existing Calico %s resource", results.SingleKind)
+						if !strings.HasPrefix(metaObj.GetObjectMeta().GetName(), converter.KubernetesNetworkPolicyEtcdPrefix) {
+							return fmt.Errorf("found existing Calico %s resource", results.SingleKind)
 						}
 					}
-				} else {
-					return fmt.Errorf("Found existing Calico %s resource", results.SingleKind)
+				case "tiers":
+					// The protected built-in tiers (default, kube-admin, kube-baseline) are
+					// created automatically and can't be deleted, so they'll be present in any
+					// KDD target and shouldn't block an import.
+					objs, err := meta.ExtractList(resource)
+					if err != nil {
+						return fmt.Errorf("error extracting tiers for inspection: %w", err)
+					}
+
+					for _, obj := range objs {
+						metaObj, ok := obj.(v1.ObjectMetaAccessor)
+						if !ok {
+							return fmt.Errorf("unable to convert Calico tier for inspection")
+						}
+
+						if !names.TierIsProtected(metaObj.GetObjectMeta().GetName()) {
+							return fmt.Errorf("found existing Calico %s resource", results.SingleKind)
+						}
+					}
+				default:
+					return fmt.Errorf("found existing Calico %s resource", results.SingleKind)
 				}
 			}
 
 			if results.FileInvalid {
-				return fmt.Errorf("Failed to execute command: %v", results.Err)
+				return fmt.Errorf("failed to execute command: %v", results.Err)
 			} else if results.Err != nil {
-				return fmt.Errorf("Failed to retrieve %s resources during datastore check: %v", resourceDisplayMap[r], results.Err)
+				return fmt.Errorf("failed to retrieve %s resources during datastore check: %v", resourceDisplayMap[r], results.Err)
 			}
 		}
 	}
@@ -267,11 +253,11 @@ func checkCalicoResourcesNotExist(args map[string]interface{}, c client.Interfac
 	ipam := NewMigrateIPAM(c)
 	err := ipam.PullFromDatastore()
 	if err != nil {
-		return fmt.Errorf("Failed to retrieve IPAM resources during datastore check: %s", err)
+		return fmt.Errorf("failed to retrieve IPAM resources during datastore check: %s", err)
 	}
 
 	if !ipam.IsEmpty() {
-		return fmt.Errorf("Found existing IPAM resources")
+		return fmt.Errorf("found existing IPAM resources")
 	}
 
 	return nil
@@ -282,13 +268,13 @@ func updateClusterInfo(ctx context.Context, c client.Interface, clusterInfoJson 
 	migrated := apiv3.ClusterInformation{}
 	err := json.Unmarshal(clusterInfoJson, &migrated)
 	if err != nil {
-		return fmt.Errorf("Error reading exported cluster info for migration: %s", err)
+		return fmt.Errorf("error reading exported cluster info for migration: %s", err)
 	}
 
 	// Get the "default" cluster info resource.
 	clusterinfo, err := c.ClusterInformation().Get(ctx, "default", options.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("Error retrieving current cluster info for migration: %s", err)
+		return fmt.Errorf("error retrieving current cluster info for migration: %s", err)
 	}
 
 	// Update the calico version and cluster GUID.
@@ -296,7 +282,7 @@ func updateClusterInfo(ctx context.Context, c client.Interface, clusterInfoJson 
 	clusterinfo.Spec.CalicoVersion = migrated.Spec.CalicoVersion
 	_, err = c.ClusterInformation().Update(ctx, clusterinfo, options.SetOptions{})
 	if err != nil {
-		return fmt.Errorf("Error updating current cluster info for migration: %s", err)
+		return fmt.Errorf("error updating current cluster info for migration: %s", err)
 	}
 
 	return nil
@@ -306,38 +292,38 @@ func updateV3Resources(cfg *apiconfig.CalicoAPIConfig, data []byte) error {
 	// Create tempfile so the v3 resources can be created using Apply
 	tempfile, err := os.CreateTemp("", "v3migration")
 	if err != nil {
-		return fmt.Errorf("Error while creating temporary v3 migration file: %s\n", err)
+		return fmt.Errorf("error while creating temporary v3 migration file: %s", err)
 	}
-	defer os.Remove(tempfile.Name())
+	defer func() { _ = os.Remove(tempfile.Name()) }()
 
 	if _, err := tempfile.Write(data); err != nil {
-		return fmt.Errorf("Error while writing to temporary v3 migration file: %s\n", err)
+		return fmt.Errorf("error while writing to temporary v3 migration file: %s", err)
 	}
 
 	// Create a tempfile for the config so QPS will be overwritten
 	tempConfigFile, err := os.CreateTemp("", "qpsconfig")
 	if err != nil {
-		return fmt.Errorf("Error while creating temporary v3 migration config file: %s\n", err)
+		return fmt.Errorf("error while creating temporary v3 migration config file: %s", err)
 	}
-	defer os.Remove(tempConfigFile.Name())
+	defer func() { _ = os.Remove(tempConfigFile.Name()) }()
 
 	cfgData, err := yaml.Marshal(cfg)
 	if err != nil {
-		return fmt.Errorf("Error while serializing temporary v3 migration config file: %s\n", err)
+		return fmt.Errorf("error while serializing temporary v3 migration config file: %s", err)
 	}
 
 	if _, err := tempConfigFile.Write(cfgData); err != nil {
-		return fmt.Errorf("Error while writing to temporary v3 migration config file: %s\n", err)
+		return fmt.Errorf("error while writing to temporary v3 migration config file: %s", err)
 	}
 
-	mockArgs := map[string]interface{}{
+	mockArgs := map[string]any{
 		"--config":   tempConfigFile.Name(),
 		"--filename": tempfile.Name(),
 		"apply":      true,
 	}
 	err = applyV3(mockArgs)
 	if err != nil {
-		return fmt.Errorf("Failed to import v3 resources: %s\n", err)
+		return fmt.Errorf("failed to import v3 resources: %s", err)
 	}
 
 	return nil
@@ -359,7 +345,7 @@ func importCRDs(cfg *apiconfig.CalicoAPIConfig) error {
 	log.Debugf("Created k8s CRD ClientSet: %+v", cs)
 
 	// Apply the CRDs
-	calicoCRDs, err := crds.CalicoCRDs()
+	calicoCRDs, err := lcconfig.AllCRDs()
 	if err != nil {
 		return err
 	}
@@ -372,7 +358,7 @@ func importCRDs(cfg *apiconfig.CalicoAPIConfig) error {
 				// Need to retrieve the current CRD first.
 				currentCRD, err := cs.ApiextensionsV1().CustomResourceDefinitions().Get(context.Background(), crd.GetObjectMeta().GetName(), v1.GetOptions{})
 				if err != nil {
-					return fmt.Errorf("Error retrieving existing CRD to update: %s: %s", crd.GetObjectMeta().GetName(), err)
+					return fmt.Errorf("error retrieving existing CRD to update: %s: %s", crd.GetObjectMeta().GetName(), err)
 				}
 
 				// Use the resource version so that the current CRD can be overwritten.
@@ -381,10 +367,10 @@ func importCRDs(cfg *apiconfig.CalicoAPIConfig) error {
 				// Update the CRD.
 				_, err = cs.ApiextensionsV1().CustomResourceDefinitions().Update(context.Background(), crd, v1.UpdateOptions{})
 				if err != nil {
-					return fmt.Errorf("Error updating CRD %s: %s", crd.GetObjectMeta().GetName(), err)
+					return fmt.Errorf("error updating CRD %s: %s", crd.GetObjectMeta().GetName(), err)
 				}
 			} else {
-				return fmt.Errorf("Error creating CRD %s: %s", crd.GetObjectMeta().GetName(), err)
+				return fmt.Errorf("error creating CRD %s: %s", crd.GetObjectMeta().GetName(), err)
 			}
 		}
 		log.Debugf("Applied %s CRD", crd.GetObjectMeta().GetName())
@@ -393,14 +379,14 @@ func importCRDs(cfg *apiconfig.CalicoAPIConfig) error {
 	return nil
 }
 
-func applyV3(args map[string]interface{}) error {
+func applyV3(args map[string]any) error {
 	results := common.ExecuteConfigCommand(args, common.ActionApply)
 	log.Infof("results: %+v", results)
 
 	if results.FileInvalid {
-		return fmt.Errorf("Failed to execute command: %v", results.Err)
+		return fmt.Errorf("failed to execute command: %v", results.Err)
 	} else if results.NumHandled == 0 {
-		return fmt.Errorf("Failed to apply any resources: %v", results.ResErrs)
+		return fmt.Errorf("failed to apply any resources: %v", results.ResErrs)
 	} else if len(results.ResErrs) == 0 {
 		if results.SingleKind != "" {
 			fmt.Printf("Successfully applied %d '%s' resource(s)\n", results.NumHandled, results.SingleKind)
@@ -415,7 +401,7 @@ func applyV3(args map[string]interface{}) error {
 			case calicoErrors.ErrorResourceDoesNotExist:
 				// Check that the error is for a Node
 				if key, ok := e.Identifier.(model.ResourceKey); ok {
-					if key.Kind == libapiv3.KindNode {
+					if key.Kind == internalapi.KindNode {
 						fmt.Printf("[WARNING] Attempted to import node %v from etcd that references a nonexistent Kubernetes node. Skipping that node. Non-Kubernetes nodes are not supported in the Kubernetes datastore and will be skipped.", e.Identifier)
 						continue
 					}
@@ -427,7 +413,7 @@ func applyV3(args map[string]interface{}) error {
 		}
 
 		if len(errors) > 0 {
-			return fmt.Errorf("Hit error(s): %v", errors)
+			return fmt.Errorf("hit error(s): %v", errors)
 		}
 	}
 

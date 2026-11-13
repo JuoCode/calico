@@ -218,7 +218,8 @@ if ${USE_TYPHA}; then
        -v ${PWD}:/testcode \
        -w /testcode/k8sfv/output \
        --restart=on-failure:2 \
-       $FV_TYPHAIMAGE
+       $FV_TYPHAIMAGE \
+       component typha
     typha_ip=$(get_container_ip ${prefix}-typha)
     typha_hostname=$(get_container_hostname ${prefix}-typha)
     typha_felix_args="-e FELIX_TYPHAADDR=${typha_ip}:5473"
@@ -240,6 +241,7 @@ docker run --detach --privileged --name ${prefix}-felix \
        -e FELIX_PROMETHEUSMETRICSENABLED=true \
        -e FELIX_USAGEREPORTINGENABLED=false \
        -e FELIX_DEBUGMEMORYPROFILEPATH="heap-<timestamp>" \
+       -e FELIX_NFTABLESENABLED=${FELIX_FV_NFTABLES} \
        -e K8S_API_ENDPOINT=${k8s_api_endpoint} \
        -e K8S_INSECURE_SKIP_TLS_VERIFY=true \
        -e K8SFV_LOG_LEVEL=${K8SFV_LOG_LEVEL} \
@@ -253,10 +255,10 @@ felix_ip=$(get_container_ip ${prefix}-felix)
 felix_hostname=$(get_container_hostname ${prefix}-felix)
 
 # Run the test suite.
-run="cd /testcode/k8sfv/output && /testcode/bin/k8sfv.test -ginkgo.v -k8s-api-endpoint ${k8s_api_endpoint} -felix-ip ${felix_ip} -felix-hostname ${felix_hostname} -prometheus-push-url \"${PROMPG_URL}\" -code-level \"${CODE_LEVEL}\""
+run="cd /testcode/k8sfv/output && /testcode/bin/k8sfv.test --ginkgo.v -k8s-api-endpoint ${k8s_api_endpoint} -felix-ip ${felix_ip} -felix-hostname ${felix_hostname} -prometheus-push-url \"${PROMPG_URL}\" -code-level \"${CODE_LEVEL}\""
 if test -n "${GINKGO_FOCUS}"; then
-    docker exec ${prefix}-felix /bin/sh -c \
-        "${run} -ginkgo.focus \"${GINKGO_FOCUS}\""
+    docker exec -e USE_TYPHA=${USE_TYPHA} ${prefix}-felix /bin/sh -c \
+        "${run} --ginkgo.focus=\"${GINKGO_FOCUS}\""
 elif ${JUST_A_MINUTE}; then
     tmp=$(mktemp)
     # Run all the tests that are _not_ marked as "[slow]", and fail
@@ -264,13 +266,23 @@ elif ${JUST_A_MINUTE}; then
     # test should be marked as "[slow]" if it normally takes longer
     # than 1 minute - so this allows a buffer of 1 extra minute to
     # allow for executor slowness.
-    docker exec ${prefix}-felix /bin/sh -c \
-       "${run} -ginkgo.skip \"\\[slow\\]\" -ginkgo.slowSpecThreshold 120" | tee $tmp
+    docker exec -e USE_TYPHA=${USE_TYPHA} ${prefix}-felix /bin/sh -c \
+       "${run} --ginkgo.skip=\"\\[slow\\]\" --ginkgo.slow-spec-threshold=120s" | tee $tmp
     # Fail if the docker command returned failure
     cmdStatus=${PIPESTATUS[0]}
     if [ $cmdStatus -ne 0 ]; then
         echo "docker or k7sfv.test command failed with RC $cmdStatus"
         echo "Status 137 can be caused by the felix container (in which we run the test binary) dying."
+        echo "Dumping felix container logs..."
+        echo
+
+        docker logs ${prefix}-felix
+
+        echo
+        echo "Finished dumping felix container logs."
+        echo "docker or k7sfv.test command failed with RC $cmdStatus"
+        echo "Status 137 can be caused by the felix container (in which we run the test binary) dying."
+
         rm -f $tmp
         exit 1
     fi
@@ -286,7 +298,7 @@ elif ${JUST_A_MINUTE}; then
         exit 1
     fi
 else
-    docker exec ${prefix}-felix /bin/sh -c \
+    docker exec -e USE_TYPHA=${USE_TYPHA} ${prefix}-felix /bin/sh -c \
         "${run}"
 fi
 

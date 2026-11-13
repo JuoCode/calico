@@ -22,7 +22,7 @@ import (
 
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/proto"
-	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -31,7 +31,7 @@ import (
 // VXLANResolver is responsible for resolving node IPs and node config to calculate the
 // VTEP for each host.  It registers for:
 //
-//   - model.HostIPKey
+//   - model.ResourceKey (for v3 Node resources)
 //   - model.HostConfigKey
 //
 // VXLAN routes are calculated by the L3RouteResolver, and to be valid for the dataplane
@@ -53,7 +53,7 @@ type VXLANResolver struct {
 
 	// Store node metadata indexed by node name, and routes by the
 	// block that contributed them. The following comprises the full internal data model.
-	nodeNameToNode              map[string]*apiv3.Node
+	nodeNameToNode              map[string]*internalapi.Node
 	nodeNameToVXLANTunnelAddr   map[string]string
 	nodeNameToIPv4Addr          map[string]string
 	nodeNameToVXLANMac          map[string]string
@@ -62,14 +62,13 @@ type VXLANResolver struct {
 	nodeNameToVXLANMacV6        map[string]string
 	nodeNameToSentVTEP          map[string]*proto.VXLANTunnelEndpointUpdate
 	vxlanPools                  map[string]model.IPPool
-	useNodeResourceUpdates      bool
 }
 
-func NewVXLANResolver(hostname string, callbacks vxlanCallbacks, useNodeResourceUpdates bool) *VXLANResolver {
+func NewVXLANResolver(hostname string, callbacks vxlanCallbacks) *VXLANResolver {
 	return &VXLANResolver{
 		hostname:                    hostname,
 		callbacks:                   callbacks,
-		nodeNameToNode:              map[string]*apiv3.Node{},
+		nodeNameToNode:              map[string]*internalapi.Node{},
 		nodeNameToVXLANTunnelAddr:   map[string]string{},
 		nodeNameToIPv4Addr:          map[string]string{},
 		nodeNameToVXLANMac:          map[string]string{},
@@ -78,31 +77,25 @@ func NewVXLANResolver(hostname string, callbacks vxlanCallbacks, useNodeResource
 		nodeNameToVXLANMacV6:        map[string]string{},
 		nodeNameToSentVTEP:          map[string]*proto.VXLANTunnelEndpointUpdate{},
 		vxlanPools:                  map[string]model.IPPool{},
-		useNodeResourceUpdates:      useNodeResourceUpdates,
 	}
 }
 
 func (c *VXLANResolver) RegisterWith(allUpdDispatcher *dispatcher.Dispatcher) {
-	if c.useNodeResourceUpdates {
-		allUpdDispatcher.Register(model.ResourceKey{}, c.OnResourceUpdate)
-	} else {
-		allUpdDispatcher.Register(model.HostIPKey{}, c.OnHostIPUpdate)
-	}
-
+	allUpdDispatcher.Register(model.ResourceKey{}, c.OnResourceUpdate)
 	allUpdDispatcher.Register(model.HostConfigKey{}, c.OnHostConfigUpdate)
 }
 
 func (c *VXLANResolver) OnResourceUpdate(update api.Update) (_ bool) {
 	resourceKey := update.Key.(model.ResourceKey)
-	if resourceKey.Kind != apiv3.KindNode {
+	if resourceKey.Kind != internalapi.KindNode {
 		return
 	}
 
 	nodeName := update.Key.(model.ResourceKey).Name
 	logCtx := logrus.WithField("node", nodeName).WithField("update", update)
 	logCtx.Debug("OnResourceUpdate triggered")
-	if update.Value != nil && update.Value.(*apiv3.Node).Spec.BGP != nil {
-		node := update.Value.(*apiv3.Node)
+	if update.Value != nil && update.Value.(*internalapi.Node).Spec.BGP != nil {
+		node := update.Value.(*internalapi.Node)
 		bgp := node.Spec.BGP
 		c.nodeNameToNode[nodeName] = node
 		ipv4, _, err := cnet.ParseCIDROrIP(bgp.IPv4Address)
@@ -124,23 +117,6 @@ func (c *VXLANResolver) OnResourceUpdate(update api.Update) (_ bool) {
 		c.sendVTEPUpdateOrRemove(nodeName)
 	}
 
-	return
-}
-
-// OnHostIPUpdate gets called whenever a node IP address changes. On an add/update,
-// we need to check if there is a VTEP which is now valid, and trigger programming
-// of them to the data plane. On a delete, we need to withdraw the VTEP associated
-// with the node.
-func (c *VXLANResolver) OnHostIPUpdate(update api.Update) (_ bool) {
-	nodeName := update.Key.(model.HostIPKey).Hostname
-	logrus.WithField("node", nodeName).Debug("OnHostIPUpdate triggered")
-
-	if update.Value != nil {
-		c.onNodeIPUpdate(nodeName, update.Value.(*cnet.IP).String(), "")
-	} else {
-		delete(c.nodeNameToIPv4Addr, nodeName)
-		c.sendVTEPUpdateOrRemove(nodeName)
-	}
 	return
 }
 
@@ -294,7 +270,7 @@ func (c *VXLANResolver) sendVTEPUpdateOrRemove(node string) {
 	hasV4Info, hasV6Info := c.hasVTEPInfo(node)
 	oldVTEP, hasSentVTEP := c.nodeNameToSentVTEP[node]
 
-	if !(hasV4Info || hasV6Info) {
+	if !hasV4Info && !hasV6Info {
 		if hasSentVTEP {
 			logCtx.Info("Missing both IPv4 and IPv6 VTEP information for node, withdrawing VTEP from dataplane")
 			delete(c.nodeNameToSentVTEP, node)

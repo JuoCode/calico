@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,18 +25,23 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/projectcalico/calico/felix/fv/cgroup"
-	"github.com/projectcalico/calico/felix/fv/connectivity"
-	"github.com/projectcalico/calico/felix/fv/utils"
-
+	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ns"
 	nsutils "github.com/containernetworking/plugins/pkg/testutils"
 	"github.com/docopt/docopt-go"
 	"github.com/ishidawataru/sctp"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+
+	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/linux"
+	"github.com/projectcalico/calico/cni-plugin/pkg/types"
+	"github.com/projectcalico/calico/felix/fv/cgroup"
+	"github.com/projectcalico/calico/felix/fv/connectivity"
+	"github.com/projectcalico/calico/felix/fv/utils"
+	"github.com/projectcalico/calico/lib/logrusr"
 )
 
 const usage = `test-workload, test workload for Felix FV testing.
@@ -43,11 +49,12 @@ const usage = `test-workload, test workload for Felix FV testing.
 If <interface-name> is "", the workload will start in the current namespace.
 
 Usage:
-  test-workload [--protocol=<protocol>] [--namespace-path=<path>] [--sidecar-iptables] [--up-lo] [--mtu=<mtu>] [--listen-any-ip] <interface-name> <ip-address> <ports>
+  test-workload [--protocol=<protocol>] [--namespace-path=<path>] [--sidecar-iptables] [--mtu=<mtu>] [--listen-any-ip] [--netkit] [--no-keepalive] <interface-name> <ip-address> <ports>
 `
 
 func main() {
 	log.SetLevel(log.DebugLevel)
+	logrusr.ConfigureFormatter("test-workload")
 
 	// If we've been told to, move into this felix's cgroup.
 	cgroup.MaybeMoveToFelixCgroupv2()
@@ -66,7 +73,6 @@ func main() {
 		nsPath = arg.(string)
 	}
 	sidecarIptables := arguments["--sidecar-iptables"].(bool)
-	upLo := arguments["--up-lo"].(bool)
 	mtu := 1450
 	if arg, ok := arguments["--mtu"]; ok && arg != nil {
 		mtu, err = strconv.Atoi(arg.(string))
@@ -77,6 +83,15 @@ func main() {
 	listenAnyIP := false
 	if arg, ok := arguments["--listen-any-ip"]; ok && arg.(bool) {
 		listenAnyIP = true
+	}
+	useNetkit := false
+	if arg, ok := arguments["--netkit"]; ok && arg.(bool) {
+		useNetkit = true
+	}
+	// Go enables a 15s keepalive on accepted TCP connections by default.
+	var lc net.ListenConfig
+	if arg, ok := arguments["--no-keepalive"]; ok && arg.(bool) {
+		lc.KeepAlive = -1
 	}
 
 	ports := strings.Split(portsStr, ",")
@@ -112,179 +127,80 @@ func main() {
 				log.WithError(err).Panic("Giving up after multiple retries")
 			}
 		}
-		log.WithField("namespace", namespace).Debug("Created namespace")
+		log.WithField("namespace", namespace.Path()).Debug("Created namespace")
 
-		peerName := "w" + interfaceName
-		if len(peerName) > 11 {
-			peerName = peerName[:11]
+		hostVethName := interfaceName
+		var addrs []*cniv1.IPConfig
+		if ipv4Addr != "" {
+			addrs = append(addrs, &cniv1.IPConfig{
+				Address: net.IPNet{
+					IP:   net.ParseIP(ipv4Addr),
+					Mask: net.CIDRMask(32, 32),
+				},
+			})
 		}
-		// Create a veth pair.
-		la := netlink.NewLinkAttrs()
-		la.Name = interfaceName
-		la.MTU = mtu
-		veth := &netlink.Veth{
-			LinkAttrs: la,
-			PeerName:  peerName,
-		}
-		err = netlink.LinkAdd(veth)
-		panicIfError(err)
-		log.WithField("veth", veth).Debug("Created veth pair")
-
-		err := netlink.LinkSetUp(veth)
-		panicIfError(err)
-
-		peerVeth, err := netlink.LinkByName(veth.PeerName)
-		panicIfError(err)
-
-		// Need to set the peer up in order to get an IPv6 address.
-		err = netlink.LinkSetUp(peerVeth)
-		panicIfError(err)
-
-		var hostIPv6Addr net.IP
-
 		if ipv6Addr != "" {
-			attempts := 0
-			for {
-				// No need to add a dummy next hop route as the host veth device will already have an IPv6
-				// link local address that can be used as a next hop.
-				// Just fetch the address of the host end of the veth and use it as the next hop.
-				addresses, err := netlink.AddrList(veth, netlink.FAMILY_V6)
-				if err != nil {
-					log.WithError(err).Panic("Error listing IPv6 addresses for the host side of the veth pair")
-				}
-
-				if len(addresses) < 1 {
-					attempts++
-					if attempts > 30 {
-						log.WithError(err).Panic("Giving up waiting for IPv6 addresses after multiple retries")
-					}
-
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-
-				hostIPv6Addr = addresses[0].IP
-				break
-			}
+			addrs = append(addrs, &cniv1.IPConfig{
+				Address: net.IPNet{
+					IP:   net.ParseIP(ipv6Addr),
+					Mask: net.CIDRMask(128, 128),
+				},
+			})
 		}
-
-		// Move the workload end of the pair into the namespace, and set it up.
-		workloadIf, err := netlink.LinkByName(veth.PeerName)
-		log.WithField("workloadIf", workloadIf).Debug("Workload end")
+		_, v4Default, err := net.ParseCIDR("0.0.0.0/0")
 		panicIfError(err)
-		err = netlink.LinkSetNsFd(workloadIf, int(namespace.Fd()))
+		_, v6Default, err := net.ParseCIDR("::/0")
 		panicIfError(err)
-		err = namespace.Do(func(_ ns.NetNS) (err error) {
-			err = utils.RunCommand("ip", "link", "set", veth.PeerName, "name", "eth0")
-			if err != nil {
-				return
-			}
-			err = utils.RunCommand("ip", "link", "set", "eth0", "up")
-			if err != nil {
-				return
-			}
-
-			err = utils.RunCommand("ip", "link", "set", "dev", "lo", "up")
-			if err != nil {
-				log.WithError(err).Info("Failed to set dev lo up")
-			}
-
-			if ipv6Addr != "" {
-				// Make sure ipv6 is enabled in the container/pod network namespace.
-				// Without these sysctls enabled, interfaces will come up but they won't get a link local IPv6 address,
-				// which is required to add the default IPv6 route.
-				if err = writeProcSys("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0"); err != nil {
-					log.WithError(err).Error("Failed to enable IPv6.")
-					return
-				}
-
-				if err = writeProcSys("/proc/sys/net/ipv6/conf/default/disable_ipv6", "0"); err != nil {
-					log.WithError(err).Error("Failed to enable IPv6 by default.")
-					return
-				}
-
-				if err = writeProcSys("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "0"); err != nil {
-					log.WithError(err).Error("Failed to enable IPv6 on the loopback interface.")
-					return
-				}
-
-				err = utils.RunCommand("ip", "-6", "addr", "add", ipv6Addr+"/128", "dev", "eth0")
-				if err != nil {
-					log.WithField("ipAddress", ipv6Addr+"/128").WithError(err).Error("Failed to add IPv6 addr to eth0.")
-					return
-				}
-				err = utils.RunCommand("ip", "-6", "route", "add", "default", "via", hostIPv6Addr.String(), "dev", "eth0")
-				if err != nil {
-					log.WithField("hostIP", hostIPv6Addr.String()).WithError(err).Info("Failed to add IPv6 route to eth0.")
-					return
-				}
-
-				// Output the routing table to the log for diagnostic purposes.
-				err = utils.RunCommand("ip", "-6", "route")
-				if err != nil {
-					log.WithError(err).Info("Failed to output IPv6 routes.")
-				}
-				err = utils.RunCommand("ip", "-6", "addr")
-				if err != nil {
-					log.WithError(err).Info("Failed to output IPv6 addresses.")
-				}
-			}
-			if ipv4Addr != "" {
-				err = utils.RunCommand("ip", "addr", "add", ipv4Addr+"/32", "dev", "eth0")
-				if err != nil {
-					log.WithField("ipAddress", ipv4Addr+"/32").WithError(err).Error("Failed to add IPv4 addr to eth0.")
-					return
-				}
-				err = utils.RunCommand("ip", "route", "add", "169.254.169.254/32", "dev", "eth0")
-				if err != nil {
-					log.WithField("hostIP", hostIPv6Addr.String()).WithError(err).Info("Failed to add IPv4 route to eth0.")
-					return
-				}
-				err = utils.RunCommand("ip", "route", "add", "default", "via", "169.254.169.254", "dev", "eth0")
-				if err != nil {
-					log.WithField("hostIP", hostIPv6Addr.String()).WithError(err).Info("Failed to add default route to eth0.")
-					return
-				}
-
-				// Output the routing table to the log for diagnostic purposes.
-				err = utils.RunCommand("ip", "route")
-				if err != nil {
-					log.WithError(err).Info("Failed to output IPv4 routes.")
-					return
-				}
-				err = utils.RunCommand("ip", "addr")
-				if err != nil {
-					log.WithError(err).Info("Failed to output IPv4 addresses.")
-					return
-				}
-			}
-			return
-		})
+		routes := []*net.IPNet{
+			v4Default,
+			v6Default, // Only used if we end up adding a v6 address.
+		}
+		hostNlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
 		panicIfError(err)
 
-		// Set the host end up too.
-		hostIf, err := netlink.LinkByName(veth.LinkAttrs.Name)
-		log.WithField("hostIf", hostIf).Debug("Host end")
-		panicIfError(err)
-		err = netlink.LinkSetUp(hostIf)
+		defer func() {
+			if err := hostNlHandle.Close(); err != nil {
+				log.WithError(err).Warn("Failed to close netlink handle")
+			}
+		}()
+
+		if useNetkit {
+			err = doNetkitSetUp(hostNlHandle, namespace, addrs, "eth0", hostVethName, routes, mtu)
+		} else {
+			conf := types.NetConf{
+				MTU:       mtu,
+				NumQueues: 1,
+			}
+			dp := linux.NewLinuxDataplane(conf, log.WithField("ns", namespace.Path()))
+			_, err = dp.DoWorkloadNetnsSetUp(
+				hostNlHandle,
+				namespace.Path(),
+				addrs,
+				"eth0",
+				hostVethName,
+				routes,
+				nil,
+			)
+		}
 		panicIfError(err)
 	} else {
 		namespace, err = ns.GetCurrentNS()
 		panicIfError(err)
 	}
 
-	// Print out the namespace path, so that test code can pick it up and execute subsequent
-	// operations in the same namespace - which (in the context of this FV framework)
-	// effectively means _as_ this workload.
-	fmt.Println(namespace.Path())
-
 	// Now listen on the specified ports in the workload namespace.
 	err = namespace.Do(func(_ ns.NetNS) error {
-		if upLo {
-			if err := utils.RunCommand("ip", "link", "set", "lo", "up"); err != nil {
-				return fmt.Errorf("failed to bring loopback up: %v", err)
+		if interfaceName != "" {
+			lo, err := netlink.LinkByName("lo")
+			if err != nil {
+				return fmt.Errorf("failed to look up 'lo' inside netns: %w", err)
+			}
+			err = netlink.LinkSetUp(lo)
+			if err != nil {
+				return fmt.Errorf("failed bring 'lo' up inside netns: %w", err)
 			}
 		}
+
 		if sidecarIptables {
 			if err := doSidecarIptablesSetup(); err != nil {
 				return fmt.Errorf("failed to setup sidecar-like iptables: %v", err)
@@ -306,6 +222,11 @@ func main() {
 				break
 			}
 		}
+
+		// Print out the namespace path, so that test code can pick it up and execute subsequent
+		// operations in the same namespace - which (in the context of this FV framework)
+		// effectively means _as_ this workload.
+		fmt.Println(namespace.Path())
 
 		handleRequest := func(conn net.Conn) {
 			log.WithFields(log.Fields{
@@ -477,7 +398,7 @@ func main() {
 					}()
 				} else {
 					logCxt.Info("About to listen for TCP connections")
-					l, err := net.Listen("tcp", myAddr)
+					l, err := lc.Listen(context.Background(), "tcp", myAddr)
 					panicIfError(err)
 					logCxt.Info("Listening for TCP connections")
 					go func() {
@@ -535,26 +456,198 @@ func loopRespondingToPackets(logCxt *log.Entry, p net.PacketConn) {
 	}
 }
 
+// doNetkitSetUp creates a netkit L2 pair instead of a veth pair for the workload.
+// The primary (host-side) end stays in the host namespace; the peer is moved into
+// the workload namespace. IP addresses, routes and sysctls are configured to match
+// what DoWorkloadNetnsSetUp does for veth pairs.
+func doNetkitSetUp(
+	hostNlHandle *netlink.Handle,
+	workloadNS ns.NetNS,
+	ipAddrs []*cniv1.IPConfig,
+	contIfName string,
+	hostIfName string,
+	routes []*net.IPNet,
+	mtu int,
+) error {
+	// Clean up if host-side interface already exists.
+	if oldLink, err := hostNlHandle.LinkByName(hostIfName); err == nil {
+		if err = hostNlHandle.LinkDel(oldLink); err != nil {
+			return fmt.Errorf("failed to delete old host interface %v: %v", hostIfName, err)
+		}
+		log.Infof("Cleaned up old host interface: %v", hostIfName)
+	}
+
+	// Determine IP versions present.
+	var hasIPv4, hasIPv6 bool
+	for _, addr := range ipAddrs {
+		if addr.Address.IP.To4() != nil {
+			hasIPv4 = true
+			addr.Address.Mask = net.CIDRMask(32, 32)
+		} else if addr.Address.IP.To16() != nil {
+			hasIPv6 = true
+			addr.Address.Mask = net.CIDRMask(128, 128)
+		}
+	}
+
+	// Create netkit in host namespace, with peer placed in workload namespace.
+	la := netlink.NewLinkAttrs()
+	la.Name = hostIfName
+	la.MTU = mtu
+	nk := &netlink.Netkit{
+		LinkAttrs: la,
+		Mode:      netlink.NETKIT_MODE_L2,
+	}
+	nk.SetPeerAttrs(&netlink.LinkAttrs{
+		Name:      contIfName,
+		MTU:       mtu,
+		Namespace: netlink.NsFd(int(workloadNS.Fd())),
+	})
+	if err := netlink.LinkAdd(nk); err != nil {
+		return fmt.Errorf("failed to add netkit pair (%s, %s): %w", hostIfName, contIfName, err)
+	}
+	log.Infof("Created netkit pair: host=%s container=%s (in workload NS)", hostIfName, contIfName)
+
+	// Configure host-side interface: MAC, proxy_arp, bring up.
+	hostLink, err := hostNlHandle.LinkByName(hostIfName)
+	if err != nil {
+		return fmt.Errorf("failed to find host-side netkit %s: %w", hostIfName, err)
+	}
+	hostMAC, _ := net.ParseMAC("ee:ee:ee:ee:ee:ee")
+	if err := hostNlHandle.LinkSetHardwareAddr(hostLink, hostMAC); err != nil {
+		log.Warnf("Failed to set MAC on %s: %v (using kernel-assigned MAC)", hostIfName, err)
+	}
+
+	// Host-side sysctls (proxy_arp, forwarding, etc.)
+	if hasIPv4 {
+		writeProcSysOrLog("/proc/sys/net/ipv4/conf/%s/route_localnet", hostIfName, "1")
+		writeProcSysOrLog("/proc/sys/net/ipv4/neigh/%s/proxy_delay", hostIfName, "0")
+		writeProcSysOrLog("/proc/sys/net/ipv4/conf/%s/proxy_arp", hostIfName, "1")
+		writeProcSysOrLog("/proc/sys/net/ipv4/conf/%s/forwarding", hostIfName, "1")
+	}
+	if hasIPv6 {
+		// No proxy_ndp, matching the real CNI plugin: it is not the IPv6
+		// equivalent of proxy_arp and Calico programs no NUD_PROXY entries for
+		// it to act on.  See felix/design/neighbour-discovery.md.
+		writeProcSysOrLog("/proc/sys/net/ipv6/conf/%s/accept_dad", hostIfName, "0")
+		writeProcSysOrLog("/proc/sys/net/ipv6/conf/%s/disable_ipv6", hostIfName, "0")
+		writeProcSysOrLog("/proc/sys/net/ipv6/conf/%s/forwarding", hostIfName, "1")
+	}
+
+	if err := hostNlHandle.LinkSetUp(hostLink); err != nil {
+		return fmt.Errorf("failed to set %s up: %w", hostIfName, err)
+	}
+
+	// Configure container-side interface inside the workload namespace.
+	err = workloadNS.Do(func(_ ns.NetNS) error {
+		contLink, err := netlink.LinkByName(contIfName)
+		if err != nil {
+			return fmt.Errorf("failed to find container netkit %s: %w", contIfName, err)
+		}
+
+		if hasIPv6 {
+			// Disable DAD before bringing the interface up.
+			if err := writeProcSys(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", contIfName), "0"); err != nil {
+				return err
+			}
+		}
+
+		if err := netlink.LinkSetUp(contLink); err != nil {
+			return fmt.Errorf("failed to set %s up: %w", contIfName, err)
+		}
+
+		// Add IP addresses.
+		for _, addr := range ipAddrs {
+			if err := netlink.AddrAdd(contLink, &netlink.Addr{IPNet: &addr.Address}); err != nil {
+				return fmt.Errorf("failed to add IP %v to %s: %w", addr.Address, contIfName, err)
+			}
+		}
+
+		// Add IPv4 routes.
+		if hasIPv4 {
+			gw := net.IPv4(169, 254, 1, 1)
+			gwNet := &net.IPNet{IP: gw, Mask: net.CIDRMask(32, 32)}
+			if err := netlink.RouteAdd(&netlink.Route{
+				LinkIndex: contLink.Attrs().Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst:       gwNet,
+			}); err != nil {
+				return fmt.Errorf("failed to add gateway route: %w", err)
+			}
+			for _, r := range routes {
+				if r.IP.To4() == nil {
+					continue
+				}
+				if err := netlink.RouteAdd(&netlink.Route{
+					LinkIndex: contLink.Attrs().Index,
+					Dst:       r,
+					Gw:        gw,
+				}); err != nil {
+					return fmt.Errorf("failed to add IPv4 route %v: %w", r, err)
+				}
+			}
+		}
+
+		// Add IPv6 routes.
+		if hasIPv6 {
+			// Enable IPv6 in the namespace.
+			_ = writeProcSys("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0")
+			_ = writeProcSys("/proc/sys/net/ipv6/conf/default/disable_ipv6", "0")
+			_ = writeProcSys("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "0")
+
+			// Get the host-side link-local address for use as IPv6 gateway.
+			var hostIPv6 net.IP
+			for i := range 10 {
+				if i > 0 {
+					time.Sleep(50 * time.Millisecond)
+				}
+				addrs, err := hostNlHandle.AddrList(hostLink, netlink.FAMILY_V6)
+				if err == nil && len(addrs) > 0 {
+					hostIPv6 = addrs[0].IP
+					break
+				}
+			}
+			if hostIPv6 == nil {
+				return fmt.Errorf("failed to get IPv6 link-local address for %s", hostIfName)
+			}
+			for _, r := range routes {
+				if r.IP.To4() != nil {
+					continue
+				}
+				if err := netlink.RouteAdd(&netlink.Route{
+					LinkIndex: contLink.Attrs().Index,
+					Dst:       r,
+					Gw:        hostIPv6,
+				}); err != nil {
+					return fmt.Errorf("failed to add IPv6 route %v: %w", r, err)
+				}
+			}
+		}
+
+		// Container-side sysctls (rp_filter, etc.)
+		if hasIPv4 {
+			_ = writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", contIfName), "1")
+		}
+
+		return nil
+	})
+	return err
+}
+
+func writeProcSysOrLog(pathFmt, ifName, value string) {
+	path := fmt.Sprintf(pathFmt, ifName)
+	if err := writeProcSys(path, value); err != nil {
+		log.Warnf("Failed to write %s=%s: %v", path, value, err)
+	}
+}
+
+func writeProcSys(path, value string) error {
+	return os.WriteFile(path, []byte(value), 0644)
+}
+
 func panicIfError(err error) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-// writeProcSys takes the sysctl path and a string value to set i.e. "0" or "1" and sets the sysctl.
-func writeProcSys(path, value string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	n, err := f.Write([]byte(value))
-	if err == nil && n < len(value) {
-		err = io.ErrShortWrite
-	}
-	if err1 := f.Close(); err == nil {
-		err = err1
-	}
-	return err
 }
 
 // doSidecarIptablesSetup generates some iptables rules to redirect a

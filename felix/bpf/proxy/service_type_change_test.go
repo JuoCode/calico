@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,13 @@ import (
 	"context"
 	"net"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfmap"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
@@ -31,6 +32,7 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	proxy "github.com/projectcalico/calico/felix/bpf/proxy"
 	"github.com/projectcalico/calico/felix/ip"
+	felixproto "github.com/projectcalico/calico/felix/proto"
 )
 
 var _ = Describe("BPF service type change", func() {
@@ -59,35 +61,34 @@ var _ = Describe("BPF service type change", func() {
 		},
 	}
 
-	testSvcEps := &v1.Endpoints{
-		TypeMeta:   typeMetaV1("Endpoints"),
-		ObjectMeta: objectMetaV1("testService"),
-		Subsets: []v1.EndpointSubset{
+	testSvcEps := &discoveryv1.EndpointSlice{
+		TypeMeta:    typeMetaV1("EndpointSlice"),
+		ObjectMeta:  objectMetaV1("testService"),
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
 			{
-				Addresses: []v1.EndpointAddress{
-					{
-						IP: "10.1.2.1",
-					},
-					{
-						IP: "10.1.2.2",
-					},
-				},
-				Ports: []v1.EndpointPort{
-					{
-						Port: 1234,
-						Name: "1234",
-					},
-				},
+				Addresses: []string{"10.1.2.1"},
+			},
+			{
+				Addresses: []string{"10.1.2.2"},
+			},
+		},
+		Ports: []discoveryv1.EndpointPort{
+			{
+				Port:     ptr.To(int32(1234)),
+				Name:     ptr.To("1234"),
+				Protocol: ptr.To(v1.ProtocolTCP),
 			},
 		},
 	}
-	k8s := fake.NewSimpleClientset(testSvc, testSvcEps)
+	k8s := fake.NewClientset(testSvc, testSvcEps)
 
 	initIP := net.IPv4(1, 1, 1, 1)
 
 	bpfMaps := &bpfmap.IPMaps{}
 	bpfMaps.FrontendMap = newMockNATMap()
 	bpfMaps.BackendMap = newMockNATBackendMap()
+	bpfMaps.MaglevMap = newMockMaglevMap()
 	bpfMaps.AffinityMap = newMockAffinityMap()
 	bpfMaps.CtMap = mock.NewMockMap(conntrack.MapParams)
 	front := bpfMaps.FrontendMap.(*mockNATMap)
@@ -100,7 +101,10 @@ var _ = Describe("BPF service type change", func() {
 	var p *proxy.KubeProxy
 
 	BeforeEach(func() {
-		p, _ = proxy.StartKubeProxy(k8s, "test-node", bpfMaps, proxy.WithImmediateSync())
+		p, _ = proxy.StartKubeProxy(k8s, "test-node", bpfMaps, proxy.WithImmediateSync(), proxy.WithMaglevLUTSize(maglevLUTSize))
+		// Unblock start(), which blocks on the initial host metadata update.
+		p.OnUpdate(&felixproto.HostMetadataUpdate{Hostname: "dummy"})
+		Expect(p.CompleteDeferredWork()).To(Succeed())
 		p.OnHostIPsUpdate([]net.IP{initIP})
 	})
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,7 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/ipsets"
-	"github.com/projectcalico/calico/felix/logutils"
-
+	"github.com/projectcalico/calico/lib/logrusr"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -34,6 +33,14 @@ var (
 		Name: "felix_bpf_num_ip_sets",
 		Help: "Number of BPF IP sets managed in the dataplane.",
 	})
+)
+
+const (
+	// Base of range for reserved IP set IDs for Calico Enterprise.
+	ReservedIPSetBase uint64 = 1 << 32
+
+	// IP set ID for All Istio WEPs.
+	AllIstioWEPsID = ReservedIPSetBase + 3
 )
 
 func init() {
@@ -55,9 +62,11 @@ type bpfIPSets struct {
 	dirtyIPSetIDs   set.Set[uint64]
 	resyncScheduled bool
 
-	opRecorder logutils.OpRecorder
+	opRecorder logrusr.OpRecorder
 
 	lg *log.Entry
+
+	filterIPSet func(string) bool
 }
 
 func NewBPFIPSets(
@@ -66,7 +75,7 @@ func NewBPFIPSets(
 	ipSetsMap maps.Map,
 	entryFromBytes func([]byte) IPSetEntryInterface,
 	protoIPSetMemberToBPFEntry func(uint64, string) IPSetEntryInterface,
-	opRecorder logutils.OpRecorder,
+	opRecorder logrusr.OpRecorder,
 ) *bpfIPSets {
 	return &bpfIPSets{
 		IPVersionConfig:            ipVersionConfig,
@@ -96,6 +105,11 @@ func (m *bpfIPSets) getExistingIPSetString(setID string) *bpfIPSet {
 // Never allocates an IP set ID from the allocator.
 func (m *bpfIPSets) getExistingIPSet(setID uint64) *bpfIPSet {
 	return m.ipSets[setID]
+}
+
+// IDStringToUint64 return the internal BPF id for the set or 0 if there is no match.
+func (m *bpfIPSets) IDStringToUint64(strID string) uint64 {
+	return m.ipSetIDAllocator.GetNoAlloc(strID)
 }
 
 // getOrCreateIPSet gets the IP set data given the string set ID; allocates a new uint64 ID and creates the tracking
@@ -134,6 +148,14 @@ func (m *bpfIPSets) deleteIPSetAndReleaseID(ipSet *bpfIPSet) {
 // to ApplyUpdates(), the IP sets will be replaced with the new contents and the set's metadata
 // will be updated as appropriate.
 func (m *bpfIPSets) AddOrReplaceIPSet(setMetadata ipsets.IPSetMetadata, members []string) {
+	if !m.isIPSetNeeded(setMetadata.SetID) {
+		ipSet := m.getExistingIPSetString(setMetadata.SetID)
+		if ipSet != nil {
+			ipSet.Deleted = true
+			m.markIPSetDirty(ipSet)
+		}
+		return
+	}
 	ipSet := m.getOrCreateIPSet(setMetadata.SetID)
 	ipSet.Type = setMetadata.Type
 	m.lg.WithFields(log.Fields{"stringID": setMetadata.SetID, "uint64ID": ipSet.ID, "members": members}).Info("IP set added")
@@ -146,7 +168,9 @@ func (m *bpfIPSets) AddOrReplaceIPSet(setMetadata ipsets.IPSetMetadata, members 
 func (m *bpfIPSets) RemoveIPSet(setID string) {
 	ipSet := m.getExistingIPSetString(setID)
 	if ipSet == nil {
-		m.lg.WithField("setID", setID).Panic("Received deletion for unknown IP set")
+		if m.isIPSetNeeded(setID) {
+			m.lg.WithField("setID", setID).Panic("Received deletion for unknown IP set")
+		}
 		return
 	}
 	if ipSet.Deleted {
@@ -163,7 +187,9 @@ func (m *bpfIPSets) RemoveIPSet(setID string) {
 func (m *bpfIPSets) AddMembers(setID string, newMembers []string) {
 	ipSet := m.getExistingIPSetString(setID)
 	if ipSet == nil {
-		m.lg.WithField("setID", setID).Panic("Received delta for unknown IP set")
+		if m.isIPSetNeeded(setID) {
+			m.lg.WithField("setID", setID).Panic("Received delta for unknown IP set")
+		}
 		return
 	}
 	if ipSet.Deleted {
@@ -189,7 +215,9 @@ func (m *bpfIPSets) AddMembers(setID string, newMembers []string) {
 func (m *bpfIPSets) RemoveMembers(setID string, removedMembers []string) {
 	ipSet := m.getExistingIPSetString(setID)
 	if ipSet == nil {
-		m.lg.WithField("setID", setID).Panic("Received delta for unknown IP set")
+		if m.isIPSetNeeded(setID) {
+			m.lg.WithField("setID", setID).Panic("Received delta for unknown IP set")
+		}
 		return
 	}
 	if ipSet.Deleted {
@@ -234,7 +262,7 @@ func (m *bpfIPSets) GetDesiredMembers(setID string) (set.Set[string], error) {
 	panic("Not implemented")
 }
 
-func (m *bpfIPSets) ApplyUpdates() {
+func (m *bpfIPSets) ApplyUpdates(_ ipsets.UpdateListener) {
 	var numAdds, numDels uint
 	startTime := time.Now()
 
@@ -296,16 +324,17 @@ func (m *bpfIPSets) ApplyUpdates() {
 		}
 	}
 
-	m.dirtyIPSetIDs.Iter(func(setID uint64) error {
+	for setID := range m.dirtyIPSetIDs.All() {
 		leaveDirty := false
 		ipSet := m.getExistingIPSet(setID)
 		if ipSet == nil {
 			m.lg.WithField("id", setID).Warn("Couldn't find IP set that was marked as dirty.")
 			m.resyncScheduled = true
-			return set.RemoveItem
+			m.dirtyIPSetIDs.Discard(setID)
+			continue
 		}
 
-		ipSet.PendingRemoves.Iter(func(entry IPSetEntryInterface) error {
+		for entry := range ipSet.PendingRemoves.All() {
 			if debug {
 				m.lg.WithFields(log.Fields{"setID": setID, "entry": entry}).Debug("Removing entry from IP set")
 			}
@@ -313,13 +342,13 @@ func (m *bpfIPSets) ApplyUpdates() {
 			if err != nil {
 				m.lg.WithFields(log.Fields{"setID": setID, "entry": entry}).WithError(err).Error("Failed to remove IP set entry")
 				leaveDirty = true
-				return nil
+				continue
 			}
 			numDels++
-			return set.RemoveItem
-		})
+			ipSet.PendingRemoves.Discard(entry)
+		}
 
-		ipSet.PendingAdds.Iter(func(entry IPSetEntryInterface) error {
+		for entry := range ipSet.PendingAdds.All() {
 			if debug {
 				m.lg.WithFields(log.Fields{"setID": setID, "entry": entry}).Debug("Adding entry to IP set")
 			}
@@ -327,16 +356,16 @@ func (m *bpfIPSets) ApplyUpdates() {
 			if err != nil {
 				m.lg.WithFields(log.Fields{"setID": setID, "entry": entry}).WithError(err).Error("Failed to add IP set entry")
 				leaveDirty = true
-				return nil
+				continue
 			}
 			numAdds++
-			return set.RemoveItem
-		})
+			ipSet.PendingAdds.Discard(entry)
+		}
 
 		if leaveDirty {
 			m.lg.WithField("setID", setID).Debug("IP set still dirty, queueing resync")
 			m.resyncScheduled = true
-			return nil
+			continue
 		}
 
 		if ipSet.Deleted {
@@ -345,8 +374,8 @@ func (m *bpfIPSets) ApplyUpdates() {
 		}
 
 		m.lg.WithField("setID", setID).Debug("IP set is now clean")
-		return set.RemoveItem
-	})
+		m.dirtyIPSetIDs.Discard(setID)
+	}
 
 	duration := time.Since(startTime)
 	if numDels > 0 || numAdds > 0 {
@@ -376,6 +405,35 @@ func (m *bpfIPSets) SetFilter(ipSetNames set.Set[string]) {
 	// are written into the corresponding BPF map.
 }
 
+// SetIPSetNameFilter updates the ipset filter function but does
+// not scan the existing ipsets and apply the filter.
+func (m *bpfIPSets) SetIPSetNameFilter(fn func(ipSetName string) bool) {
+	m.filterIPSet = fn
+}
+
+func (m *bpfIPSets) isIPSetNeeded(name string) bool {
+	if m.filterIPSet == nil {
+		// We're not filtering down to a "needed" set, so all IP sets are needed.
+		return true
+	}
+
+	// We are filtering down, so compare against the needed set.
+	return m.filterIPSet(name)
+}
+
+// ApplyIPSetNameFilter applies the ipset filter to the existing
+// ipsets. The caller should call ApplyIPSetNameFilter after updating
+// the filter function to make sure the filter is applied to
+// the existing ipsets.
+func (m *bpfIPSets) ApplyIPSetNameFilter() {
+	for _, ipset := range m.ipSets {
+		if !m.isIPSetNeeded(ipset.OriginalID) {
+			ipset.Deleted = true
+			m.markIPSetDirty(ipset)
+		}
+	}
+}
+
 type bpfIPSet struct {
 	OriginalID string
 	ID         uint64
@@ -399,10 +457,9 @@ func (m *bpfIPSet) ReplaceMembers(members []string, protoIPSetMemberToBPFEntry f
 }
 
 func (m *bpfIPSet) RemoveAll() {
-	m.DesiredEntries.Iter(func(entry IPSetEntryInterface) error {
+	for entry := range m.DesiredEntries.All() {
 		m.RemoveMember(entry)
-		return nil
-	})
+	}
 }
 
 func (m *bpfIPSet) AddMembers(members []string, protoIPSetMemberToBPFEntry func(uint64, string) IPSetEntryInterface) {

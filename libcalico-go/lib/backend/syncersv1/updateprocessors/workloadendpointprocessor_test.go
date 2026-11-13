@@ -17,13 +17,13 @@ package updateprocessors_test
 import (
 	"net"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/updateprocessors"
@@ -47,12 +47,12 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 	iface2 := "iface2"
 
 	v3WorkloadEndpointKey1 := model.ResourceKey{
-		Kind:      libapiv3.KindWorkloadEndpoint,
+		Kind:      internalapi.KindWorkloadEndpoint,
 		Name:      name1,
 		Namespace: ns1,
 	}
 	v3WorkloadEndpointKey2 := model.ResourceKey{
-		Kind:      libapiv3.KindWorkloadEndpoint,
+		Kind:      internalapi.KindWorkloadEndpoint,
 		Name:      name2,
 		Namespace: ns2,
 	}
@@ -77,7 +77,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
 
 		By("converting a WorkloadEndpoint with minimum configuration")
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns1
 		res.Labels = map[string]string{
 			"projectcalico.org/namespace":    ns1,
@@ -106,17 +106,17 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 				State: "active",
 				Name:  iface1,
 				Ports: []model.EndpointPort{},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					"projectcalico.org/namespace":    ns1,
 					"projectcalico.org/orchestrator": oid1,
-				},
+				}),
 				IPv4Nets: []cnet.IPNet{expectedIPv4Net},
 			},
 			Revision: "abcde",
 		}))
 
 		By("adding another WorkloadEndpoint with a full configuration")
-		res = libapiv3.NewWorkloadEndpoint()
+		res = internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns2
 		res.Labels = map[string]string{
 			"testLabel":                      "label",
@@ -135,7 +135,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		_, ipn, err = cnet.ParseCIDROrIP("10.100.10.1")
 		Expect(err).NotTo(HaveOccurred())
 		expectedIPv4Net = *(ipn.Network())
-		res.Spec.IPNATs = []libapiv3.IPNAT{
+		res.Spec.IPNATs = []internalapi.IPNAT{
 			{
 				InternalIP: "10.100.1.1",
 				ExternalIP: "10.1.10.1",
@@ -146,7 +146,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		expectedIPv4Gateway, _, err := cnet.ParseCIDROrIP("10.10.10.1")
 		res.Spec.IPv6Gateway = "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
 		expectedIPv6Gateway, _, err := cnet.ParseCIDROrIP("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
-		res.Spec.Ports = []libapiv3.WorkloadEndpointPort{
+		res.Spec.Ports = []internalapi.WorkloadEndpointPort{
 			{
 				Name:     "portname",
 				Protocol: numorstring.ProtocolFromInt(uint8(30)),
@@ -171,11 +171,11 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 					ProfileIDs: []string{"testProfile"},
 					IPv4Nets:   []cnet.IPNet{expectedIPv4Net},
 					IPv4NAT:    []model.IPNAT{expectedIPv4NAT},
-					Labels: map[string]string{
+					Labels: uniquelabels.Make(map[string]string{
 						"testLabel":                      "label",
 						"projectcalico.org/namespace":    ns2,
 						"projectcalico.org/orchestrator": oid2,
-					},
+					}),
 					IPv4Gateway: expectedIPv4Gateway,
 					IPv6Gateway: expectedIPv6Gateway,
 					Ports: []model.EndpointPort{
@@ -209,13 +209,13 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
 
 		By("trying to convert with the wrong key type.")
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Name = name1
 		res.Namespace = ns1
 
 		_, err := up.Process(&model.KVPair{
 			Key: model.GlobalBGPPeerKey{
-				PeerIP: cnet.MustParseIP("1.2.3.4"),
+				PeerIP: model.AddrFromIP(cnet.MustParseIP("1.2.3.4")),
 			},
 			Value:    res,
 			Revision: "abcde",
@@ -239,9 +239,9 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		}))
 
 		By("trying to convert without enough information to create a v1 key.")
-		eres := libapiv3.NewWorkloadEndpoint()
+		eres := internalapi.NewWorkloadEndpoint()
 		v3WorkloadEndpointKey1 := model.ResourceKey{
-			Kind: libapiv3.KindWorkloadEndpoint,
+			Kind: internalapi.KindWorkloadEndpoint,
 			Name: name1,
 		}
 
@@ -257,7 +257,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
 
 		By("converting a WorkloadEndpoint with no IPNetworks")
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns1
 		res.Labels = map[string]string{
 			"projectcalico.org/namespace":    ns1,
@@ -286,7 +286,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
 
 		By("converting a WorkloadEndpoint with bad AllowSpoofedSourcePrefixes")
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns1
 		res.Labels = map[string]string{
 			"projectcalico.org/namespace":    ns1,
@@ -323,7 +323,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 
 		nsLabel := conversion.NamespaceLabelPrefix + "ns1"
 		saLabel := conversion.ServiceAccountLabelPrefix + "sa1"
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns1
 		res.Labels = map[string]string{
 			"projectcalico.org/namespace":    ns1,
@@ -354,11 +354,11 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 				State: "active",
 				Name:  iface1,
 				Ports: []model.EndpointPort{},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					"projectcalico.org/namespace":    ns1,
 					"projectcalico.org/orchestrator": oid1,
 					"k1":                             "v1",
-				},
+				}),
 				IPv4Nets: []cnet.IPNet{expectedIPv4Net},
 			},
 			Revision: "abcde",
@@ -368,7 +368,7 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 	It("should add a label representing the serviceaccount name", func() {
 		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
 
-		res := libapiv3.NewWorkloadEndpoint()
+		res := internalapi.NewWorkloadEndpoint()
 		res.Namespace = ns1
 		res.Labels = map[string]string{
 			"projectcalico.org/namespace":    ns1,
@@ -398,13 +398,87 @@ var _ = Describe("Test the WorkloadEndpoint update processor", func() {
 				State: "active",
 				Name:  iface1,
 				Ports: []model.EndpointPort{},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					"projectcalico.org/namespace":      ns1,
 					"projectcalico.org/orchestrator":   oid1,
 					"k1":                               "v1",
 					"projectcalico.org/serviceaccount": "test-serviceaccount-name",
-				},
+				}),
 				IPv4Nets: []cnet.IPNet{expectedIPv4Net},
+			},
+			Revision: "abcde",
+		}))
+	})
+
+	It("should convert a WEP with QoSControls configured", func() {
+		up := updateprocessors.NewWorkloadEndpointUpdateProcessor()
+
+		res := internalapi.NewWorkloadEndpoint()
+		res.Namespace = ns1
+		res.Labels = map[string]string{
+			"projectcalico.org/namespace":    ns1,
+			"projectcalico.org/orchestrator": oid1,
+		}
+		res.Spec.Node = hn1
+		res.Spec.Orchestrator = oid1
+		res.Spec.Workload = wid1
+		res.Spec.Endpoint = eid1
+		res.Spec.InterfaceName = iface1
+		res.Spec.IPNetworks = []string{"10.100.10.1"}
+		res.Spec.QoSControls = &internalapi.QoSControls{
+			IngressBandwidth:      1000000,
+			EgressBandwidth:       2000000,
+			IngressBurst:          3000000,
+			EgressBurst:           4000000,
+			IngressPeakrate:       5000000,
+			EgressPeakrate:        6000000,
+			IngressMinburst:       7000000,
+			EgressMinburst:        8000000,
+			IngressPacketRate:     9000000,
+			EgressPacketRate:      10000000,
+			IngressPacketBurst:    11000000,
+			EgressPacketBurst:     12000000,
+			IngressMaxConnections: 13000000,
+			EgressMaxConnections:  14000000,
+		}
+
+		kvps, err := up.Process(&model.KVPair{
+			Key:      v3WorkloadEndpointKey1,
+			Value:    res,
+			Revision: "abcde",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvps).To(HaveLen(1))
+		_, ipn, err := cnet.ParseCIDROrIP("10.100.10.1")
+		Expect(err).NotTo(HaveOccurred())
+		expectedIPv4Net := *(ipn.Network())
+		Expect(kvps[0]).To(Equal(&model.KVPair{
+			Key: v1WorkloadEndpointKey1,
+			Value: &model.WorkloadEndpoint{
+				State: "active",
+				Name:  iface1,
+				Ports: []model.EndpointPort{},
+				Labels: uniquelabels.Make(map[string]string{
+					"projectcalico.org/namespace":    ns1,
+					"projectcalico.org/orchestrator": oid1,
+				}),
+				IPv4Nets: []cnet.IPNet{expectedIPv4Net},
+				QoSControls: &model.QoSControls{
+					IngressBandwidth:      1000000,
+					EgressBandwidth:       2000000,
+					IngressBurst:          3000000,
+					EgressBurst:           4000000,
+					IngressPeakrate:       5000000,
+					EgressPeakrate:        6000000,
+					IngressMinburst:       7000000,
+					EgressMinburst:        8000000,
+					IngressPacketRate:     9000000,
+					EgressPacketRate:      10000000,
+					IngressPacketBurst:    11000000,
+					EgressPacketBurst:     12000000,
+					IngressMaxConnections: 13000000,
+					EgressMaxConnections:  14000000,
+				},
 			},
 			Revision: "abcde",
 		}))

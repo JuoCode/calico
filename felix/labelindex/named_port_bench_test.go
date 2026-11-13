@@ -20,12 +20,12 @@ import (
 	"runtime"
 	"testing"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
 
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	. "github.com/projectcalico/calico/felix/labelindex"
-
+	. "github.com/projectcalico/calico/felix/labelindex/ipsetmember"
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	calinet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -35,12 +35,15 @@ import (
 func BenchmarkWorkloadUpdate10Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 10)
 }
+
 func BenchmarkWorkloadUpdate100Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 100)
 }
+
 func BenchmarkWorkloadUpdate1000Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 1000)
 }
+
 func BenchmarkWorkloadUpdate10000Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 10000)
 }
@@ -53,7 +56,7 @@ func benchmarkWorkloadUpdates(b *testing.B, numSels int) {
 	logrus.SetLevel(logrus.InfoLevel)
 	defer logrus.SetLevel(logLevel)
 
-	idx := NewSelectorAndNamedPortIndex()
+	idx := NewSelectorAndNamedPortIndex(false)
 	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
 		lastID = ipSetID
 		lastMember = member
@@ -62,7 +65,7 @@ func benchmarkWorkloadUpdates(b *testing.B, numSels int) {
 		lastID = ipSetID
 		lastMember = member
 	}
-	for i := 0; i < numSels; i++ {
+	for i := range numSels {
 		sel, err := selector.Parse(fmt.Sprintf(`alpha == "beta" && has(ipset-%d)`, i))
 		if err != nil {
 			b.Fatal(err)
@@ -88,7 +91,7 @@ func sendUpdates(b *testing.B, idx *SelectorAndNamedPortIndex, updates []api.Upd
 
 func makeEndpointUpdates(num int) []api.Update {
 	updates := make([]api.Update, num)
-	for n := 0; n < num; n++ {
+	for n := range num {
 		key := model.WorkloadEndpointKey{
 			Hostname:       "host",
 			OrchestratorID: "k8s",
@@ -103,7 +106,7 @@ func makeEndpointUpdates(num int) []api.Update {
 			KVPair: model.KVPair{
 				Key: key,
 				Value: &model.WorkloadEndpoint{
-					Labels:     map[string]string{"alpha": "beta", "ipset-1": "true"},
+					Labels:     uniquelabels.Make(map[string]string{"alpha": "beta", "ipset-1": "true"}),
 					IPv4Nets:   []calinet.IPNet{ipNet},
 					ProfileIDs: []string{fmt.Sprintf("namespace-%d", n)},
 				},
@@ -137,7 +140,7 @@ func benchmarkParentUpdates(b *testing.B, numSels, numEndpoints int) {
 	logrus.SetLevel(logrus.InfoLevel)
 	defer logrus.SetLevel(logLevel)
 
-	idx := NewSelectorAndNamedPortIndex()
+	idx := NewSelectorAndNamedPortIndex(false)
 	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
 		lastID = ipSetID
 		lastMember = member
@@ -153,7 +156,7 @@ func benchmarkParentUpdates(b *testing.B, numSels, numEndpoints int) {
 		idx.OnUpdate(upd)
 	}
 
-	for i := 0; i < numSels; i++ {
+	for i := range numSels {
 		sel, err := selector.Parse(fmt.Sprintf(`projectcalico.org/name == "namespace-%d"`, i))
 		if err != nil {
 			b.Fatal(err)
@@ -214,7 +217,7 @@ func benchmarkSelectorUpdates(b *testing.B, numEndpoints int) {
 	logrus.SetLevel(logrus.InfoLevel)
 	defer logrus.SetLevel(logLevel)
 
-	idx := NewSelectorAndNamedPortIndex()
+	idx := NewSelectorAndNamedPortIndex(false)
 	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
 		lastID = ipSetID
 		lastMember = member
@@ -231,7 +234,7 @@ func benchmarkSelectorUpdates(b *testing.B, numEndpoints int) {
 	}
 
 	// Pre-calculate the selectors.
-	var sels []selector.Selector
+	var sels []*selector.Selector
 	for i := 0; i < b.N; i++ {
 		sel, err := selector.Parse(fmt.Sprintf(`alpha == "beta" && has(ipset-%d)`, i%10))
 		if err != nil {

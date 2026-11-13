@@ -1,0 +1,9 @@
+name: 2026-01-06-v3-32-vertigo
+hash: v3.32.0-0.dev-527-g92e0cd84e375
+stream: master
+version: v3.32.0-0.dev-527-g92e0cd84e375
+operator:
+  version: v3.32.0-0.dev-527-g92e0cd84e375
+  image: operator
+  registry: quay.io/calico
+url: https://2026-01-06-v3-32-vertigo.hashrelease.tools.tigera.net

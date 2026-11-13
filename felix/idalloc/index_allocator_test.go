@@ -15,10 +15,10 @@
 package idalloc_test
 
 import (
-	. "github.com/projectcalico/calico/felix/idalloc"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	. "github.com/projectcalico/calico/felix/idalloc"
 )
 
 var _ = Describe("IndexAllocator", func() {
@@ -104,6 +104,12 @@ var _ = Describe("IndexAllocator", func() {
 			By("allocating when no indices are available")
 			_, err = r.GrabIndex()
 			Expect(err).To(HaveOccurred())
+		})
+
+		It("should not reorder the caller's slice", func() {
+			ranges := []IndexRange{{Min: 1, Max: 250}, {Min: 1000, Max: 1500}}
+			NewIndexAllocator(ranges, nil)
+			Expect(ranges).To(Equal([]IndexRange{{Min: 1, Max: 250}, {Min: 1000, Max: 1500}}))
 		})
 	})
 })

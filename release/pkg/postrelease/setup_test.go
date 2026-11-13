@@ -1,0 +1,57 @@
+package postrelease
+
+import (
+	"flag"
+	"strings"
+	"testing"
+
+	"github.com/projectcalico/calico/release/internal/command"
+	"github.com/projectcalico/calico/release/internal/defaults"
+	"github.com/projectcalico/calico/release/internal/registry"
+)
+
+var (
+	linuxArches  = []string{"amd64", "arm64", "s390x", "ppc64le"}
+	darwinArches = []string{"amd64", "arm64"}
+)
+
+var (
+	releaseVersion, operatorVersion, flannelVersion string
+	githubOrg, githubRepo, githubRemote             string
+	images                                          string
+)
+
+var commandRunner = command.RealRunner
+
+func init() {
+	flag.StringVar(&releaseVersion, "release-version", "", "Version for the release")
+	flag.StringVar(&operatorVersion, "operator-version", "", "Version for Tigera operator")
+	flag.StringVar(&flannelVersion, "flannel-version", "", "Version for flannel")
+	flag.StringVar(&githubOrg, "github-org", defaults.ProjectCalicoOrg, "GitHub organization")
+	flag.StringVar(&githubRepo, "github-repo", defaults.CalicoRepoName, "GitHub repository")
+	flag.StringVar(&githubRemote, "github-repo-remote", defaults.Remote(), "GitHub repository remote")
+	flag.StringVar(&images, "images", "", "List of images to check")
+}
+
+func checkVersion(t testing.TB, version string) {
+	t.Helper()
+	if version == "" {
+		t.Fatal("No version provided")
+	}
+}
+
+func checkImages(t testing.TB, images string) {
+	t.Helper()
+	if images == "" {
+		t.Fatal("No images provided")
+	}
+	list := strings.Split(images, " ")
+	if len(list) == 0 {
+		t.Fatal("No images provided")
+	}
+	for _, image := range list {
+		if strings.Contains(image, registry.OperatorImage) {
+			t.Fatal("Operator images are checked separately, do not include in list of images to check")
+		}
+	}
+}

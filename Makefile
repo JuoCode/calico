@@ -3,23 +3,37 @@ PACKAGE_NAME = github.com/projectcalico/calico
 include metadata.mk
 include lib.Makefile
 
-DOCKER_RUN := mkdir -p ./.go-pkg-cache bin $(GOMOD_CACHE) && \
+DOCKER_RUN := mkdir -p $(LOCAL_GO_PKG_CACHE) bin $(GOMOD_CACHE) && \
 	docker run --rm \
 		--net=host \
 		--init \
 		$(EXTRA_DOCKER_ARGS) \
+		$(DOCKER_GIT_WORKTREE_ARGS) \
 		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
 		-e GOCACHE=/go-cache \
 		$(GOARCH_FLAGS) \
 		-e GOPATH=/go \
 		-e OS=$(BUILDOS) \
 		-e GOOS=$(BUILDOS) \
-		-e GOFLAGS=$(GOFLAGS) \
+		-e "GOFLAGS=$(GOFLAGS)" \
 		-v $(CURDIR):/go/src/github.com/projectcalico/calico:rw \
-		-v $(CURDIR)/.go-pkg-cache:/go-cache:rw \
+		-v $(LOCAL_GO_PKG_CACHE):/go-cache:rw \
 		-w /go/src/$(PACKAGE_NAME)
 
+.PHONY: update-file-copyrights
+update-file-copyrights:
+ifndef BASE_BRANCH
+	$(error BASE_BRANCH is not defined. Please set BASE_BRANCH to the target branch (e.g., 'main'))
+endif
+	# Update outdated copyrights for updated files.
+	YEAR=$$(date +%Y); git diff --diff-filter=d --name-only $(BASE_BRANCH) | xargs sed -i "/Copyright (c) $$YEAR Tigera/!s/Copyright (c) \([0-9]\{4\}\)\(-[0-9]\{4\}\)\{0,1\} Tigera/Copyright (c) \1-$$YEAR Tigera/"
+	# Add copyright to new files that don't have it.
+	YEAR=$$(date +%Y); \
+	git diff --name-only --diff-filter=A $(BASE_BRANCH) | grep '\.go$$' | \
+	xargs -I {} sh -c 'if ! grep -q "Copyright (c)" "{}"; then sed "s/YEAR/'$$YEAR'/g" hack/copyright.template | (cat -; echo; cat "{}") > temp && mv temp "{}"; fi'
+
 clean:
+	rm -rf .dev-stamps/
 	$(MAKE) -C api clean
 	$(MAKE) -C apiserver clean
 	$(MAKE) -C app-policy clean
@@ -27,117 +41,548 @@ clean:
 	$(MAKE) -C cni-plugin clean
 	$(MAKE) -C confd clean
 	$(MAKE) -C felix clean
+	$(MAKE) -C cmd/calico clean
+	$(MAKE) -C istio clean
 	$(MAKE) -C kube-controllers clean
 	$(MAKE) -C libcalico-go clean
 	$(MAKE) -C node clean
 	$(MAKE) -C pod2daemon clean
+	$(MAKE) -C key-cert-provisioner clean
 	$(MAKE) -C typha clean
-	rm -rf ./bin
+	$(MAKE) -C release clean
+	$(MAKE) -C third_party/cni-plugins clean
+	$(MAKE) -C third_party/envoy-gateway clean
+	$(MAKE) -C third_party/envoy-proxy clean
+	$(MAKE) -C third_party/envoy-ratelimit clean
+	$(MAKE) -C whisker clean
+	rm -rf ./bin .stamp.*
 
-ci-preflight-checks:
-	$(MAKE) check-dockerfiles
-	$(MAKE) check-language
-	$(MAKE) generate
-	$(MAKE) check-dirty
+check-go-mod:
+	$(DOCKER_GO_BUILD) ./hack/check-go-mod.sh
+
+go-vet: operator-charts
+	# Go vet will check that libbpf headers can be found; make sure they're available.
+	$(MAKE) -C felix clone-libbpf
+	$(DOCKER_GO_BUILD) go vet --tags fvtests ./...
+
+update-x-libraries:
+	$(DOCKER_GO_BUILD) sh -c "go get golang.org/x/... && go mod tidy"
 
 check-dockerfiles:
 	./hack/check-dockerfiles.sh
 
+check-images-availability: bin/crane bin/yq
+	cd ./hack && RELEASE_BRANCH_PREFIX=$(RELEASE_BRANCH_PREFIX) ./check-images-availability.sh
+
 check-language:
 	./hack/check-language.sh
 
+check-mockery-config:
+	./hack/check-mockery-config.sh
+
+check-ginkgo-v2:
+	./hack/check-ginkgo-v2.sh
+
+# Exported so the script sees make's fully expanded value.
+check-argoci-image: export GO_BUILD_VER := $(GO_BUILD_VER)
+check-argoci-image:
+	./hack/check-argoci-image.sh
+
+check-ocp-no-crds:
+	@echo "Checking for files in manifests/ocp with CustomResourceDefinitions"
+	@CRD_FILES_IN_OCP_DIR=$$(grep "^kind: CustomResourceDefinition" manifests/ocp/* -l || true); if [ ! -z "$$CRD_FILES_IN_OCP_DIR" ]; then echo "ERROR: manifests/ocp should not have any CustomResourceDefinitions, these files should be removed:"; echo "$$CRD_FILES_IN_OCP_DIR"; exit 1; fi
+
+.PHONY: test-charts
+## Render the helm charts and assert on the resulting Kubernetes objects.
+test-charts: bin/helm
+	$(DOCKER_GO_BUILD) sh -c 'PATH=$$PWD/bin::$$PATH go test -count=1 ./charts/test/...'
+	
+# yamllint is single-threaded, so the files are split across cores. Parsable
+# output keeps each problem on one line, so parallel runs can't garble it.
+yaml-lint:
+	@docker run --rm -v $(PWD):/data -w /data --entrypoint sh cytopia/yamllint:latest -c \
+	  'find . -name .git -prune -o -type f \( -name "*.yaml" -o -name "*.yml" -o -name .yamllint \) -print0 | \
+	   xargs -0 -r -P $(or $(GOMAXPROCS),$$(nproc)) -n 50 yamllint -f parsable'
+
+protobuf:
+	$(MAKE) -C app-policy protobuf
+	$(MAKE) -C cni-plugin protobuf
+	$(MAKE) -C felix protobuf
+	$(MAKE) -C pod2daemon protobuf
+	$(MAKE) -C goldmane protobuf
+
 generate:
 	$(MAKE) gen-semaphore-yaml
+	$(MAKE) gen-deps-files
+	$(MAKE) protobuf
+	$(MAKE) -C lib gen-files
 	$(MAKE) -C api gen-files
 	$(MAKE) -C libcalico-go gen-files
 	$(MAKE) -C felix gen-files
-	$(MAKE) -C calicoctl gen-crds
-	$(MAKE) -C app-policy protobuf
+	$(MAKE) -C goldmane gen-files
+	$(MAKE) -C kube-controllers gen-files
+	# Before the manifests, which take the operator's CRDs from its own tree.
+	$(MAKE) -C operator gen-files
 	$(MAKE) gen-manifests
+	$(MAKE) -C e2e gen-test-set
+	$(MAKE) fix-changed
 
-gen-manifests: bin/helm
-	cd ./manifests && \
-		OPERATOR_VERSION=$(OPERATOR_VERSION) \
-		CALICO_VERSION=$(CALICO_VERSION) \
-		./generate.sh
+gen-manifests: bin/helm bin/yq
+	cd ./manifests && ./generate.sh
 
-# Get operator CRDs from the operator repo, OPERATOR_BRANCH_NAME must be set
-get-operator-crds: var-require-all-OPERATOR_BRANCH_NAME
-	cd ./charts/tigera-operator/crds/ && \
-	for file in operator.tigera.io_*.yaml; do echo "downloading $$file from operator repo" && curl -fsSL https://raw.githubusercontent.com/tigera/operator/${OPERATOR_BRANCH_NAME}/pkg/crds/operator/$${file%_crd.yaml}.yaml -o $${file}; done
-	cd ./manifests/ocp/ && \
-	for file in operator.tigera.io_*.yaml; do echo "downloading $$file from operator repo" && curl -fsSL https://raw.githubusercontent.com/tigera/operator/${OPERATOR_BRANCH_NAME}/pkg/crds/operator/$${file%_crd.yaml}.yaml -o $${file}; done
+# The operator's go:embed directives need these on disk before any target can
+# load its packages.
+.PHONY: operator-charts
+operator-charts:
+	$(MAKE) -C operator embedded_charts
 
-gen-semaphore-yaml:
-	cd .semaphore && ./generate-semaphore-yaml.sh
+gen-semaphore-yaml: operator-charts
+ifdef CI_WORKFLOW_NAME
+	@echo "Skipping Semaphore config generation under ArgoCI"
+else
+	$(DOCKER_GO_BUILD) sh -c "DEFAULT_BRANCH_OVERRIDE=$(DEFAULT_BRANCH_OVERRIDE) \
+	                          SEMAPHORE_GIT_BRANCH=$(SEMAPHORE_GIT_BRANCH) \
+	                          RELEASE_BRANCH_PREFIX=$(RELEASE_BRANCH_PREFIX) \
+	                          go run ./hack/cmd/deps $(DEPS_ARGS) generate-semaphore-yamls"
+endif
 
-# Build the tigera-operator helm chart.
-chart: bin/tigera-operator-$(GIT_VERSION).tgz
-bin/tigera-operator-$(GIT_VERSION).tgz: bin/helm $(shell find ./charts/tigera-operator -type f)
+GO_DIRS=$(shell ./hack/list-go-sources.sh dirs)
+DEP_FILES=$(patsubst %, %/deps.txt, $(GO_DIRS))
+DEPS_SOURCES:=go.mod go.sum $(shell ./hack/list-go-sources.sh files) Makefile ./hack/list-go-sources.sh hack/cmd/deps/*
+
+# Regenerated with the deps.txt files, from the same import graph.
+ARGOCI_DEPS_FILE=.argoci/depstree.yaml
+
+# Subpackages a CI lane gates on by themselves, narrower than their component.
+# They get a depstree entry but no deps.txt.
+ARGOCI_DEPS_SUBPACKAGES=felix/nftables test-tools/mocknode
+
+# Each job starts its own go-build container, so it is sized from the CPU a CI
+# step was given where there is one; nproc counts the node's cores instead.
+gen-deps-files: operator-charts
+	$(MAKE) -j$(or $(GOMAXPROCS),$$(nproc)) $(DEP_FILES)
+	$(MAKE) $(ARGOCI_DEPS_FILE)
+
+$(DEP_FILES): $(DEPS_SOURCES)
+	@{ \
+	  echo "!!! GENERATED FILE, DO NOT EDIT !!!" && \
+	  echo "Run 'make gen-deps-files' to regenerate." && \
+	  echo && \
+	  grep '^go' go.mod && \
+	  $(DOCKER_GO_BUILD) sh -c "go run ./hack/cmd/deps combined $(patsubst %/,%,$(dir $@))"; \
+	} > $@
+
+# One invocation for every component, since each is a whole-repo `go list` pass.
+# Via a temporary, because a truncated file would silently gate nothing.
+$(ARGOCI_DEPS_FILE): $(DEPS_SOURCES)
+	@$(DOCKER_GO_BUILD) sh -c "go run ./hack/cmd/deps gen-argoci-deps $(GO_DIRS) $(ARGOCI_DEPS_SUBPACKAGES)" > $@.tmp \
+	  && mv $@.tmp $@ || { rm -f $@.tmp; exit 1; }
+
+# The pin file is what onboards a component: one without it is left out,
+# because the generator treats an absent pin file as "no pins" and would delete
+# the patch.
+THIRDPARTY_DEP_PIN_FILES=$(wildcard third_party/*/dep-pins.txt istio/dep-pins.txt)
+
+.PHONY: regen-thirdparty-dep-patches
+regen-thirdparty-dep-patches:
+	@for pins in $(THIRDPARTY_DEP_PIN_FILES); do \
+		$(MAKE) -C $$(dirname $$pins) regen-dep-patches || exit 1; \
+	done
+
+.PHONY: check-thirdparty-dep-patches
+check-thirdparty-dep-patches:
+	@for pins in $(THIRDPARTY_DEP_PIN_FILES); do \
+		$(MAKE) -C $$(dirname $$pins) check-dep-patches || exit 1; \
+	done
+
+# bin/send-perf-results is the tool that pushes hack/perf JSON docs to the Lens
+# Elasticsearch cluster (see hack/perf/README.md). Built statically so CI jobs
+# that produce perf artifacts on the host (e.g. the nftables dataplane benchmark)
+# can run it without the go-build container.
+bin/send-perf-results: $(shell find ./hack/perf -name '*.go')
+	$(DOCKER_GO_BUILD) sh -c "CGO_ENABLED=0 go build -o $@ ./hack/perf/cmd/send-perf-results"
+
+CHART_DESTINATION ?= ./bin
+
+# Build helm charts.
+chart: $(CHART_DESTINATION)/tigera-operator-$(GIT_VERSION).tgz \
+			 $(CHART_DESTINATION)/projectcalico.org.v3-$(GIT_VERSION).tgz \
+			 $(CHART_DESTINATION)/crd.projectcalico.org.v1-$(GIT_VERSION).tgz
+
+$(CHART_DESTINATION)/tigera-operator-$(GIT_VERSION).tgz: bin/helm $(shell find ./charts/tigera-operator -type f)
+	mkdir -p $(CHART_DESTINATION)
 	bin/helm package ./charts/tigera-operator \
-	--destination ./bin/ \
+	--destination $(CHART_DESTINATION)/ \
 	--version $(GIT_VERSION) \
 	--app-version $(GIT_VERSION)
 
-# Build all Calico images for the current architecture.
+$(CHART_DESTINATION)/crd.projectcalico.org.v1-$(GIT_VERSION).tgz: bin/helm $(shell find ./charts/crd.projectcalico.org.v1/ -type f)
+	mkdir -p $(CHART_DESTINATION)
+	bin/helm package ./charts/crd.projectcalico.org.v1/ \
+	--destination $(CHART_DESTINATION)/ \
+	--version $(GIT_VERSION) \
+	--app-version $(GIT_VERSION)
+
+$(CHART_DESTINATION)/projectcalico.org.v3-$(GIT_VERSION).tgz: bin/helm $(shell find ./charts/projectcalico.org.v3/ -type f)
+	mkdir -p $(CHART_DESTINATION)
+	bin/helm package ./charts/projectcalico.org.v3/ \
+	--destination $(CHART_DESTINATION)/ \
+	--version $(GIT_VERSION) \
+	--app-version $(GIT_VERSION)
+
+###############################################################################
+# Build & push workflow — build all images, tag with a custom tag, and
+# optionally push to a remote registry.
+#
+# Images are only re-tagged / re-pushed when their docker image ID changes,
+# which makes repeated runs fast when only one component has been modified.
+#
+# Usage:
+#   make image                                              # build + tag as calico/<name>:<version>
+#   make push DEV_IMAGE_PATH=myuser DEV_IMAGE_TAG=latest    # build + tag + push to myuser/<name>:latest
+#
+# Component images are independent targets and build in parallel up to
+# NUM_BUILD_JOBS (default 4 to keep memory usage sane on a workstation;
+# raise via NUM_BUILD_JOBS=8 etc. for a bigger machine).
+#
+# To force a full rebuild, remove the stamp directory:
+#   rm -rf .dev-stamps && make push ...
+###############################################################################
+
+.PHONY: image
+## Build all component images and tag for dev registry.
 image:
-	$(MAKE) -C pod2daemon image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C calicoctl image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C cni-plugin image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C apiserver image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C kube-controllers image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C app-policy image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C typha image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
-	$(MAKE) -C node image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
+	$(MAKE) -j$(NUM_BUILD_JOBS) $(KIND_IMAGE_MARKERS)
+	@CALICO_IMAGES="$(KIND_CALICO_IMAGES)" \
+	  DEV_IMAGE_PREFIX="$(DEV_IMAGE_PREFIX)" \
+	  DEV_IMAGE_TAG="$(DEV_IMAGE_TAG)" \
+	  ARCH="$(ARCH)" \
+	  STAMP_DIR="$(DEV_STAMP_DIR)" \
+	  $(REPO_ROOT)/hack/dev-build.sh --tag
+	@echo "image complete"
+
+.PHONY: operator-image
+## Build the operator image with the dev registry's component references baked in.
+operator-image: $(REPO_ROOT)/operator/.image.created-$(ARCH)
+
+.PHONY: push
+## Push all tagged images to the remote registry.
+push: image
+	@DEV_IMAGES="$(DEV_CALICO_IMAGES) $(DEV_OPERATOR_IMAGE)" \
+	  STAMP_DIR="$(DEV_STAMP_DIR)" \
+	  $(REPO_ROOT)/hack/dev-build.sh --push
+
+.PHONY: push-chart
+## Package the tigera-operator helm chart with custom image refs and push to OCI registry.
+push-chart: bin/helm
+	@TAG="$(DEV_IMAGE_TAG)" \
+	  REGISTRY="$(DEV_IMAGE_REGISTRY)" \
+	  IMAGE_PATH="$(DEV_IMAGE_PATH)" \
+	  HELM="$(REPO_ROOT)/bin/helm" \
+	  $(REPO_ROOT)/.github/scripts/package-helm-chart.sh
 
 ###############################################################################
 # Run local e2e smoke test against the checked-out code
 # using a local kind cluster.
 ###############################################################################
-E2E_FOCUS ?= "sig-network.*Conformance"
+E2E_PROCS ?= 4
+E2E_TIMEOUT ?= 90m
+# The conformance kind lane relies on this default. The provisioned lanes never
+# reach it: run_tests.sh always passes E2E_TEST_CONFIG on make's command line,
+# and a command-line assignment overrides ?= even when its value is empty.
+E2E_TEST_CONFIG ?= e2e/config/kind/conformance.yaml
+# E2E_TEST_CONFIG is a list, one --calico.test-config per entry. An entry is
+# relative to e2e/config, unless it is absolute or already starts with e2e/config/.
+e2e_config_path = $(abspath $(if $(filter /% e2e/config/%,$(1)),$(1),e2e/config/$(1)))
+E2E_TEST_CONFIG_FLAGS = $(foreach c,$(E2E_TEST_CONFIG),--calico.test-config=$(call e2e_config_path,$(c)))
+E2E_OUTPUT_DIR ?= report
+E2E_JUNIT_REPORT ?= e2e_conformance.xml
+# ClusterNetworkPolicyNamedPorts needs the experimental-channel CRD; we install the standard one.
+K8S_NETPOL_SUPPORTED_FEATURES ?= "ClusterNetworkPolicy"
+K8S_NETPOL_UNSUPPORTED_FEATURES ?= ""
+
+# rapidclient helper image for the packet-size and maglev specs. e2e-test-bpf loads
+# a PR-built copy into the kind nodes under the tag the tests use, so
+# PullIfNotPresent finds it. Keep in sync with images.go.
+RAPIDCLIENT_TAG := latest
+RAPIDCLIENT_IMAGE := quay.io/tigeradev/rapidclient
+EXTERNAL_NODE_NAME ?= kind-external-node
+
+# Set where the e2e binaries arrive already built: rebuilding them downloads
+# most of Kubernetes, which a host without a module proxy pays for every time.
+E2E_PREBUILT ?=
+E2E_BUILD = $(if $(E2E_PREBUILT),@echo "Using the prebuilt e2e binaries",$(MAKE) -C e2e build)
+
+## Build all test images, create a kind cluster, and deploy Calico on it.
+.PHONY: kind-up
+kind-up:
+	$(MAKE) -j$(NUM_BUILD_JOBS) kind-build-images
+	$(MAKE) kind-cluster-create CALICO_API_GROUP=$(KIND_CALICO_API_GROUP)
+	$(MAKE) kind-deploy
+
+## Build images, create a kind cluster with v1 CRDs, deploy Calico, and run the
+## v1-to-v3 migration test.
+.PHONY: kind-migration-test
+kind-migration-test:
+	KIND_CALICO_API_GROUP=crd.projectcalico.org/v1 $(MAKE) kind-up
+	$(REPO_ROOT)/hack/test/kind/migration/run_test.sh
+
+## Create a kind cluster, install Calico from the generated manifests, run the
+## datapath and policy conformance specs against it, then upgrade the cluster to
+## the operator and run them again. Every other kind lane installs via the
+## operator from the start.
+.PHONY: kind-manifest-install-test
+kind-manifest-install-test:
+	$(E2E_BUILD)
+	$(MAKE) -j$(NUM_BUILD_JOBS) kind-build-images
+	$(MAKE) kind-cluster-create KIND_CONFIG=$(KIND_DIR)/kind-manifests.config CALICO_API_GROUP=projectcalico.org/v3
+	REPO_ROOT=$(REPO_ROOT) KIND=$(KIND) KIND_NAME=kind-manifests \
+		KUBECONFIG=$(KIND_DIR)/kind-manifests-kubeconfig.yaml \
+		$(REPO_ROOT)/hack/test/kind/deploy_manifests.sh
+	$(MAKE) e2e-run \
+		KIND_NAME=kind-manifests \
+		KUBECONFIG=$(KIND_DIR)/kind-manifests-kubeconfig.yaml \
+		E2E_TEST_CONFIG=$(REPO_ROOT)/e2e/config/kind/manifest-install.yaml \
+		E2E_JUNIT_REPORT=e2e_manifest_install.xml
+	$(MAKE) -C $(REPO_ROOT) chart CALICO_API_GROUP=projectcalico.org/v3
+	REPO_ROOT=$(REPO_ROOT) GIT_VERSION=$(GIT_VERSION) \
+		KUBECONFIG=$(KIND_DIR)/kind-manifests-kubeconfig.yaml \
+		$(REPO_ROOT)/hack/test/kind/upgrade_to_operator.sh
+	$(MAKE) e2e-run \
+		KIND_NAME=kind-manifests \
+		KUBECONFIG=$(KIND_DIR)/kind-manifests-kubeconfig.yaml \
+		E2E_TEST_CONFIG=$(REPO_ROOT)/e2e/config/kind/manifest-install.yaml \
+		E2E_JUNIT_REPORT=e2e_operator_upgrade.xml
+
+## Create a kind cluster and run the conformance e2e tests.
 e2e-test:
-	$(MAKE) -C e2e build
-	$(MAKE) -C node kind-k8st-setup
-	KUBECONFIG=$(KIND_KUBECONFIG) ./e2e/bin/e2e.test -ginkgo.focus=$(E2E_FOCUS)
+	$(E2E_BUILD)
+	$(MAKE) kind-up
+	$(MAKE) e2e-run KUBECONFIG=$(KIND_KUBECONFIG)
+
+## Create a kind cluster with the BPF dataplane plus an external node, and run
+## the sig-calico BPF e2e tests (including the ExternalNode specs).
+## Uses kind-bpf.config (kube-proxy in iptables mode - eBPF does not support
+## ipvs kube-proxy) while keeping the cluster named "kind" so values.yaml's
+## control-plane nodeSelector still matches.
+e2e-test-bpf:
+	$(E2E_BUILD)
+	$(MAKE) kind-up KIND_NAME=kind KIND_CONFIG=$(KIND_DIR)/kind-bpf.config EXTRA_VALUES_FILES=$(KIND_INFRA_DIR)/values-bpf.yaml
+	$(MAKE) kind-load-rapidclient KIND_NAME=kind
+	EXTERNAL_NODE_IMAGE=$(EXTERNAL_NODE_IMAGE) $(KIND_DIR)/external-node.sh up
+	$(KIND_DIR)/external-node.sh seed
+	$(MAKE) external-node-load-rapidclient
+	# EXT_* / SSH_AUTH_SOCK are passed as environment (the e2e binary reads them
+	# via os.Getenv); KIND_NAME/KUBECONFIG/E2E_TEST_CONFIG are make variables.
+	# SSH_AUTH_SOCK is cleared so the framework's ssh uses only EXT_KEY and does
+	# not trip over unrelated agent keys.
+	EXT_USER=ubuntu \
+	EXT_IP="$$(cat $(KIND_DIR)/external-node-ip)" \
+	EXT_KEY=$(KIND_DIR)/external-node-key \
+	SSH_AUTH_SOCK= \
+	$(MAKE) e2e-run \
+		KIND_NAME=kind \
+		KUBECONFIG=$(KIND_KUBECONFIG) \
+		E2E_TEST_CONFIG=$(REPO_ROOT)/e2e/config/kind/bpf.yaml
+
+## Build the rapidclient helper image from PR source and load it into the kind
+## nodes, so the packet-size server pods use the PR build rather than pulling
+## the published image.
+.PHONY: kind-load-rapidclient
+kind-load-rapidclient:
+	$(MAKE) -C e2e/images/rapidclient image TAG_NAME=$(RAPIDCLIENT_TAG)
+	$(KIND) load docker-image $(RAPIDCLIENT_IMAGE):$(RAPIDCLIENT_TAG) --name $(KIND_NAME)
+
+## Load the (already-built) rapidclient image into the external node's inner docker
+## daemon, for the ExternalNode packet-size spec and maglev's `docker run`. The node
+## is a dind container, so we `docker exec` its dockerd directly as root (no sudo /
+## ssh, unlike the gcp external node in load_images.sh). Run after kind-load-rapidclient
+## (builds the host image) and external-node.sh up (creates the container).
+.PHONY: external-node-load-rapidclient
+external-node-load-rapidclient:
+	docker save $(RAPIDCLIENT_IMAGE):$(RAPIDCLIENT_TAG) | docker exec -i $(EXTERNAL_NODE_NAME) docker load
+
+## Create a kind cluster and run the ClusterNetworkPolicy specific e2e tests.
+e2e-test-clusternetworkpolicy:
+	$(E2E_BUILD)
+	$(MAKE) kind-up
+	$(MAKE) e2e-run-cnp KUBECONFIG=$(KIND_KUBECONFIG)
+
+## Run the general e2e tests against the cluster at $KUBECONFIG.
+## Callers must set KUBECONFIG explicitly (e.g. $(KIND_KUBECONFIG) for kind).
+## Selection comes from E2E_TEST_CONFIG. E2E_GINKGO_ARGS passes extra ginkgo flags for
+## an ad-hoc local run; it expands in the shell so its regex metacharacters survive.
+## --fail-on-empty fails a run that selects no specs instead of passing it.
+## OpenShift keeps the legacy master taint on control-plane nodes, which otherwise blocks startup.
+#
+# In CI, keep a failed suite's namespaces for the diagnostics collected after;
+# locally they would just be left behind.
+ifdef CI
+E2E_KEEP_FAILED := --delete-namespace-on-failure=false
+CNP_KEEP_FAILED := -cleanup-base-resources=false
+endif
+
+e2e-run: bin/ginkgo
+	@if [ -z "$(KUBECONFIG)" ]; then echo "e2e-run: KUBECONFIG must be set"; exit 1; fi
+	mkdir -p $(E2E_OUTPUT_DIR)
+	KUBECONFIG=$(KUBECONFIG) ./bin/ginkgo -procs=$(E2E_PROCS) --timeout=$(E2E_TIMEOUT) --fail-on-empty --junit-report=$(E2E_JUNIT_REPORT) --output-dir=$(E2E_OUTPUT_DIR)/ ./e2e/bin/k8s/e2e.test -- --non-blocking-taints=node-role.kubernetes.io/control-plane,node-role.kubernetes.io/master $${E2E_GINKGO_ARGS} $(E2E_KEEP_FAILED) $(E2E_TEST_CONFIG_FLAGS)
+
+# Version from go.mod. Built with whichever of Go and docker the host has: the
+# kind lanes have only docker, the remote-cluster lanes only Go.
+bin/ginkgo: go.mod
+	mkdir -p bin
+	@if command -v go >/dev/null 2>&1; then \
+	    set -x; CGO_ENABLED=0 go build -o $@ github.com/onsi/ginkgo/v2/ginkgo; \
+	else \
+	    set -x; $(DOCKER_GO_BUILD) sh -c "CGO_ENABLED=0 go build -o $@ github.com/onsi/ginkgo/v2/ginkgo"; \
+	fi
+
+## Run the ClusterNetworkPolicy specific e2e tests against the cluster at $KUBECONFIG.
+e2e-run-cnp:
+	@if [ -z "$(KUBECONFIG)" ]; then echo "e2e-run-cnp: KUBECONFIG must be set"; exit 1; fi
+	KUBECONFIG=$(KUBECONFIG) ./e2e/bin/clusternetworkpolicy/e2e.test \
+	  -exempt-features=$(K8S_NETPOL_UNSUPPORTED_FEATURES) \
+	  -supported-features=$(K8S_NETPOL_SUPPORTED_FEATURES) $(CNP_KEEP_FAILED)
+
+###############################################################################
+# Gateway API conformance
+#
+# Runs the upstream sigs.k8s.io/gateway-api conformance suite against
+# Calico's Envoy-Gateway-based implementation on the cluster at $KUBECONFIG,
+# and emits a ConformanceReport YAML.
+#
+# Caller must set KUBECONFIG (e.g. $(KIND_KUBECONFIG)). Everything else
+# is inferred from git: GATEWAY_CONFORMANCE_VERSION defaults to
+# `git describe --tags --always --dirty`, which produces a useful
+# identifier on every build (a clean tag for release builds, a
+# describe-style ref for branch/PR builds). Whether to submit the
+# resulting report upstream is a separate decision and is not gated
+# here.
+#
+# The default GATEWAY_CLASS_NAME ("tigera-gateway-class") matches what the
+# tigera-operator provisions when the GatewayAPI CR omits gatewayClasses.
+###############################################################################
+GATEWAY_CONFORMANCE_VERSION ?= $(shell git -C $(REPO_ROOT) describe --tags --always --dirty 2>/dev/null)
+GATEWAY_CLASS_NAME ?= tigera-gateway-class
+GATEWAY_CONFORMANCE_PROFILES ?= GATEWAY-HTTP
+GATEWAY_CONFORMANCE_MODE ?= default
+GATEWAY_CONFORMANCE_REPORT ?= $(REPO_ROOT)/$(E2E_OUTPUT_DIR)/gateway-conformance-report.yaml
+GATEWAY_CONFORMANCE_ORG ?= projectcalico
+GATEWAY_CONFORMANCE_PROJECT ?= calico
+GATEWAY_CONFORMANCE_URL ?= https://github.com/projectcalico/calico
+GATEWAY_CONFORMANCE_CONTACT ?= https://www.tigera.io/contact/
+GATEWAY_API_CR ?= $(REPO_ROOT)/e2e/cmd/gateway/manifests/gatewayapi.yaml
+GATEWAY_ENVOY_PROXY ?= $(REPO_ROOT)/e2e/cmd/gateway/manifests/envoyproxy.yaml
+GATEWAY_METALLB_POOL ?= $(REPO_ROOT)/e2e/cmd/gateway/manifests/metallb-pool.yaml
+# Name of the docker network kind binds to. The kind default is "kind".
+GATEWAY_KIND_DOCKER_NETWORK ?= kind
+# Envoy Gateway deliberately leaves GatewayClass .status.supportedFeatures empty
+# (the field is experimental and datatype-unstable upstream; see EG's
+# internal/gatewayapi/status/gatewayclass.go). With empty status the conformance
+# suite's auto-inference returns no features and refuses to run. Default to the
+# curated envoy-gateway set (see e2e/cmd/gateway/e2e_test.go::envoyGatewayCuratedSet)
+# -- Calico ships stock unpatched Envoy Gateway so its feature surface matches
+# upstream's. Override GATEWAY_CONFORMANCE_CURATED to "" and set the individual
+# flags below for ad-hoc / debugging runs.
+GATEWAY_CONFORMANCE_CURATED ?= envoy-gateway
+GATEWAY_CONFORMANCE_ALL_FEATURES ?= false
+GATEWAY_CONFORMANCE_SUPPORTED_FEATURES ?=
+GATEWAY_CONFORMANCE_EXEMPT_FEATURES ?=
+
+## Apply the GatewayAPI operator CR and wait for the default GatewayClass to be Accepted.
+GATEWAY_SETUP_CRD_TIMEOUT ?= 300
+GATEWAY_SETUP_GWC_TIMEOUT ?= 5m
+
+.PHONY: e2e-gateway-setup
+e2e-gateway-setup:
+	KUBECONFIG=$(KUBECONFIG) \
+	GATEWAY_API_CR=$(GATEWAY_API_CR) \
+	GATEWAY_ENVOY_PROXY=$(GATEWAY_ENVOY_PROXY) \
+	GATEWAY_METALLB_POOL=$(GATEWAY_METALLB_POOL) \
+	GATEWAY_CLASS_NAME=$(GATEWAY_CLASS_NAME) \
+	GATEWAY_KIND_DOCKER_NETWORK=$(GATEWAY_KIND_DOCKER_NETWORK) \
+	GATEWAY_SETUP_CRD_TIMEOUT=$(GATEWAY_SETUP_CRD_TIMEOUT) \
+	GATEWAY_SETUP_GWC_TIMEOUT=$(GATEWAY_SETUP_GWC_TIMEOUT) \
+	$(REPO_ROOT)/hack/test/kind/gateway-setup.sh
+
+## Run the Gateway API conformance suite.
+e2e-run-gateway-conformance: e2e-gateway-setup
+	@if [ -z "$(KUBECONFIG)" ]; then echo "e2e-run-gateway-conformance: KUBECONFIG must be set"; exit 1; fi
+	mkdir -p $(dir $(GATEWAY_CONFORMANCE_REPORT))
+	KUBECONFIG=$(KUBECONFIG) ./e2e/bin/gateway/e2e.test \
+	  -gateway-class='$(GATEWAY_CLASS_NAME)' \
+	  -curated='$(GATEWAY_CONFORMANCE_CURATED)' \
+	  -conformance-profiles='$(GATEWAY_CONFORMANCE_PROFILES)' \
+	  -mode='$(GATEWAY_CONFORMANCE_MODE)' \
+	  -all-features='$(GATEWAY_CONFORMANCE_ALL_FEATURES)' \
+	  -supported-features='$(GATEWAY_CONFORMANCE_SUPPORTED_FEATURES)' \
+	  -exempt-features='$(GATEWAY_CONFORMANCE_EXEMPT_FEATURES)' \
+	  -organization='$(GATEWAY_CONFORMANCE_ORG)' \
+	  -project='$(GATEWAY_CONFORMANCE_PROJECT)' \
+	  -url='$(GATEWAY_CONFORMANCE_URL)' \
+	  -contact='$(GATEWAY_CONFORMANCE_CONTACT)' \
+	  -version='$(GATEWAY_CONFORMANCE_VERSION)' \
+	  -report-output='$(GATEWAY_CONFORMANCE_REPORT)' \
+	  -test.v -test.timeout=60m
+
+## End-to-end: build, kind-up, deploy Envoy Gateway, run conformance, emit report.
+.PHONY: e2e-test-gateway-conformance
+e2e-test-gateway-conformance:
+	$(MAKE) -C e2e bin/gateway/e2e.test
+	$(MAKE) kind-up
+	$(MAKE) e2e-run-gateway-conformance KUBECONFIG=$(KIND_KUBECONFIG)
 
 ###############################################################################
 # Release logic below
 ###############################################################################
+.PHONY: release release-publish create-release-branch release-test build-openstack publish-openstack release-notes
 # Build the release tool.
-hack/release/release: $(shell find ./hack/release -type f -name '*.go')
-	$(call build_binary, ./hack/release/cmd, $@)
+release/bin/release: $(shell find ./release -type f -name '*.go') metadata.mk
+	$(MAKE) -C release
+
+# Prepare for a release (update version references, charts, manifests).
+release-prep: release/bin/release bin/gh
+	@release/bin/release release prep
 
 # Install ghr for publishing to github.
-hack/release/ghr:
-	$(DOCKER_RUN) -e GOBIN=/go/src/$(PACKAGE_NAME)/hack/release/ $(CALICO_BUILD) go install github.com/tcnksm/ghr@v0.14.0
+bin/ghr:
+	$(DOCKER_RUN) -e GOBIN=/go/src/$(PACKAGE_NAME)/bin/ $(CALICO_BUILD) go install github.com/tcnksm/ghr@$(GHR_VERSION)
+
+# Install GitHub CLI
+bin/gh:
+	@mkdir -p bin
+	@$(call fetch_file,https://github.com/cli/cli/releases/download/v$(GITHUB_CLI_VERSION)/gh_$(GITHUB_CLI_VERSION)_linux_amd64.tar.gz,bin/gh.tgz)
+	@tar -zxvf bin/gh.tgz -C bin/ gh_$(GITHUB_CLI_VERSION)_linux_amd64/bin/gh --strip-components=2
+	@chmod +x $@
+	@rm bin/gh.tgz
 
 # Build a release.
-release: hack/release/release
-	@hack/release/release -create
+release: release/bin/release
+	@release/bin/release release build
+
+# Publish an already built release.
+release-publish: release/bin/release bin/gh bin/ghr bin/helm
+	@release/bin/release release publish
+
+# Create a release branch.
+create-release-branch: release/bin/release
+	@release/bin/release branch cut
 
 # Test the release code
 release-test:
 	$(DOCKER_RUN) $(CALICO_BUILD) ginkgo -cover -r hack/release/pkg
-
-# Publish an already built release.
-release-publish: hack/release/release hack/release/ghr
-	@hack/release/release -publish
-
-# Create a release branch.
-create-release-branch: hack/release/release
-	@hack/release/release -new-branch
 
 # Currently our openstack builds either build *or* build and publish,
 # hence why we have two separate jobs here that do almost the same thing.
 build-openstack: bin/yq
 	$(eval VERSION=$(shell bin/yq '.version' charts/calico/values.yaml))
 	$(info Building openstack packages for version $(VERSION))
-	$(MAKE) -C hack/release/packaging release VERSION=$(VERSION)
+	$(MAKE) -C release/packaging release VERSION=$(VERSION)
 
 publish-openstack: bin/yq
 	$(eval VERSION=$(shell bin/yq '.version' charts/calico/values.yaml))
 	$(info Publishing openstack packages for version $(VERSION))
-	$(MAKE) -C hack/release/packaging release-publish VERSION=$(VERSION)
+	$(MAKE) -C release/packaging release-publish VERSION=$(VERSION)
 
 ## Kicks semaphore job which syncs github released helm charts with helm index file
 .PHONY: helm-index
@@ -150,25 +595,12 @@ helm-index:
 
 # Creates the tar file used for installing Calico on OpenShift.
 bin/ocp.tgz: manifests/ocp/ bin/yq
-	mkdir -p bin/tmp
-	cp -r manifests/ocp bin/tmp/
-	$(DOCKER_RUN) $(CALICO_BUILD) /bin/bash -c "                                        \
-		for file in bin/tmp/ocp/*crd* ;                                                 \
-        	do bin/yq -i 'del(.. | select(has(\"description\")).description)' \$$file ; \
-        done"
-	tar czvf $@ -C bin/tmp ocp
-	rm -rf bin/tmp
+	tar czvf $@ --exclude='.gitattributes' -C manifests/ ocp
 
 ## Generates release notes for the given version.
 .PHONY: release-notes
 release-notes:
-ifndef GITHUB_TOKEN
-	$(error GITHUB_TOKEN must be set)
-endif
-ifndef VERSION
-	$(error VERSION must be set)
-endif
-	VERSION=$(VERSION) GITHUB_TOKEN=$(GITHUB_TOKEN) python2 ./hack/release/generate-release-notes.py
+	@$(MAKE) -C release release-notes
 
 ## Update the AUTHORS.md file.
 update-authors:
@@ -185,23 +617,13 @@ endif
 		-w /code \
 		-e GITHUB_TOKEN=$(GITHUB_TOKEN) \
 		python:3 \
-		bash -c '/usr/local/bin/python hack/release/get-contributors.py >> /code/AUTHORS.md'
+		bash -c '/usr/local/bin/python release/get-contributors.py >> /code/AUTHORS.md'
 
 ###############################################################################
 # Post-release validation
 ###############################################################################
-POSTRELEASE_IMAGE=calico/postrelease
-POSTRELEASE_IMAGE_CREATED=.calico.postrelease.created
-$(POSTRELEASE_IMAGE_CREATED):
-	cd hack/postrelease && docker build -t $(POSTRELEASE_IMAGE) .
-	touch $@
+bin/gotestsum:
+	@GOBIN=$(REPO_ROOT)/bin go install gotest.tools/gotestsum@$(GOTESTSUM_VERSION)
 
-postrelease-checks: $(POSTRELEASE_IMAGE_CREATED)
-	$(DOCKER_RUN) \
-		-v /var/run/docker.sock:/var/run/docker.sock \
-		-e VERSION=$(VERSION) \
-		-e FLANNEL_VERSION=$(FLANNEL_VERSION) \
-		-e VPP_VERSION=$(VPP_VERSION) \
-		-e OPERATOR_VERSION=$(OPERATOR_VERSION) \
-		$(POSTRELEASE_IMAGE) \
-		sh -c "nosetests hack/postrelease -e "$(EXCLUDE_REGEX)" -s -v --with-xunit --xunit-file='postrelease-checks.xml' --with-timer $(EXTRA_NOSE_ARGS)"
+postrelease-checks release-validate: release/bin/release bin/gotestsum
+	@release/bin/release release validate

@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,53 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/projectcalico/calico/felix/bpf/ifstate"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	. "github.com/projectcalico/calico/felix/fv/connectivity"
-	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-
+	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	options2 "github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
-var _ = describeBPFDualStackTests(false, true)
-var _ = describeBPFDualStackTests(true, true)
-var _ = describeBPFDualStackTests(false, false)
+var (
+	_ = describeBPFDualStackTests(false, true)
+	_ = describeBPFDualStackTests(true, true)
+	_ = describeBPFDualStackTests(false, false)
+
+	_ = describeBPFDualStackProxyHealthTests()
+	_ = describeBPFProxyHealthDisabledTests()
+)
 
 func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 	if !BPFMode() {
 		return true
 	}
-	desc := fmt.Sprintf("_BPF-SAFE_ BPF dual stack basic in-cluster connectivity tests (ct = %v)", ctlbEnabled)
+	desc := fmt.Sprintf("_BPF_ _BPF-SAFE_ BPF dual stack basic in-cluster connectivity tests (ct=%v)", ctlbEnabled)
 	return infrastructure.DatastoreDescribe(desc, []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-
 		var (
 			infra        infrastructure.DatastoreInfra
 			tc           infrastructure.TopologyContainers
@@ -71,17 +71,19 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 		)
 
 		felixIP := func(f int) string {
-			return tc.Felixes[f].Container.IP
+			return tc.Felixes[f].IP
 		}
 
 		felixIP6 := func(f int) string {
-			return tc.Felixes[f].Container.IPv6
+			return tc.Felixes[f].IPv6
 		}
 
 		BeforeEach(func() {
-			iOpts := []infrastructure.CreateOption{infrastructure.K8sWithDualStack(),
+			iOpts := []infrastructure.CreateOption{
+				infrastructure.K8sWithDualStack(),
 				infrastructure.K8sWithAPIServerBindAddress("::"),
-				infrastructure.K8sWithServiceClusterIPRange("dead:beef::abcd:0:0:0/112,10.101.0.0/16")}
+				infrastructure.K8sWithServiceClusterIPRange("dead:beef::abcd:0:0:0/112,10.101.0.0/16"),
+			}
 			infra = getInfra(iOpts...)
 			cc = &Checker{
 				CheckSNAT: true,
@@ -91,8 +93,7 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			opts.EnableIPv6 = true
 			opts.NATOutgoingEnabled = true
 			opts.AutoHEPsEnabled = false
-			opts.IPIPEnabled = false
-			opts.IPIPRoutesEnabled = false
+			opts.IPIPMode = api.IPIPModeNever
 			opts.DelayFelixStart = true
 
 			if ipv6Dataplane {
@@ -122,40 +123,23 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 				}
 
 				wIP := fmt.Sprintf("10.65.%d.%d", ii, wi+2)
+				wIPv6 := fmt.Sprintf("dead:beef::%d:%d", ii, wi+2)
 				wName := fmt.Sprintf("w%d%d", ii, wi)
 
+				infrastructure.AssignIP(wName, wIP, tc.Felixes[ii].Hostname, calicoClient)
+				infrastructure.AssignIP(wName, wIPv6, tc.Felixes[ii].Hostname, calicoClient)
+
 				w := workload.New(tc.Felixes[ii], wName, "default",
-					wIP, strconv.Itoa(port), "tcp", workload.WithIPv6Address(net.ParseIP(fmt.Sprintf("dead:beef::%d:%d", ii, wi+2)).String()))
+					wIP, strconv.Itoa(port), "tcp", workload.WithIPv6Address(wIPv6))
 
 				labels["name"] = w.Name
 				labels["workload"] = "regular"
 
 				w.WorkloadEndpoint.Labels = labels
 				if run {
-					err := w.Start()
+					err := w.Start(infra)
 					Expect(err).NotTo(HaveOccurred())
 					w.ConfigureInInfra(infra)
-				}
-
-				if opts.UseIPPools {
-					// Assign the workload's IP in IPAM, this will trigger calculation of routes.
-					err := calicoClient.IPAM().AssignIP(context.Background(), ipam.AssignIPArgs{
-						IP:       cnet.MustParseIP(w.IP),
-						HandleID: &w.Name,
-						Attrs: map[string]string{
-							ipam.AttributeNode: tc.Felixes[ii].Hostname,
-						},
-						Hostname: tc.Felixes[ii].Hostname,
-					})
-					Expect(err).NotTo(HaveOccurred())
-					err = calicoClient.IPAM().AssignIP(context.Background(), ipam.AssignIPArgs{
-						IP:       cnet.MustParseIP(w.IP6),
-						HandleID: &w.Name,
-						Attrs: map[string]string{
-							ipam.AttributeNode: tc.Felixes[ii].Hostname,
-						},
-						Hostname: tc.Felixes[ii].Hostname,
-					})
 				}
 
 				return w
@@ -203,38 +187,10 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 					currBpfepsV6  []nat.BackendMapMemV6
 				)
 
-				currBpfsvcsV6, currBpfepsV6 = dumpNATmapsV6(tc.Felixes)
-				currBpfsvcs, currBpfeps = dumpNATmaps(tc.Felixes)
+				currBpfsvcsV6, currBpfepsV6, _ = dumpNATmapsV6(tc.Felixes)
+				currBpfsvcs, currBpfeps, _ = dumpNATmaps(tc.Felixes)
 
 				for i, felix := range tc.Felixes {
-					felix.Exec("conntrack", "-L")
-					felix.Exec("ip6tables-save", "-c")
-					felix.Exec("ip", "-6", "link")
-					felix.Exec("ip", "-6", "addr")
-					felix.Exec("ip", "-6", "rule")
-					felix.Exec("ip", "-6", "route")
-					felix.Exec("ip", "-6", "neigh")
-					felix.Exec("calico-bpf", "-6", "ipsets", "dump")
-					felix.Exec("calico-bpf", "-6", "routes", "dump")
-					felix.Exec("calico-bpf", "-6", "nat", "dump")
-					felix.Exec("calico-bpf", "-6", "nat", "aff")
-					felix.Exec("calico-bpf", "-6", "conntrack", "dump")
-					felix.Exec("calico-bpf", "-6", "arp", "dump")
-					felix.Exec("iptables-save", "-c")
-					felix.Exec("ip", "link")
-					felix.Exec("ip", "addr")
-					felix.Exec("ip", "rule")
-					felix.Exec("ip", "route")
-					felix.Exec("ip", "neigh")
-					felix.Exec("arp")
-					felix.Exec("calico-bpf", "ipsets", "dump")
-					felix.Exec("calico-bpf", "routes", "dump")
-					felix.Exec("calico-bpf", "nat", "dump")
-					felix.Exec("calico-bpf", "nat", "aff")
-					felix.Exec("calico-bpf", "conntrack", "dump")
-					felix.Exec("calico-bpf", "arp", "dump")
-					felix.Exec("calico-bpf", "counters", "dump")
-					felix.Exec("calico-bpf", "ifstate", "dump")
 					log.Infof("[%d]FrontendMapV6: %+v", i, currBpfsvcsV6[i])
 					log.Infof("[%d]NATBackendV6: %+v", i, currBpfepsV6[i])
 					log.Infof("[%d]SendRecvMapV6: %+v", i, dumpSendRecvMapV6(felix))
@@ -245,29 +201,14 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			}
 		})
 
-		AfterEach(func() {
-			if CurrentGinkgoTestDescription().Failed {
-				infra.DumpErrorData()
-			}
-
-			for i := 0; i < 2; i++ {
-				for j := 0; j < 2; j++ {
-					w[i][j].Stop()
-				}
-			}
-			_, err := calicoClient.GlobalNetworkPolicies().Delete(context.Background(), "policy-1", options2.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
-			tc.Stop()
-			infra.Stop()
-		})
-
 		if !ipv6Dataplane {
 			JustBeforeEach(func() {
 				tc.TriggerDelayedStart()
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, nil)
+				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready, ifstate.FlgHEP, nil)
 			})
 			It("should drop ipv6 packets at workload interface and allow ipv6 packets at host interface when in IPv4 only mode", func() {
+				cc.ResetExpectations()
 				// IPv4 connectivity must work.
 				cc.Expect(Some, hostW[0], w[0][0])
 				cc.Expect(Some, hostW[0], hostW[1])
@@ -297,13 +238,14 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 				k8sClient = infra.(*infrastructure.K8sDatastoreInfra).K8sClient
 				_ = k8sClient
 				testSvc = k8sServiceForDualStack("test-svc", clusterIPs, w[0][0], 80, 8055, int32(npPort), "tcp")
-				testSvcNamespace = testSvc.ObjectMeta.Namespace
+				testSvcNamespace = testSvc.Namespace
 				_, err := k8sClient.CoreV1().Services(testSvcNamespace).Create(context.Background(), testSvc, metav1.CreateOptions{})
 				Expect(err).NotTo(HaveOccurred())
-				Eventually(k8sGetEpsForServiceFunc(k8sClient, testSvc), "10s").Should(HaveLen(1),
+				Eventually(checkSvcEndpoints(k8sClient, testSvc), "10s").Should(Equal(2),
 					"Service endpoints didn't get created? Is controller-manager happy?")
 			})
 			It("Should connect to w[0][0] from all other workloads with IPv4 and IPv6", func() {
+				cc.ResetExpectations()
 				cc.ExpectSome(w[0][1], w[0][0])
 				cc.ExpectSome(w[1][0], w[0][0])
 				cc.ExpectSome(w[1][1], w[0][0])
@@ -315,6 +257,7 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			})
 
 			It("Should connect to w[0][0] via clusterIP (IPv4 and IPv6)", func() {
+				cc.ResetExpectations()
 				port := uint16(testSvc.Spec.Ports[0].Port)
 				cc.ExpectSome(w[1][0], TargetIP(clusterIPs[0]), port)
 				cc.ExpectSome(w[1][0], TargetIP(clusterIPs[1]), port)
@@ -325,6 +268,7 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			})
 
 			It("Should connect to w[0][0] via nodePort (IPv4 and IPv6)", func() {
+				cc.ResetExpectations()
 				cc.ExpectSome(w[1][0], TargetIP(felixIP(0)), npPort)
 				cc.ExpectSome(w[0][1], TargetIP(felixIP(0)), npPort)
 
@@ -334,78 +278,13 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			})
 		})
 
-		// Running this test once should be enough as this test doesn't depend on CTLB.
 		if !ctlbEnabled {
-			It("Should connect to w[0][0] using IPv6 after IPv6 host IP is added", func() {
-				k8sClient = infra.(*infrastructure.K8sDatastoreInfra).K8sClient
-				_ = k8sClient
-
-				// Remove Node IPv6 address.
-				node, err := k8sClient.CoreV1().Nodes().Get(context.Background(), tc.Felixes[0].Hostname, metav1.GetOptions{})
-				Expect(err).NotTo(HaveOccurred())
-
-				delete(node.ObjectMeta.Annotations, "projectcalico.org/IPv6Address")
-				_, err = k8sClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
-				Expect(err).NotTo(HaveOccurred())
-
-				node, err = k8sClient.CoreV1().Nodes().Get(context.Background(), tc.Felixes[0].Hostname, metav1.GetOptions{})
-				Expect(err).NotTo(HaveOccurred())
-				node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felixIP(0)}}
-				_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
-				Expect(err).NotTo(HaveOccurred())
-
-				tc.TriggerDelayedStart()
-
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready)
-				cc.ExpectSome(w[0][1], w[0][0])
-				cc.ExpectSome(w[1][0], w[0][0])
-				cc.ExpectSome(w[1][1], w[0][0])
-
-				cc.Expect(None, w[0][1], w[0][0], ExpectWithIPVersion(6))
-				cc.Expect(None, w[1][0], w[0][0], ExpectWithIPVersion(6))
-				cc.Expect(None, w[1][1], w[0][0], ExpectWithIPVersion(6))
-				cc.Expect(Some, hostW[0], hostW[1], ExpectWithIPVersion(6))
-
-				cc.CheckConnectivity()
-				cc.ResetExpectations()
-
-				// Since we allow the IPv6 packets through IPv4 programs, a stale neighbor entry might get created
-				// when trying to reach w[0][0] from workloads in felix-1. This will impact subsequent
-				// tests. This does not seem to be a problem with ubuntu 22+ but is on ubuntu 20.
-				// Hence cleaning up the neighbor entry.
-				tc.Felixes[0].Exec("ip", "-6", "neigh", "del", w[0][0].IP6, "dev", w[0][0].InterfaceName)
-
-				// Add the node IPv6 address
-				node, err = k8sClient.CoreV1().Nodes().Get(context.Background(), tc.Felixes[0].Hostname, metav1.GetOptions{})
-				Expect(err).NotTo(HaveOccurred())
-				node.ObjectMeta.Annotations["projectcalico.org/IPv6Address"] = fmt.Sprintf("%s/%s", felixIP6(0), tc.Felixes[0].IPv6Prefix)
-				_, err = k8sClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
-				Expect(err).NotTo(HaveOccurred())
-
-				node, err = k8sClient.CoreV1().Nodes().Get(context.Background(), tc.Felixes[0].Hostname, metav1.GetOptions{})
-				Expect(err).NotTo(HaveOccurred())
-				node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felixIP(0)}, {Type: v1.NodeInternalIP, Address: felixIP6(0)}}
-				_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
-				Expect(err).NotTo(HaveOccurred())
-
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready)
-				cc.ExpectSome(w[0][1], w[0][0])
-				cc.ExpectSome(w[1][0], w[0][0])
-				cc.ExpectSome(w[1][1], w[0][0])
-
-				cc.Expect(Some, w[0][1], w[0][0], ExpectWithIPVersion(6))
-				cc.Expect(Some, w[1][0], w[0][0], ExpectWithIPVersion(6))
-				cc.Expect(Some, w[1][1], w[0][0], ExpectWithIPVersion(6))
-				cc.CheckConnectivity()
-			})
-
 			It("should be able to ping external client from w[0][0]", func() {
 				tc.TriggerDelayedStart()
-				externalClient := infrastructure.RunExtClient("ext-client")
+				externalClient := infrastructure.RunExtClient(infra, "ext-client")
 				_ = externalClient
-				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready)
-				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready)
+				ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
+				ensureRightIFStateFlags(tc.Felixes[1], ifstate.FlgIPv4Ready|ifstate.FlgIPv6Ready, ifstate.FlgHEP, nil)
 
 				tcpdump := externalClient.AttachTCPDump("any")
 				tcpdump.SetLogEnabled(true)
@@ -413,15 +292,31 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 					felixIP6(0), externalClient.IPv6)
 
 				tcpdump.AddMatcher("ICMP", regexp.MustCompile(matcher))
-				tcpdump.Start()
-				defer tcpdump.Stop()
+				tcpdump.Start(infra)
 
 				_, err := w[0][0].ExecCombinedOutput("ping6", "-c", "2", externalClient.IPv6)
 				Expect(err).NotTo(HaveOccurred())
 				Eventually(func() int { return tcpdump.MatchCount("ICMP") }).
 					Should(BeNumerically(">", 0), matcher)
-				externalClient.Stop()
+			})
 
+			It("should have both IPv4 and IPv6 routes for a dual stack UDP service", func() {
+				tc.TriggerDelayedStart()
+				ensureAllNodesBPFProgramsAttached(tc.Felixes)
+				k8sClient = infra.(*infrastructure.K8sDatastoreInfra).K8sClient
+				_ = k8sClient
+				testSvc = k8sServiceForDualStack("test-svc", clusterIPs, w[0][0], 80, 8055, int32(npPort), "udp")
+				testSvcNamespace = testSvc.Namespace
+				_, err := k8sClient.CoreV1().Services(testSvcNamespace).Create(context.Background(), testSvc, metav1.CreateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				Eventually(checkSvcEndpoints(k8sClient, testSvc), "10s").Should(Equal(2),
+					"Service endpoints didn't get created? Is controller-manager happy?")
+				Eventually(func() bool {
+					return checkServiceRoute(tc.Felixes[0], testSvc.Spec.ClusterIPs[0])
+				}, 10*time.Second, 300*time.Millisecond).Should(BeTrue(), "Failed to sync with udp service")
+				Eventually(func() bool {
+					return checkServiceRoute(tc.Felixes[0], testSvc.Spec.ClusterIPs[1])
+				}, 10*time.Second, 300*time.Millisecond).Should(BeTrue(), "Failed to sync with udp service")
 			})
 		}
 
@@ -435,20 +330,29 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			})
 
 			It("should be ready and have connectivity to w[0][0] from all other workloads with IPv6 only", func() {
+				// BPF programs attach for both IP families even with the
+				// IPv4 host IP missing; IPv4 globals just hold HOST_IP=0.
 				for _, f := range tc.Felixes {
-					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, false, true, "eth0")
-				}
-
-				felixReady := func(f *infrastructure.Felix) int {
-					return healthStatus("["+f.IPv6+"]", "9099", "readiness")
+					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, true, true, "eth0")
 				}
 
 				for _, f := range tc.Felixes {
-					Eventually(felixReady(f), "5s", "100ms").Should(BeGood())
-					Consistently(felixReady(f), "10s", "1s").Should(BeGood())
+					felixReady := func() int {
+						return healthStatus(f.IPv6, "9099", "readiness")
+					}
+					Eventually(felixReady, "10s", "330ms").Should(BeGood())
+					Consistently(felixReady, "10s", "1s").Should(BeGood())
 				}
 
-				cc.Expect(None, w[0][1], w[0][0])
+				cc.ResetExpectations()
+				// Same-host v4 connectivity works: no VXLAN encap is needed,
+				// kernel routes via veth, BPF programs attach with HOST_IPv4=0
+				// and apply default-allow policy.
+				cc.Expect(Some, w[0][1], w[0][0])
+				// Cross-host v4 connectivity fails: the BPF dataplane needs
+				// VXLAN encap with HOST_IPv4 as the source. With HOST_IPv4=0,
+				// the encap-source site (tc.c do_nat) drops the packet and
+				// increments the DroppedNoHostIP counter.
 				cc.Expect(None, w[1][0], w[0][0])
 				cc.Expect(None, w[1][1], w[0][0])
 
@@ -471,20 +375,29 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 			})
 
 			It("should be ready and have connectivity to w[0][0] from all other workloads with IPv4 only", func() {
+				// BPF programs attach for both IP families even with the
+				// IPv6 host IP missing; IPv6 globals just hold HOST_IP=0.
 				for _, f := range tc.Felixes {
-					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, true, false, "eth0")
-				}
-
-				felixReady := func(f *infrastructure.Felix) int {
-					return healthStatus(f.IP, "9099", "readiness")
+					ensureBPFProgramsAttachedOffsetWithIPVersion(1, f, true, true, "eth0")
 				}
 
 				for _, f := range tc.Felixes {
-					Eventually(felixReady(f), "5s", "100ms").Should(BeGood())
-					Consistently(felixReady(f), "10s", "1s").Should(BeGood())
+					felixReady := func() int {
+						return healthStatus(f.IP, "9099", "readiness")
+					}
+					Eventually(felixReady, "10s", "330ms").Should(BeGood())
+					Consistently(felixReady, "10s", "1s").Should(BeGood())
 				}
 
-				cc.Expect(None, w[0][1], w[0][0], ExpectWithIPVersion(6))
+				cc.ResetExpectations()
+				// Same-host v6 connectivity works: no VXLAN encap is needed,
+				// kernel routes via veth, BPF programs attach with HOST_IPv6=0
+				// and apply default-allow policy.
+				cc.Expect(Some, w[0][1], w[0][0], ExpectWithIPVersion(6))
+				// Cross-host v6 connectivity fails: the BPF dataplane needs
+				// VXLAN encap with HOST_IPv6 as the source. With HOST_IPv6=0,
+				// the encap-source site (tc.c do_nat) drops the packet and
+				// increments the DroppedNoHostIP counter.
 				cc.Expect(None, w[1][0], w[0][0], ExpectWithIPVersion(6))
 				cc.Expect(None, w[1][1], w[0][0], ExpectWithIPVersion(6))
 
@@ -495,6 +408,274 @@ func describeBPFDualStackTests(ctlbEnabled, ipv6Dataplane bool) bool {
 				cc.CheckConnectivity()
 			})
 		})
+
+		// CTLB is an intra-cluster connect-time NAT mechanism — by design
+		// it should not apply to external clients. However, the FV
+		// infrastructure attaches the connect-time hook globally, so
+		// when CTLB is enabled in the topology, the external client
+		// container ends up with the CTLB hook attached too. Its
+		// connect() calls then get NodePort-resolved at connect time,
+		// bypassing the BPF nodeport-NAT-then-encap path on the
+		// receiving node that this test exercises. Restrict to the
+		// non-CTLB scope so the external client acts as a real external
+		// client.
+		if !ctlbEnabled {
+			Context("with IPv6 host IP removed from one node only", func() {
+				var (
+					npPort         = uint16(30444)
+					testSvc        *v1.Service
+					externalClient *containers.Container
+				)
+				npClusterIPs := []string{"10.101.0.20", "dead:beef::abcd:0:0:20"}
+
+				BeforeEach(func() {
+					k8sClient = infra.(*infrastructure.K8sDatastoreInfra).K8sClient
+
+					// Strip felix-1's IPv6 host IP from the K8s Node, but keep
+					// the v6 address on the docker eth0 — the external client
+					// still needs to reach felix-1 over v6 to trigger the BPF
+					// nodeport-forwarding path. From Felix's POV (driven by the
+					// calc graph from K8s state) the local v6 host IP is unknown.
+					node, err := k8sClient.CoreV1().Nodes().Get(
+						context.Background(), tc.Felixes[1].Hostname, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred())
+					delete(node.Annotations, "projectcalico.org/IPv6Address")
+					_, err = k8sClient.CoreV1().Nodes().Update(
+						context.Background(), node, metav1.UpdateOptions{})
+					Expect(err).NotTo(HaveOccurred())
+					node, err = k8sClient.CoreV1().Nodes().Get(
+						context.Background(), tc.Felixes[1].Hostname, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred())
+					node.Status.Addresses = []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: tc.Felixes[1].IP},
+					}
+					_, err = k8sClient.CoreV1().Nodes().UpdateStatus(
+						context.Background(), node, metav1.UpdateOptions{})
+					Expect(err).NotTo(HaveOccurred())
+
+					// Service with backend on felix-0 (which still has both
+					// v4 and v6). NodePort is reachable on either felix.
+					testSvc = k8sServiceForDualStack("test-np-no-v6", npClusterIPs,
+						w[0][0], 80, 8055, int32(npPort), "tcp")
+					_, err = k8sClient.CoreV1().Services(testSvc.Namespace).Create(
+						context.Background(), testSvc, metav1.CreateOptions{})
+					Expect(err).NotTo(HaveOccurred())
+
+					externalClient = infrastructure.RunExtClientWithOpts(infra,
+						"ext-v6-np", infrastructure.ExtClientOpts{IPv6Enabled: true})
+
+					tc.TriggerDelayedStart()
+				})
+
+				AfterEach(func() {
+					if externalClient != nil {
+						externalClient.Stop()
+					}
+				})
+
+				It("v6 NodePort via the no-v6 node fails for external clients with DroppedNoHostIP", func() {
+					ensureAllNodesBPFProgramsAttached(tc.Felixes)
+					Eventually(checkSvcEndpoints(k8sClient, testSvc), "10s").Should(Equal(2),
+						"Service endpoints didn't get created? Is controller-manager happy?")
+
+					// External client → felix-1 v4 nodeport: works (felix-1 has v4 host IP,
+					// VXLAN encap to felix-0 succeeds).
+					// External client → felix-1 v6 nodeport: fails. felix-1 has no v6 host IP,
+					// so the BPF nodeport-forwarding path tries to VXLAN-encap with
+					// HOST_IPv6=0, hits ip_void(HOST_IP) in tc.c do_nat, drops the packet
+					// and increments the DroppedNoHostIP counter.
+					cc.ResetExpectations()
+					cc.ExpectSome(externalClient, TargetIP(tc.Felixes[1].IP), npPort)
+					cc.ExpectNone(externalClient, TargetIP(tc.Felixes[1].IPv6), npPort)
+					cc.CheckConnectivity()
+
+					// The connectivity assertion above already proves the drop;
+					// the counter check codifies *why* — it ties the drop to the
+					// new HOST_IP-aware encap site, not to some unrelated
+					// dataplane failure.
+					Eventually(func(g Gomega) {
+						ingress, egress := readDroppedNoHostIPCounter(g, tc.Felixes[1], "eth0")
+						g.Expect(ingress+egress).To(BeNumerically(">", 0),
+							"DroppedNoHostIP counter should have incremented on felix-1 eth0")
+					}, "10s", "1s").Should(Succeed())
+				})
+			})
+		}
+	})
+}
+
+// readDroppedNoHostIPCounter returns the (ingress, egress) values of the
+// "VXLAN encap when host IP unknown" counter (DroppedNoHostIP) on the
+// given felix's iface. Used by tests that assert on this counter to tie
+// observed packet drops to the specific encap-site drop we introduced for
+// the missing-host-IP case.
+func readDroppedNoHostIPCounter(g Gomega, felix *infrastructure.Felix, ifName string) (int, int) {
+	out, err := felix.ExecOutput("calico-bpf", "counters", "dump",
+		fmt.Sprintf("--iface=%s", ifName))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var iCount, eCount int
+	inDropped := false
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.FieldsFunc(line, func(c rune) bool { return c == '|' })
+		if len(fields) < 5 {
+			continue
+		}
+		if strings.TrimSpace(strings.ToLower(fields[0])) == "dropped" {
+			inDropped = true
+		}
+		// The counter name "VXLAN encap when host IP unknown" exceeds the
+		// counters-dump TYPE column width and wraps onto a second line
+		// ("...host IP" / "unknown"), so match on the unique prefix that
+		// survives on the first line — the counts live on that first line
+		// either way. HasPrefix also matches the unwrapped (wide-table) form.
+		if inDropped && strings.HasPrefix(strings.TrimSpace(strings.ToLower(fields[1])),
+			"vxlan encap when host ip") {
+			iCount, _ = strconv.Atoi(strings.TrimSpace(fields[2]))
+			eCount, _ = strconv.Atoi(strings.TrimSpace(fields[3]))
+			return iCount, eCount
+		}
+	}
+	return 0, 0
+}
+
+func describeBPFDualStackProxyHealthTests() bool {
+	if !BPFMode() {
+		return true
+	}
+	desc := "_BPF_ _BPF-SAFE_ BPF dual stack kube-proxy health checking tests"
+	return infrastructure.DatastoreDescribe(desc, []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
+		var (
+			infra     infrastructure.DatastoreInfra
+			tc        infrastructure.TopologyContainers
+			k8sClient *kubernetes.Clientset
+		)
+
+		BeforeEach(func() {
+			iOpts := []infrastructure.CreateOption{
+				infrastructure.K8sWithDualStack(),
+				infrastructure.K8sWithAPIServerBindAddress("::"),
+				infrastructure.K8sWithServiceClusterIPRange("dead:beef::abcd:0:0:0/112,10.101.0.0/16"),
+			}
+			infra = getInfra(iOpts...)
+			opts := infrastructure.DefaultTopologyOptions()
+			opts.EnableIPv6 = true
+			opts.IPIPMode = api.IPIPModeNever
+			opts.NATOutgoingEnabled = true
+			opts.BPFProxyHealthzPort = 10256
+			opts.IPIPMode = api.IPIPModeNever
+
+			tc, _ = infrastructure.StartNNodeTopology(2, opts, infra)
+			k8sClient = infra.(*infrastructure.K8sDatastoreInfra).K8sClient
+		})
+
+		It("should have kube-proxy health check working over both IPv4 and IPv6", func() {
+			felix := tc.Felixes[0]
+
+			felixReady := func(ip string) int {
+				return healthStatus(ip, "10256", "healthz")
+			}
+
+			Eventually(func() int { return felixReady(felix.IP) }, "10s", "330ms").Should(BeGood())
+			Eventually(func() int { return felixReady(felix.IPv6) }, "10s", "330ms").Should(BeGood())
+		})
+
+		It("should have nodeport health probe working over both IPv4 and IPv6", func() {
+			// Create a workload on node 0
+			w0 := workload.Run(
+				tc.Felixes[0],
+				"w0",
+				"default",
+				"10.65.0.2",
+				"8055",
+				"tcp",
+				workload.WithIPv6Address("dead:beef::0:2"),
+			)
+			w0.WorkloadEndpoint.Labels = map[string]string{"name": w0.Name, "app": "test"}
+			w0.ConfigureInInfra(infra)
+
+			// Create a NodePort service with ExternalTrafficPolicy=Local
+			// This will automatically get a HealthCheckNodePort allocated
+			clusterIPs := []string{"10.101.0.20", "dead:beef::abcd:0:0:20"}
+			testSvc := k8sServiceForDualStack("test-np-health", clusterIPs, w0, 80, 8055, 30080, "tcp")
+			testSvc.Spec.Type = v1.ServiceTypeLoadBalancer
+			testSvc.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal
+			healthCheckNodePort := int32(30081)
+			testSvc.Spec.HealthCheckNodePort = healthCheckNodePort
+			_, err := k8sClient.CoreV1().Services("default").Create(context.Background(), testSvc, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(checkSvcEndpoints(k8sClient, testSvc), "10s").Should(Equal(2),
+				"Service endpoints didn't get created? Is controller-manager happy?")
+
+			// Check health probe on node 0 (has local endpoint) - should return 200
+			Eventually(func() int {
+				return healthStatus(tc.Felixes[0].IP, strconv.Itoa(int(healthCheckNodePort)), "")
+			}, "10s", "330ms").Should(Equal(200))
+
+			Eventually(func() int {
+				return healthStatus(tc.Felixes[0].IPv6, strconv.Itoa(int(healthCheckNodePort)), "")
+			}, "10s", "330ms").Should(Equal(200))
+
+			// Check health probe on node 1 (no local endpoint) - should return 503
+			Eventually(func() int {
+				return healthStatus(tc.Felixes[1].IP, strconv.Itoa(int(healthCheckNodePort)), "")
+			}, "10s", "330ms").Should(Equal(503))
+
+			Eventually(func() int {
+				return healthStatus(tc.Felixes[1].IPv6, strconv.Itoa(int(healthCheckNodePort)), "")
+			}, "10s", "330ms").Should(Equal(503))
+
+			// Clean up
+			w0.Stop()
+			err = k8sClient.CoreV1().Services("default").Delete(context.Background(), "test-np-health", metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+}
+
+func describeBPFProxyHealthDisabledTests() bool {
+	if !BPFMode() {
+		return true
+	}
+	desc := "_BPF_ _BPF-SAFE_ BPF kube-proxy health check disabled when port is 0"
+	return infrastructure.DatastoreDescribe(desc, []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
+		var (
+			infra infrastructure.DatastoreInfra
+			tc    infrastructure.TopologyContainers
+		)
+
+		BeforeEach(func() {
+			iOpts := []infrastructure.CreateOption{
+				infrastructure.K8sWithDualStack(),
+				infrastructure.K8sWithAPIServerBindAddress("::"),
+				infrastructure.K8sWithServiceClusterIPRange("dead:beef::abcd:0:0:0/112,10.101.0.0/16"),
+			}
+			infra = getInfra(iOpts...)
+			opts := infrastructure.DefaultTopologyOptions()
+			opts.EnableIPv6 = true
+			opts.IPIPMode = api.IPIPModeNever
+			opts.NATOutgoingEnabled = true
+			opts.BPFProxyHealthzPort = 0
+
+			tc, _ = infrastructure.StartNNodeTopology(1, opts, infra)
+		})
+
+		It("should not listen on the kube-proxy health check port", func() {
+			felix := tc.Felixes[0]
+
+			// Felix should be running and healthy on its own health port.
+			Eventually(func() int {
+				return healthStatus(felix.IP, "9099", "readiness")
+			}, "10s", "330ms").Should(BeGood())
+
+			// Verify no socket is listening on port 10256 inside the Felix container.
+			Consistently(func() string {
+				out, err := felix.ExecOutput("ss", "-tln", "sport", "=", "10256")
+				Expect(err).NotTo(HaveOccurred())
+				return out
+			}, "5s", "500ms").ShouldNot(ContainSubstring("LISTEN"))
+		})
 	})
 }
 
@@ -502,40 +683,43 @@ func removeIPv4Address(k8sClient *kubernetes.Clientset, felix *infrastructure.Fe
 	node, err := k8sClient.CoreV1().Nodes().Get(context.Background(), felix.Hostname, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
-	delete(node.ObjectMeta.Annotations, "projectcalico.org/IPv4Address")
+	delete(node.Annotations, "projectcalico.org/IPv4Address")
 	_, err = k8sClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	node, err = k8sClient.CoreV1().Nodes().Get(context.Background(), felix.Hostname, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
-	node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felix.Container.IPv6}}
+	node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felix.IPv6}}
 	_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
-	felix.Exec("ip", "addr", "del", felix.Container.IP, "dev", "eth0")
+	felix.Exec("ip", "addr", "del", felix.IP, "dev", "eth0")
 }
 
 func removeIPv6Address(k8sClient *kubernetes.Clientset, felix *infrastructure.Felix) {
 	node, err := k8sClient.CoreV1().Nodes().Get(context.Background(), felix.Hostname, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
-	delete(node.ObjectMeta.Annotations, "projectcalico.org/IPv6Address")
+	delete(node.Annotations, "projectcalico.org/IPv6Address")
 	_, err = k8sClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	node, err = k8sClient.CoreV1().Nodes().Get(context.Background(), felix.Hostname, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
-	node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felix.Container.IP}}
+	node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: felix.IP}}
 	_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
-	felix.Exec("ip", "-6", "addr", "del", felix.Container.IPv6+"/64", "dev", "eth0")
+	felix.Exec("ip", "-6", "addr", "del", felix.IPv6+"/64", "dev", "eth0")
 }
 
-func ensureRightIFStateFlags(felix *infrastructure.Felix, ready uint32) {
+func ensureRightIFStateFlags(felix *infrastructure.Felix, ready uint32, hostIfType uint32, additionalInterfaces map[string]uint32) {
 	expectedIfacesToFlags := map[string]uint32{
-		"eth0": ready,
+		"eth0": hostIfType | ready,
 	}
+
+	maps.Copy(expectedIfacesToFlags, additionalInterfaces)
+
 	for _, w := range felix.Workloads {
 		if w.Runs() {
 			if iface := w.GetInterfaceName(); iface != "" {
@@ -556,15 +740,13 @@ func ensureRightIFStateFlags(felix *infrastructure.Felix, ready uint32) {
 				numIfaces++
 			}
 		}
-		if numIfaces != len(expectedIfacesToFlags) {
-			return false
-		}
-		return true
+		return numIfaces == len(expectedIfacesToFlags)
 	}, "1m", "1s").Should(BeTrue())
 }
 
 func k8sServiceForDualStack(name string, clusterIPs []string, w *workload.Workload, port,
-	tgtPort int, nodePort int32, protocol string) *v1.Service {
+	tgtPort int, nodePort int32, protocol string,
+) *v1.Service {
 	k8sProto := v1.ProtocolTCP
 	if protocol == "udp" {
 		k8sProto = v1.ProtocolUDP

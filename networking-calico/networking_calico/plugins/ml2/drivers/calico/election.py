@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2014, 2015 Metaswitch Networks
-# Copyright (c) 2018 Tigera, Inc. All rights reserved.
+# Copyright (c) 2014-2018 Tigera, Inc. All rights reserved.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,19 +17,25 @@
 """
 Calico election code.
 """
-from etcd3gw.exceptions import Etcd3Exception
-import eventlet
-import greenlet
 import os
 import random
 import re
 import socket
 import sys
+import time
 
-from networking_calico.common import config as calico_config
-from networking_calico.compat import cfg
-from networking_calico.compat import log
+from etcd3gw.exceptions import Etcd3Exception
+
+import eventlet
+
+import greenlet
+
+from oslo_config import cfg
+
+from oslo_log import log
+
 from networking_calico import etcdv3
+from networking_calico.common import config as calico_config
 
 
 LOG = log.getLogger(__name__)
@@ -41,8 +46,9 @@ _hostname = socket.gethostname()
 
 # Elector configuration;
 elector_opt = cfg.StrOpt(
-    'elector_name', default=_hostname,
-    help="A unique name to identify this node in leader election"
+    "elector_name",
+    default=_hostname,
+    help="A unique name to identify this node in leader election",
 )
 
 # Register Calico related configuration options
@@ -54,12 +60,14 @@ ETCD_DELETE_ACTIONS = set(["delete", "expire", "compareAndDelete"])
 
 class RestartElection(Exception):
     """Exception indicating that we should start our leader election over."""
+
     pass
 
 
 class Elector(object):
-    def __init__(self, server_id, election_key,
-                 old_key=None, interval=30, ttl=60):
+    def __init__(
+        self, server_id, election_key, is_master, old_key=None, interval=30, ttl=60
+    ):
         """Class that manages elections.
 
         :param server_id: Server ID. Must be unique to this server, and should
@@ -67,6 +75,9 @@ class Elector(object):
                           hostname)
         :param election_key: The etcd key used for the election - e.g.
                              "/calico/v2/no-region/election"
+        :param is_master: Process-shared value, used by other processes to
+                          determine whether the current neutron-server
+                          instance is the master.
         :param old_key: A legacy key that does not determine the election, but
                         that we write whenever we write the election_key - e.g.
                              "/calico/v1/election"
@@ -85,6 +96,7 @@ class Elector(object):
         self._interval = int(interval)
         self._ttl = int(ttl)
         self._stopped = False
+        self._is_master = is_master
 
         if self._interval <= 0:
             raise ValueError("Interval %r is <= 0" % interval)
@@ -93,10 +105,12 @@ class Elector(object):
             raise ValueError("TTL %r is <= interval %r" % (ttl, interval))
 
         # Is this the master? To start with, no
-        self._master = False
+        self._is_master.value = 0
+        self._greenlet = None
 
-        # Keep the greenlet ID handy to ease UT.
+    def start(self):
         self._greenlet = eventlet.spawn(self._run)
+        return self._greenlet
 
     def _run(self):
         """Main election thread run routine.
@@ -115,8 +129,7 @@ class Elector(object):
                 # In case we're repeatedly failing, sleep a little before we
                 # retry.
                 retry_time = 1 + random.random()
-                LOG.info("Retrying leader election in %.1f seconds",
-                         retry_time)
+                LOG.info("Retrying leader election in %.1f seconds", retry_time)
                 eventlet.sleep(retry_time)
         except ElectorStopped:
             LOG.info("Elector told to stop.")
@@ -152,8 +165,12 @@ class Elector(object):
 
         LOG.debug("ID of elected master is : %s", value)
         if value:
-            # If we happen to be on the same server, check if the master
-            # process is still alive.
+            # If the previous master was on this host, check whether its process is
+            # still alive.  This recovers from the case where the previous master
+            # was killed without running its step-down cleanup (e.g. SIGKILL, or
+            # the worker greenlet dying without unwinding) so the stale election
+            # key would otherwise have to wait out the lease TTL before any node
+            # could win.
             self._check_master_process(value)
 
         while not self._stopped:
@@ -176,13 +193,15 @@ class Elector(object):
             # and back into _vote again, rereading the current revision and so
             # ensuring that the next watch will be good.
             try:
-                event = etcdv3.watch_once(self._key,
-                                          timeout=self._interval * 2,
-                                          start_revision=mod_revision + 1)
+                event = etcdv3.watch_once(
+                    self._key,
+                    timeout=self._interval * 2,
+                    start_revision=mod_revision + 1,
+                )
                 LOG.debug("election event: %s", event)
-                action = event.get('type', 'SET').lower()
-                value = event['kv'].get('value')
-                mod_revision = int(event['kv'].get('mod_revision', '0'))
+                action = event.get("type", "SET").lower()
+                value = event["kv"].get("value")
+                mod_revision = int(event["kv"].get("mod_revision", "0"))
             except etcdv3.KeyNotFound:
                 # It should be impossible for somebody to delete the object
                 # without us getting the delete action, but safer to handle it.
@@ -193,22 +212,23 @@ class Elector(object):
                 self._log_exception("wait for master change", e)
                 return
             LOG.debug("Election key action: %s; new value %s", action, value)
-            if (action in ETCD_DELETE_ACTIONS or value is None):
+            if action in ETCD_DELETE_ACTIONS or value is None:
                 # Deleted - try and become the master.
-                LOG.info("Leader etcd key went away, attempting to become "
-                         "the elected master")
+                LOG.info(
+                    "Leader etcd key went away, attempting to become the elected master"
+                )
                 self._become_master()
 
     def _check_master_process(self, master_id):
-        """_check_master_process
+        """If the previous master was on this host, check whether the process is
+        still alive; if not, delete the stale election key (with CAS against the
+        observed value) and restart the election.
 
-        If the master happens to be on our host, checks if its process is
-        still alive.  If it is not, cleans up the now-stale election key.
-
-        :param master_id: Value loaded from the election key.
+        :param master_id: Value read from the election key.
         """
-        # Defensive. In case we ever change the master ID format, only parse
-        # it if it looks like what we expect.
+        # Defensive: only parse the key if it looks like what _become_master
+        # writes.  An unparseable value means someone else's election scheme is
+        # writing here, or the format has changed -- leave it alone.
         match = re.match(r"^(?P<host>[^:]+):(?P<pid>\d+)$", master_id)
         if not match:
             LOG.warning("Unable to parse master ID: %r.", master_id)
@@ -216,23 +236,26 @@ class Elector(object):
         host = match.group("host")
         pid = int(match.group("pid"))
         LOG.debug("Parsed key as host = %s, PID = %s", host, pid)
-        if host == self._server_id:
-            # Check if the PID is still running.
-            LOG.debug("Previous master was on this server %s", host)
-            if os.path.exists("/proc/%s" % pid):
-                LOG.debug("Master still running")
-            else:
-                LOG.warning("Master was on this server but cannot find its "
-                            "PID in /proc.  Removing stale election key.")
-                try:
-                    deleted = etcdv3.delete(self._key,
-                                            existing_value=master_id)
-                except Etcd3Exception as e:
-                    self._log_exception("remove stale key from dead master", e)
-                    deleted = False
-
-                if not deleted:
-                    raise RestartElection()
+        if host != self._server_id:
+            return
+        LOG.debug("Previous master was on this server %s", host)
+        if os.path.exists("/proc/%s" % pid):
+            LOG.debug("Master still running")
+            return
+        LOG.warning(
+            "Master was on this server but cannot find its PID in /proc.  "
+            "Removing stale election key."
+        )
+        try:
+            deleted = etcdv3.delete(self._key, existing_value=master_id)
+        except Etcd3Exception as e:
+            self._log_exception("remove stale key from dead master", e)
+            deleted = False
+        if not deleted:
+            # Either the CAS-delete found a value that no longer matches (so
+            # somebody else has already moved the election on), or the etcd
+            # call failed.  Either way, restart the election to re-read state.
+            raise RestartElection()
 
     def _become_master(self):
         """_become_master
@@ -245,26 +268,28 @@ class Elector(object):
                 master.
                 Any other error from etcd is not caught in this routine.
         """
+        ok = False
 
         try:
             ttl_lease = etcdv3.get_lease(self._ttl)
-            self._master = etcdv3.put(self._key,
-                                      self.id_string,
-                                      lease=ttl_lease,
-                                      mod_revision='0')
+            ok = etcdv3.put(
+                self._key, self.id_string, lease=ttl_lease, mod_revision="0"
+            )
         except Exception as e:
             # We could be smarter about what exceptions we allow, but any kind
             # of error means we should give up, and safer to have a broad
             # except here. Log and reconnect.
             self._log_exception("become master", e)
-            self._master = False
+            self._is_master.value = 0
 
-        if not self._master:
+        if not ok:
             LOG.info("Race: someone else beat us to be master")
             raise RestartElection()
 
-        LOG.info("Successfully become master - key %s, value %s",
-                 self._key, self.id_string)
+        self._is_master.value = time.time()
+        LOG.info(
+            "Successfully become master - key %s, value %s", self._key, self.id_string
+        )
 
         # If there's a legacy election key, try to write that now too.
         self._write_old_key(ttl_lease)
@@ -277,12 +302,18 @@ class Elector(object):
                     ttl = ttl_lease.refresh()
                     # Also rewrite the key, so that non-masters see an event on
                     # the key.
-                    if not etcdv3.put(self._key,
-                                      self.id_string,
-                                      lease=ttl_lease,
-                                      existing_value=self.id_string):
+                    if not etcdv3.put(
+                        self._key,
+                        self.id_string,
+                        lease=ttl_lease,
+                        existing_value=self.id_string,
+                    ):
                         LOG.warning("Key changed or deleted; restart election")
                         raise RestartElection()
+
+                    # Successfully refreshed the role - let's update the
+                    # timestamp.
+                    self._is_master.value = time.time()
                     LOG.debug("Refreshed master role, TTL now is %d", ttl)
                 except RestartElection:
                     raise
@@ -299,7 +330,7 @@ class Elector(object):
                 eventlet.sleep(self._interval)
         finally:
             LOG.info("Exiting master refresh loop, no longer the master")
-            self._master = False
+            self._is_master.value = 0
         raise RestartElection()
 
     def _write_old_key(self, lease):
@@ -320,32 +351,29 @@ class Elector(object):
         if isinstance(exc, Etcd3Exception):
             # Expected errors (with good messages): timeouts and connection
             # failures.  Don't log stack traces to avoid cluttering the log.
-            LOG.warning("Failed to %s - key %s: %r:\n%s", failed_to,
-                        self._key, exc, exc.detail_text)
+            LOG.warning(
+                "Failed to %s - key %s: %r:\n%s",
+                failed_to,
+                self._key,
+                exc,
+                exc.detail_text,
+            )
         else:
             # Genuinely unexpected errors.
-            LOG.exception("Failed to %s - key %s: %r", failed_to,
-                          self._key, exc)
+            LOG.exception("Failed to %s - key %s: %r", failed_to, self._key, exc)
 
     @property
     def id_string(self):
         return "%s:%d" % (self._server_id, os.getpid())
 
     def _attempt_step_down(self):
-        self._master = False
+        self._is_master.value = 0
         try:
             etcdv3.delete(self._key, existing_value=self.id_string)
         except Exception:
             # Broad except because we're already on an error path.  The key
             # will expire anyway.
             LOG.exception("Failed to step down as master.  Ignoring.")
-
-    def master(self):
-        """Am I the master?
-
-        returns: True if this is the master.
-        """
-        return self._master and not self._stopped
 
     def stop(self):
         self._stopped = True
@@ -368,4 +396,5 @@ class ElectorStopped(greenlet.GreenletExit):
     Custom exception used to stop our Elector.  Used to distinguish our
     kill() call from any other potential GreenletExit exception.
     """
+
     pass

@@ -19,13 +19,11 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/projectcalico/calico/felix/dataplane/windows/hcn"
-
 	log "github.com/sirupsen/logrus"
 
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/dataplane/windows/hcn"
 	"github.com/projectcalico/calico/felix/dataplane/windows/hns"
-
-	"github.com/projectcalico/calico/felix/dataplane/common"
 	"github.com/projectcalico/calico/felix/dataplane/windows/ipsets"
 	"github.com/projectcalico/calico/felix/dataplane/windows/policysets"
 	"github.com/projectcalico/calico/felix/jitter"
@@ -45,9 +43,7 @@ const (
 	reschedDelay = time.Duration(5) * time.Second
 )
 
-var (
-	processStartTime time.Time
-)
+var processStartTime time.Time
 
 func init() {
 	processStartTime = time.Now()
@@ -96,9 +92,9 @@ type Config struct {
 // event before it sends a rule that references that IP set.
 type WindowsDataplane struct {
 	// the channel which we receive messages from felix
-	toDataplane chan interface{}
+	toDataplane chan any
 	// the channel used to send messages from the dataplane to felix
-	fromDataplane chan interface{}
+	fromDataplane chan any
 	// ifaceAddrUpdates is a channel used to signal when the host's IPs change.
 	ifaceAddrUpdates chan []string
 	// stores all of the managers which will be processing  the various updates from felix.
@@ -142,7 +138,7 @@ type Manager interface {
 	// send updates to the IPSets and PolicySets objects (which will queue the updates
 	// until the main loop instructs them to act) or (for efficiency) may wait until
 	// a call to CompleteDeferredWork() to flush updates to the dataplane.
-	OnUpdate(protoBufMsg interface{})
+	OnUpdate(protoBufMsg any)
 	// Called to allow for any batched work to be completed.
 	CompleteDeferredWork() error
 }
@@ -165,8 +161,8 @@ func NewWinDataplaneDriver(hns hns.API, config Config) *WindowsDataplane {
 	config.MaxIPSetSize = math.MaxInt64
 
 	dp := &WindowsDataplane{
-		toDataplane:      make(chan interface{}, msgPeekLimit),
-		fromDataplane:    make(chan interface{}, 100),
+		toDataplane:      make(chan any, msgPeekLimit),
+		fromDataplane:    make(chan any, 100),
 		ifaceAddrUpdates: make(chan []string, 1),
 		config:           config,
 		applyThrottle:    throttle.New(10),
@@ -182,7 +178,7 @@ func NewWinDataplaneDriver(hns hns.API, config Config) *WindowsDataplane {
 	}
 	dp.policySets = policysets.NewPolicySets(hns, ipsc, policysets.FileReader(policysets.StaticFileName))
 
-	dp.RegisterManager(common.NewIPSetsManager("ipv4", ipSetsV4, config.MaxIPSetSize))
+	dp.RegisterManager(dpsets.NewIPSetsManager("ipv4", ipSetsV4, config.MaxIPSetSize))
 	dp.RegisterManager(newPolicyManager(dp.policySets))
 	dp.endpointMgr = newEndpointManager(hns, dp.policySets)
 	dp.RegisterManager(dp.endpointMgr)
@@ -221,7 +217,7 @@ func (d *WindowsDataplane) Start() {
 
 // Called by someone to put a message into our channel so that the loop will pick it up
 // and process it.
-func (d *WindowsDataplane) SendMessage(msg interface{}) error {
+func (d *WindowsDataplane) SendMessage(msg any) error {
 	log.Debugf("WindowsDataPlane->SendMessage to felix: %T", msg)
 
 	d.toDataplane <- msg
@@ -230,7 +226,7 @@ func (d *WindowsDataplane) SendMessage(msg interface{}) error {
 
 // Called by Felix.go so that it can receive a channel to listen for message being
 // sent by this dataplane driver.
-func (d *WindowsDataplane) RecvMessage() (interface{}, error) {
+func (d *WindowsDataplane) RecvMessage() (any, error) {
 	log.Debug("WindowsDataPlane->RecvMessage was invoked")
 
 	return <-d.fromDataplane, nil
@@ -252,7 +248,7 @@ func (d *WindowsDataplane) loopUpdatingDataplane() {
 	datastoreInSync := false
 
 	// function to pass messages to the managers for processing
-	processMsgFromCalcGraph := func(msg interface{}) {
+	processMsgFromCalcGraph := func(msg any) {
 		log.WithField("msg", proto.MsgStringer{Msg: msg}).Infof(
 			"Received %T update from calculation graph", msg)
 		for _, mgr := range d.allManagers {
@@ -274,7 +270,7 @@ func (d *WindowsDataplane) loopUpdatingDataplane() {
 			batchSize := 1
 			processMsgFromCalcGraph(msg)
 		msgLoop1:
-			for i := 0; i < msgPeekLimit; i++ {
+			for range msgPeekLimit {
 				select {
 				case msg := <-d.toDataplane:
 					processMsgFromCalcGraph(msg)

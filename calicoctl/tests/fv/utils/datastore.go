@@ -15,8 +15,10 @@
 package utils
 
 import (
+	"os"
 	"testing"
 
+	//nolint:staticcheck // Ignore ST1001: should not use dot imports
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
@@ -33,9 +35,7 @@ func RunDatastoreTest(t *testing.T, testFn func(t *testing.T, kdd bool, client c
 		client, err := clientv3.New(*config)
 		Expect(err).NotTo(HaveOccurred())
 		defer func() {
-			err := client.(interface {
-				Backend() bapi.Client
-			}).Backend().Clean()
+			err := client.(bapi.BackendAccessor).Backend().Clean()
 			Expect(err).NotTo(HaveOccurred())
 		}()
 		testFn(t, false, client)
@@ -52,13 +52,11 @@ func RunDatastoreTest(t *testing.T, testFn func(t *testing.T, kdd bool, client c
 		config := apiconfig.NewCalicoAPIConfig()
 		config.Spec.DatastoreType = apiconfig.Kubernetes
 		config.Spec.Kubeconfig = "/go/src/github.com/projectcalico/calico/calicoctl/test-data/kubeconfig.yaml"
-		config.Spec.K8sInsecureSkipTLSVerify = true
+		config.Spec.CalicoAPIGroup = os.Getenv("CALICO_API_GROUP")
 		client, err := clientv3.New(*config)
 		Expect(err).NotTo(HaveOccurred())
 		defer func() {
-			err := client.(interface {
-				Backend() bapi.Client
-			}).Backend().Clean()
+			err := client.(bapi.BackendAccessor).Backend().Clean()
 			Expect(err).NotTo(HaveOccurred())
 		}()
 		testFn(t, true, client)

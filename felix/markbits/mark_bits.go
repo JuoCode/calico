@@ -33,7 +33,7 @@ type MarkBitsManager struct {
 
 func NewMarkBitsManager(markMask uint32, markName string) *MarkBitsManager {
 	numBitsFound := 0
-	for shift := uint(0); shift < 32; shift++ {
+	for shift := range uint(32) {
 		bit := uint32(1) << shift
 		if markMask&bit > 0 {
 			numBitsFound += 1
@@ -78,7 +78,7 @@ func (mc *MarkBitsManager) AvailableMarkBitCount() int {
 // It is up to the caller to check the result.
 func (mc *MarkBitsManager) NextBlockBitsMark(size int) (uint32, int) {
 	mark := uint32(0)
-	for allocated := 0; allocated < size; allocated++ {
+	for allocated := range size {
 		if bit, err := mc.NextSingleBitMark(); err != nil {
 			log.WithFields(log.Fields{
 				"Name":                   mc.name,
@@ -99,7 +99,7 @@ func (mc *MarkBitsManager) NextBlockBitsMark(size int) (uint32, int) {
 // Return Nth mark bit without allocation.
 func (mc *MarkBitsManager) nthMark(n int) (uint32, error) {
 	numBitsFound := 0
-	for shift := uint(0); shift < 32; shift++ {
+	for shift := range uint(32) {
 		candidate := uint32(1) << shift
 		if mc.mask&candidate > 0 {
 			if numBitsFound == n {
@@ -109,7 +109,7 @@ func (mc *MarkBitsManager) nthMark(n int) (uint32, error) {
 		}
 	}
 
-	return 0, errors.New("No mark bit found")
+	return 0, errors.New("no mark bit found")
 }
 
 // Return how many free position number left.
@@ -143,7 +143,7 @@ func (mc *MarkBitsManager) MapNumberToMark(n int) (uint32, error) {
 			"MarkMask":           mc.mask,
 			"requestedMapNumber": n,
 		}).Warn("Not enough mark bits available.")
-		return 0, errors.New("Not enough mark bits available")
+		return 0, errors.New("not enough mark bits available")
 	}
 
 	return mark, nil
@@ -153,12 +153,12 @@ func (mc *MarkBitsManager) MapNumberToMark(n int) (uint32, error) {
 func (mc *MarkBitsManager) MapMarkToNumber(mark uint32) (int, error) {
 	if mark&mc.mask != mark {
 		// mark bit not compatible.
-		return 0, errors.New("Mark bit not compatible")
+		return 0, errors.New("mark bit not compatible")
 	}
 
 	number := 0
 	numBitsFound := uint32(0)
-	for shift := uint(0); shift < 32; shift++ {
+	for shift := range uint(32) {
 		bit := uint32(1) << shift
 		if mc.mask&bit > 0 {
 			if bit&mark > 0 {

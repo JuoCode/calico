@@ -17,6 +17,7 @@ package health
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"sort"
@@ -25,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olekukonko/tablewriter"
+	"github.com/jedib0t/go-pretty/v6/table"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -36,9 +37,7 @@ var (
 
 func SetGlobalTimeoutOverrides(overrides map[string]time.Duration) {
 	overridesCopy := map[string]time.Duration{}
-	for k, v := range overrides {
-		overridesCopy[k] = v
-	}
+	maps.Copy(overridesCopy, overrides)
 	globalOverridesLock.Lock()
 	defer globalOverridesLock.Unlock()
 	globalTimeoutOverrides = overrides
@@ -196,14 +195,12 @@ func (aggregator *HealthAggregator) Report(name string, report *HealthReport) {
 	reporter := aggregator.reporters[name]
 
 	reports := aggregator.reporters[name].reports
-	logCxt := log.WithFields(log.Fields{
-		"name":      name,
-		"newReport": formatReport(&reports, report),
-		"oldReport": formatReport(&reports, &reporter.latest),
-	})
-
 	if reporter.latest != *report {
-		logCxt.Info("Health of component changed")
+		log.WithFields(log.Fields{
+			"name":      name,
+			"newReport": formatReport(&reports, report),
+			"oldReport": formatReport(&reports, &reporter.latest),
+		}).Info("Health of component changed")
 		reporter.latest = *report
 	}
 	reporter.timestamp = time.Now()
@@ -273,9 +270,10 @@ func (aggregator *HealthAggregator) Summary() *HealthReport {
 
 	// Prepare a table to report detail.
 	var buf bytes.Buffer
-	table := tablewriter.NewWriter(&buf)
-	table.SetHeader([]string{"COMPONENT", "TIMEOUT", "LIVENESS", "READINESS", "DETAIL"})
-	componentData := map[string][]string{}
+	t := table.NewWriter()
+	t.SetOutputMirror(&buf)
+	t.AppendHeader(table.Row{"COMPONENT", "TIMEOUT", "LIVENESS", "READINESS", "DETAIL"})
+	componentData := map[string]table.Row{}
 	componentNames := []string(nil)
 
 	// Now for each reporter...
@@ -311,7 +309,7 @@ func (aggregator *HealthAggregator) Summary() *HealthReport {
 		}
 		timeoutStr += suffix
 
-		componentData[reporter.name] = []string{
+		componentData[reporter.name] = table.Row{
 			reporter.name,
 			timeoutStr,
 			livenessStr,
@@ -323,9 +321,9 @@ func (aggregator *HealthAggregator) Summary() *HealthReport {
 	// Render the component data ordered by name.
 	sort.Strings(componentNames)
 	for _, name := range componentNames {
-		table.Append(componentData[name])
+		t.AppendRow(componentData[name])
 	}
-	table.Render()
+	t.Render()
 
 	summary.Detail = strings.TrimSpace(buf.String())
 	log.Debugf("Calculated health summary: live=%v ready=%v\n%s", summary.Live, summary.Ready, summary.Detail)

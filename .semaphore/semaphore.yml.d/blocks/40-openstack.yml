@@ -1,36 +1,55 @@
-- name: "OpenStack integration (Yoga)"
+- name: "OpenStack integration (Caracal)"
   run:
-    when: "${FORCE_RUN} or change_in(['/networking-calico/'])"
+    when: "${FORCE_RUN} or change_in(['/metadata.mk', '/lib.Makefile', '/networking-calico/', '/.semaphore/semaphore.yml.d/blocks/40-openstack.yml'], {pipeline_file: 'ignore'})"
   dependencies:
     - Prerequisites
   task:
     agent:
       machine:
-        type: e1-standard-4
-        os_image: ubuntu2004
+        type: f1-standard-2
+        os_image: ubuntu2204
+    secrets:
+      - name: banzai-secrets
     prologue:
       commands:
         - cd networking-calico
     jobs:
-      - name: "Unit and FV tests (tox) on Yoga"
+      - name: "OpenStack: Unit and FV tests (tox) on Caracal"
         commands:
-          - ../.semaphore/run-and-monitor tox.log make tox-yoga
-      - name: "Mainline ST (DevStack + Tempest) on Yoga"
+          # Run sequentially via `bash -c '... && ...'` rather than as
+          # multiple targets on a single make invocation: a make invoked
+          # with MAKEFLAGS=-j would otherwise schedule the two targets in
+          # parallel and have two concurrent tox runs contend over the
+          # shared .tox/ working tree.
+          - ../.semaphore/run-and-monitor tox.log bash -c 'make tox-caracal && make tox-fv-caracal'
+      - name: "OpenStack: Mainline ST (DevStack + Tempest) on Caracal"
         commands:
+          # Env vars needed for saving performance results.  Take the user name
+          # from the secret alongside the token, rather than hardcoding it, so
+          # that rotating the Lens credential to a different account does not
+          # silently break publishing.
+          - export ELASTICSEARCH_URL=https://banzai-lens-es.dev-tools.tigera.net:9200
+          - export ELASTICSEARCH_USER=${LENS_ELASTICSEARCH_USER}
+          - export ELASTICSEARCH_TOKEN=${LENS_ELASTICSEARCH_TOKEN}
           # For some reason python3-wrapt is pre-installed on a Semaphore ubuntu2004 node, but with
           # a version (1.11.2) that is different from the version that OpenStack needs (1.13.3), and
           # this was causing the DevStack setup to fail, because pip doesn't know how to uninstall
           # or replace the existing version.  Happily we do know that, so let's do it upfront here.
           - sudo apt-get remove -y python3-wrapt || true
+          # Set NC_PLUGIN_REPO and NC_PLUGIN_REF so that DevStack will use the networking-calico
+          # code from the current PR or branch.  The following checkout is to make sure of having a
+          # local ref that we can specify.
           - git checkout -b devstack-test
-          - export LIBVIRT_TYPE=qemu
-          - export UPPER_CONSTRAINTS_FILE=https://releases.openstack.org/constraints/upper/yoga
           - export NC_PLUGIN_REPO=$(dirname $(pwd))
           - export NC_PLUGIN_REF=$(git rev-parse --abbrev-ref HEAD)
-          - TEMPEST=true DEVSTACK_BRANCH=unmaintained/yoga ./devstack/bootstrap.sh
+          - sudo git config --system --add safe.directory ${NC_PLUGIN_REPO}/.git
+          # The BIRD config in our DevStack setup is thoroughly broken and generates loads of errors
+          # in the log.  But we don't need it for a single node setup anyway, so let's disable it.
+          - export CALICO_BGP_MODE=none
+          - TEMPEST=true OPENSTACK_RELEASE=caracal ./devstack/bootstrap.sh
     epilogue:
-      on_fail:
+      always:
         commands:
           - mkdir logs
           - sudo journalctl > logs/journalctl.txt
-          - artifact push job --expire-in 1d logs
+          - artifact push job logs

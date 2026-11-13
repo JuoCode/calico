@@ -2,34 +2,33 @@
 
 This document describes how to set up a development environment for Calico, as well as how to build and test development code.
 
-This guide is broken into the following main sections:
-
-- [Building Calico from scratch](#building-calico-from-scratch)
-- [Deploying your code on Kubernetes](#deploying-your-code-on-kubernetes)
-- [Running automated tests](#running-automated-tests)
-
 Additional developer docs can be found in [hack/docs](hack/docs).
 
 ## Prerequisites:
 
-These build instructions assume you have a Linux build environment
-with:
+These build instructions assume you have a Linux build environment with:
 
 -  Docker
 -  git
 -  make
 
-## Building Calico 
+## Building Calico
 
 ### Building all of Calico
 
 To build all of Calico, run the following command from the root of the repository.
 
 ```
-make image DEV_REGISTRY=my-registry
+make image
 ```
 
-This will produce several container images, each tagged with the registry provided.
+This will produce several container images and may take some time, so you likely want to build the specific image / images that you are working on instead.
+
+The build uses the go package cache and local vendor caching to increase build speed. To perform a clean build, use the `clean` target.
+
+```
+make clean image
+```
 
 ### Build a specific image
 
@@ -50,17 +49,23 @@ build for arm64, run the following:
 make image ARCH=arm64
 ```
 
-- Now, build the YAML manifests that are used to install calico:
+### Building with an alternative base image
+
+Many Calico components (e.g. Typha) depend on `calico/base` as a base image.
+It is possible to override this image via its Makefile variable:
 
 ```
-make dev-manifests
+make image CALICO_BASE=some/image
 ```
 
-The build uses the go package cache and local vendor caching to increase build speed. To perform a clean build, use the `dev-clean` target.
 
-```
-make dev-clean dev-image
-```
+The chosen base image must be suitably similar to the default (which is based on Red Hat UBI at the time of writing) for the build to succeed. Note that by building your own images, you will miss out on the regression testing done by the Calico team for the images that we ship, and support from the Calico team will be on a best-effort basis.
+
+
+### Updating Calico helm chart and manifests
+
+The Calico helm charts can be found in the `charts/` directory. After making changes to the templates in the chart,
+make sure to run `make gen-manifests` to update the `manifests/` directory, which is largely auto-generated based on the helm chart.
 
 ### Makefile target reference
 

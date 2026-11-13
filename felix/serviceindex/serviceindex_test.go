@@ -15,16 +15,14 @@
 package serviceindex_test
 
 import (
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
 	. "github.com/projectcalico/calico/felix/serviceindex"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -35,7 +33,7 @@ var _ = Describe("ServiceIndex", func() {
 
 	BeforeEach(func() {
 		idx = NewServiceIndex()
-		recorder = &testRecorder{ipsets: make(map[string]map[labelindex.IPSetMember]bool)}
+		recorder = &testRecorder{ipsets: make(map[string]map[ipsetmember.IPSetMember]bool)}
 		idx.OnMemberAdded = recorder.OnMemberAdded
 		idx.OnMemberRemoved = recorder.OnMemberRemoved
 	})
@@ -70,7 +68,7 @@ var _ = Describe("ServiceIndex", func() {
 		})
 
 		// Not yet active, so ipset membership should be empty.
-		Expect(recorder.ipsets).To(Equal(map[string]map[labelindex.IPSetMember]bool{}))
+		Expect(recorder.ipsets).To(Equal(map[string]map[ipsetmember.IPSetMember]bool{}))
 
 		// Make it active.
 		idx.UpdateIPSet("identifier", "default/svc1")
@@ -208,7 +206,7 @@ var _ = Describe("ServiceIndex", func() {
 		})
 
 		// Not yet active, so ipset membership should be empty.
-		Expect(recorder.ipsets).To(Equal(map[string]map[labelindex.IPSetMember]bool{}))
+		Expect(recorder.ipsets).To(Equal(map[string]map[ipsetmember.IPSetMember]bool{}))
 
 		// Make it active. We should have 6 IP set members - one for each address / port combination.
 		idx.UpdateIPSet("identifier", "default/svc1")
@@ -405,19 +403,19 @@ var _ = Describe("ServiceIndex", func() {
 })
 
 type testRecorder struct {
-	ipsets map[string]map[labelindex.IPSetMember]bool
+	ipsets map[string]map[ipsetmember.IPSetMember]bool
 }
 
-func (t *testRecorder) OnMemberAdded(ipSetID string, member labelindex.IPSetMember) {
+func (t *testRecorder) OnMemberAdded(ipSetID string, member ipsetmember.IPSetMember) {
 	s := t.ipsets[ipSetID]
 	if s == nil {
-		s = make(map[labelindex.IPSetMember]bool)
+		s = make(map[ipsetmember.IPSetMember]bool)
 		t.ipsets[ipSetID] = s
 	}
 	s[member] = true
 }
 
-func (t *testRecorder) OnMemberRemoved(ipSetID string, member labelindex.IPSetMember) {
+func (t *testRecorder) OnMemberRemoved(ipSetID string, member ipsetmember.IPSetMember) {
 	s := t.ipsets[ipSetID]
 	delete(s, member)
 	if len(s) == 0 {

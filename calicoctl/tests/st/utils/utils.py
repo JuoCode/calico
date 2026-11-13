@@ -21,8 +21,6 @@ from datetime import datetime
 from subprocess import CalledProcessError
 from subprocess import check_output, STDOUT
 
-import termios
-
 import json
 import logging
 from pprint import pformat
@@ -48,13 +46,14 @@ NOT_NAMESPACED = "is not namespaced"
 SET_DEFAULT = "Cannot set"
 NOT_SUPPORTED = "is not supported on"
 KUBERNETES_NP = "kubernetes network policies must be managed through the kubernetes API"
-NOT_LOCKED = "Datastore is not locked. Run the `calicoctl datastore migrate lock` command in order to begin migration."
-NOT_KUBERNETES = "Invalid datastore type: etcdv3 to import to for datastore migration. Datastore type must be kubernetes"
-NO_IPAM = "No IPAM resources specified in file"
-NOT_LOCKED_SPLIT = "Datastore is not locked. Run the `calicoctl datastore migrate lock` command in order split the IP pools."
-POOL_NOT_EXIST_CIDR = "Unable to find IP pool"
-INVALID_SPLIT_NUM = "Number to split CIDR into is not a valid power of 2"
+NOT_LOCKED = "datastore is not locked. Run the `calicoctl datastore migrate lock` command in order to begin migration"
+NOT_KUBERNETES = "invalid datastore type: etcdv3 to import to for datastore migration. Datastore type must be kubernetes"
+NO_IPAM = "no IPAM resources specified in file"
+NOT_LOCKED_SPLIT = "datastore is not locked. Run the `calicoctl datastore migrate lock` command in order split the IP pools"
+POOL_NOT_EXIST_CIDR = "unable to find IP pool"
+INVALID_SPLIT_NUM = "number to split CIDR into is not a valid power of 2"
 POOL_TOO_SMALL = "is not large enough to be split into"
+
 
 class CalicoctlOutput:
     """
@@ -64,6 +63,7 @@ class CalicoctlOutput:
     This class contains the command, output and error code (if it failed)
     along with YAML/JSON decoded output if the output could be decoded.
     """
+
     def __init__(self, command, output, error=None):
         self.command = command
         self.output = output
@@ -89,12 +89,14 @@ class CalicoctlOutput:
 
         if format is not None:
             assert format == self.decoded_format, "Decoded format is different. " \
-                "expect %s; got %s" % (format, self.decoded_format)
+                                                  "expect %s; got %s" % (format, self.decoded_format)
 
         # Copy and clean the decoded data to allow it to be comparable.
         cleaned = clean_calico_data(self.decoded)
+        drop_unasserted_status(cleaned, data)
 
-        assert cmp(cleaned, data) == 0, \
+        print(self.decoded)
+        assert cleaned == data, \
             "Items are not the same.  Difference is:\n %s" % \
             pformat(DeepDiff(cleaned, data), indent=2)
 
@@ -135,10 +137,13 @@ class CalicoctlOutput:
         """
         Assert the calicoctl command exited with an error and did not panic
         Args:
-            text:   (optional) Expected text in the command output.
+            text:   (optional) Expected text in the comma, another_resource)
+        rc.assert_no_error()
+
+        rc = calicoctl("get %s -nd output.
         """
         assert self.error, "Expected error running command; \n" \
-            "command=" + self.command + "\noutput=" + self.output
+                           "command=" + self.command + "\noutput=" + self.output
         assert not "panic" in self.output, "Exited with an error due to a panic"
         self.assert_output_contains(text)
 
@@ -149,7 +154,7 @@ class CalicoctlOutput:
             text:   (optional) Expected text in the command output.
         """
         assert not self.error, "Expected no error running command; \n" \
-            "command=" + self.command + "\noutput=" + self.output
+                               "command=" + self.command + "\noutput=" + self.output
 
         # If text is supplied, assert it appears in the output
         if text:
@@ -192,8 +197,8 @@ class CalicoctlOutput:
         if not text:
             return
         assert text in self.output, "Expected text in output; \n" + \
-            "command=" + self.command + "\noutput=\n" + self.output + \
-            "\nexpected=\n" + text
+                                    "command=" + self.command + "\noutput=\n" + self.output + \
+                                    "\nexpected=\n" + text
 
     def assert_output_not_contains(self, text):
         """
@@ -204,8 +209,8 @@ class CalicoctlOutput:
         if not text:
             return
         assert not text in self.output, "Unexpected text in output; \n" + \
-            "command=" + self.command + "\noutput=\n" + self.output + \
-            "\nunexpected=\n" + text
+                                        "command=" + self.command + "\noutput=\n" + self.output + \
+                                        "\nunexpected=\n" + text
 
 
 def calicoctl(command, data=None, load_as_stdin=False, format="yaml", only_stdout=False, no_config=False, kdd=False, allowVersionMismatch=True):
@@ -257,25 +262,25 @@ def calicoctl(command, data=None, load_as_stdin=False, format="yaml", only_stdou
     #
     # Pass in all etcd params, the values will be empty if not set anyway
     calicoctl_env_cmd = "export ETCD_ENDPOINTS=%s; " \
-                "export ETCD_CA_CERT_FILE=%s; " \
-                "export ETCD_CERT_FILE=%s; " \
-                "export ETCD_KEY_FILE=%s; " \
-                "export DATASTORE_TYPE=%s; %s %s" % \
-                (ETCD_SCHEME+"://"+etcd_auth, ETCD_CA, ETCD_CERT, ETCD_KEY,
-                 "etcdv3", stdin, calicoctl_bin)
+                        "export ETCD_CA_CERT_FILE=%s; " \
+                        "export ETCD_CERT_FILE=%s; " \
+                        "export ETCD_KEY_FILE=%s; " \
+                        "export DATASTORE_TYPE=%s; %s %s" % \
+                        (ETCD_SCHEME + "://" + etcd_auth, ETCD_CA, ETCD_CERT, ETCD_KEY,
+                         "etcdv3", stdin, calicoctl_bin)
     if kdd:
         calicoctl_env_cmd = "export DATASTORE_TYPE=kubernetes; " \
-                "export KUBECONFIG=%s; %s %s" % \
-                (KUBECONFIG, stdin, calicoctl_bin)
-    if no_config :
-        calicoctl_env_cmd = calicoctl_bin
+                            "export KUBECONFIG=%s; %s %s" % \
+                            (KUBECONFIG, stdin, calicoctl_bin)
+    if no_config:
+        calicoctl_env_cmd = stdin + calicoctl_bin
     full_cmd = calicoctl_env_cmd + " " + command + option_file
 
     try:
         output = log_and_run(full_cmd, stderr=(None if only_stdout else STDOUT))
         return CalicoctlOutput(full_cmd, output)
     except CalledProcessError as e:
-        return CalicoctlOutput(full_cmd, e.output, error=e.returncode)
+        return CalicoctlOutput(full_cmd, e.output.decode(), error=e.returncode)
 
 
 def clean_calico_data(data, extra_keys_to_remove=None):
@@ -308,14 +313,64 @@ def clean_calico_data(data, extra_keys_to_remove=None):
             if extra_keys is not None:
                 for extra_key in extra_keys:
                     del_keys.append(extra_key)
-            for k, v in elem.iteritems():
+            for k, v in elem.items():
                 clean_elem(v, extra_keys)
                 if v is None or v == {}:
                     del_keys.append(k)
             for k in del_keys:
                 if k in elem:
-                    del(elem[k])
+                    del (elem[k])
+
     clean_elem(new, extra_keys_to_remove)
+    return new
+
+
+def drop_unasserted_status(actual, expected):
+    """
+    Remove server-populated status from actual wherever expected doesn't assert
+    one, so a test comparing against the document it submitted doesn't have to
+    spell out status it never set.
+
+    Args:
+        actual: The cleaned data returned by calicoctl. Modified in place.
+        expected: The data the test is comparing against.
+    """
+    if isinstance(expected, list) and isinstance(actual, list):
+        for a, e in zip(actual, expected):
+            drop_unasserted_status(a, e)
+        return
+
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return
+
+    if 'status' in actual and 'status' not in expected:
+        del (actual['status'])
+    if 'items' in actual and 'items' in expected:
+        drop_unasserted_status(actual['items'], expected['items'])
+
+
+def add_tier_label(data):
+    """
+    Convenience method for auto-adding the `projectcalico.org/tier`.
+    """
+    new = copy.deepcopy(data)
+
+    def add_label(elem):
+        if isinstance(elem, list):
+            for i in elem:
+                add_label(i)
+        if isinstance(elem, dict):
+            if elem['kind'] not in ['NetworkPolicy', 'GlobalNetworkPolicy', 'StagedNetworkPolicy',
+                                    'StagedGlobalNetworkPolicy']:
+                return
+            tier = 'default'
+            if 'tier' in elem['spec']:
+                tier = elem['spec']['tier']
+            if 'labels' not in elem['metadata']:
+                elem['metadata']['labels'] = {}
+            elem['metadata']['labels']['projectcalico.org/tier'] = tier
+
+    add_label(new)
     return new
 
 
@@ -336,21 +391,24 @@ def decode_json_yaml(value):
         pass
     return None, None
 
+
 def find_and_format_creation_timestamp(decoded):
     if decoded:
         if 'items' in decoded:
-            for i in xrange(len(decoded['items'])):
+            for i in range(len(decoded['items'])):
                 decoded['items'][i] = format_creation_timestamp(decoded['items'][i])
         else:
             decoded = format_creation_timestamp(decoded)
     return decoded
 
+
 def format_creation_timestamp(decoded):
     if isinstance(decoded, dict) and 'metadata' in decoded and 'creationTimestamp' in decoded['metadata']:
         if isinstance(decoded['metadata']['creationTimestamp'], datetime):
             decoded['metadata']['creationTimestamp'] = decoded.get('metadata', {}). \
-                    get('creationTimestamp', datetime.utcnow()).isoformat() + 'Z'
+                                                           get('creationTimestamp', datetime.utcnow()).isoformat() + 'Z'
     return decoded
+
 
 def writeyaml(filename, data):
     """
@@ -380,7 +438,7 @@ def writejson(filename, data):
 
 
 def truncate_for_log(text, length):
-    if len(text) <=length:
+    if len(text) <= length:
         return text
     return text[:length] + "... <truncated>"
 
@@ -408,12 +466,6 @@ def get_ip(v6=False):
     return ip
 
 
-# Some of the commands we execute like to mess with the TTY configuration,
-# which can break the output formatting. As a workaround, save off the
-# terminal settings and restore them after each command.
-_term_settings = termios.tcgetattr(sys.stdin.fileno())
-
-
 def log_and_run(command, raise_exception_on_failure=True, stderr=STDOUT):
     def log_output(results):
         if results is None:
@@ -425,21 +477,15 @@ def log_and_run(command, raise_exception_on_failure=True, stderr=STDOUT):
 
     try:
         logger.info("%s", command)
-        try:
-            results = check_output(command, shell=True, stderr=stderr).rstrip()
-        finally:
-            # Restore terminal settings in case the command we ran manipulated
-            # them. Note: under concurrent access, this is still not a perfect
-            # solution since another thread's child process may break the
-            # settings again before we log below.
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _term_settings)
+        results = check_output(command, shell=True, stderr=stderr).rstrip()
+        results = results.decode()
         log_output(results)
         return results
     except CalledProcessError as e:
         # Wrap the original exception with one that gives a better error
         # message (including command output).
         logger.info("  # Return code: %s", e.returncode)
-        log_output(e.output)
+        log_output(e.output.decode())
         if raise_exception_on_failure:
             raise e
 
@@ -471,6 +517,7 @@ def curl_etcd(path, options=None, recursive=True, ip=None):
     logger.info("etcd RC: %s" % rc.strip())
     return json.loads(rc.strip())
 
+
 def wipe_etcd(ip):
     # Delete /calico if it exists. This ensures each test has an empty data
     # store at start of day.
@@ -479,20 +526,19 @@ def wipe_etcd(ip):
     # Disable Usage Reporting to usage.projectcalico.org
     # We want to avoid polluting analytics data with unit test noise
     curl_etcd("calico/v1/config/UsageReportingEnabled",
-                   options=["-XPUT -d value=False"], ip=ip)
+              options=["-XPUT -d value=False"], ip=ip)
 
     etcd_container_name = "calico-etcd"
     tls_vars = ""
     if ETCD_SCHEME == "https":
         # Etcd is running with SSL/TLS, require key/certificates
         etcd_container_name = "calico-etcd-ssl"
-        tls_vars = ("ETCDCTL_CACERT=/etc/calico/certs/ca.pem " +
-                    "ETCDCTL_CERT=/etc/calico/certs/client.pem " +
-                    "ETCDCTL_KEY=/etc/calico/certs/client-key.pem ")
+        tls_vars = ("-e ETCDCTL_CACERT=/etc/calico/certs/ca.pem " +
+                    "-e ETCDCTL_CERT=/etc/calico/certs/client.pem " +
+                    "-e ETCDCTL_KEY=/etc/calico/certs/client-key.pem ")
 
-    check_output("docker exec " + etcd_container_name + " sh -c '" + tls_vars +
-                 "ETCDCTL_API=3 etcdctl del --prefix /calico" +
-                 "'", shell=True)
+    check_output("docker exec " + tls_vars + etcd_container_name + " etcdctl del --prefix /calico", shell=True)
+
 
 def make_list(kind, items):
     """
@@ -512,6 +558,7 @@ def make_list(kind, items):
         'items': items,
     }
 
+
 def name(data):
     """
     Returns the name of the resource in the supplied data
@@ -522,13 +569,23 @@ def name(data):
     """
     return data['metadata']['name']
 
+def kind(data):
+    """
+    Returns the kind of the resource in the supplied data
+    Args:
+        data: A dictionary containing the resource.
+
+    Returns: The resource kind.
+    """
+    return data['kind']
+
 def namespace(data):
     """
     Returns the namespace of the resource in the supplied data
     Args:
        data: A dictionary containing the resource.
 
-    Returns: The resource name.
+    Returns: The resource namespace.
     """
     return data['metadata']['namespace']
 
@@ -566,4 +623,4 @@ def set_cluster_version(calico_version="", kdd=False):
         output = log_and_run(full_cmd, stderr=STDOUT)
         return CalicoctlOutput(full_cmd, output)
     except CalledProcessError as e:
-        return CalicoctlOutput(full_cmd, e.output, error=e.returncode)
+        return CalicoctlOutput(full_cmd, e.output.decode(), error=e.returncode)

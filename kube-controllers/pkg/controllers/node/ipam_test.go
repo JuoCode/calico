@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,25 +16,37 @@ package node
 import (
 	"context"
 	"fmt"
+	"maps"
+	"math/big"
+	"strings"
 	"time"
 
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/cache"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
+	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/vmipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/kubevirt"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
@@ -53,7 +65,7 @@ const (
 // assertConsistentState performs checks on the provided IPAM controller's internal
 // caches to ensure that they are consistent with each other. Useful for ensuring that
 // at any arbitrary point in time, we're not in an unknown state.
-func assertConsistentState(c *ipamController) {
+func assertConsistentState(c *IPAMController) {
 	// Stop the world so we can inspect it.
 	done := c.pause()
 	defer done()
@@ -73,6 +85,10 @@ func assertConsistentState(c *ipamController) {
 		_, ok := c.allBlocks[cidr]
 		Expect(ok).To(BeTrue(), fmt.Sprintf("Block %s not present in allBlocks, but is present in allocationsByBlock", cidr))
 	}
+	for cidr := range c.coldBlocks {
+		_, ok := c.allBlocks[cidr]
+		Expect(ok).To(BeTrue(), fmt.Sprintf("Block %s not present in allBlocks, but is present in coldBlocks", cidr))
+	}
 
 	// Make sure blocksByNode and nodesByBlock are consistent.
 	for n, blocks := range c.blocksByNode {
@@ -83,22 +99,56 @@ func assertConsistentState(c *ipamController) {
 	for cidr, n := range c.nodesByBlock {
 		ExpectWithOffset(1, c.blocksByNode[n][cidr]).To(BeTrue(), fmt.Sprintf("Block %s not present in blocksByNode", cidr))
 	}
+
+	// Make sure every allocation within the allocationState is present in the other maps.
+	for node, allocations := range c.allocationState.allocationsByNode {
+		for id, a := range allocations {
+			ExpectWithOffset(1, c.allocationsByBlock[a.block][id]).To(Equal(a), fmt.Sprintf("Allocation %s not present in allocationsByBlock", id))
+		}
+		if node == stoppedVMNode {
+			// No block is ever affine to it.
+			continue
+		}
+		ExpectWithOffset(1, c.blocksByNode).To(HaveKey(node), fmt.Sprintf("Node %s not present in blocksByNode", node))
+	}
+}
+
+// createPod is a helper to create Pod objects that ensures we execute the transformer functionality as part of UTs.
+func createPod(ctx context.Context, cs kubernetes.Interface, p *v1.Pod) (*v1.Pod, error) {
+	t := converter.PodTransformer(true)
+	a, err := t(p)
+	if err != nil {
+		return nil, err
+	}
+	transformed := a.(*v1.Pod)
+	return cs.CoreV1().Pods(transformed.Namespace).Create(ctx, transformed, metav1.CreateOptions{})
 }
 
 var _ = Describe("IPAM controller UTs", func() {
-	var c *ipamController
+	var c *IPAMController
+	var dataFeed *utils.DataFeed
 	var cli client.Interface
 	var cs kubernetes.Interface
+	var deferredInformers *kubevirt.DeferredInformers
+	var vmIndexer cache.Indexer
+	var vmiIndexer cache.Indexer
 	var stopChan chan struct{}
 	var pods chan *v1.Pod
 	var nodes chan *v1.Node
 
+	// deliver sends an update the way the syncer does: to the shared tracker first, then to the controller.
+	deliver := func(u bapi.Update) { dataFeed.OnUpdates([]bapi.Update{u}) }
+
 	BeforeEach(func() {
 		// Create a fake clientset with nothing in it.
-		cs = fake.NewSimpleClientset()
+		cs = fake.NewClientset()
 
 		// Create a fake Calico client.
 		cli = NewFakeCalicoClient()
+
+		vmIndexer = cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		vmiIndexer = cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		deferredInformers = kubevirt.NewDeferredInformersWithIndexers(vmIndexer, vmiIndexer)
 
 		// Create a node indexer with the fake clientset
 		factory := informers.NewSharedInformerFactory(cs, 0)
@@ -115,7 +165,11 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		pods = make(chan *v1.Pod, 1)
 		_, err := podInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
+			AddFunc: func(obj any) {
+				pod := obj.(*v1.Pod)
+				pods <- pod
+			},
+			DeleteFunc: func(obj any) {
 				pod := obj.(*v1.Pod)
 				pods <- pod
 			},
@@ -123,7 +177,11 @@ var _ = Describe("IPAM controller UTs", func() {
 		Expect(err).NotTo(HaveOccurred())
 		nodes = make(chan *v1.Node, 1)
 		_, err = nodeInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
+			AddFunc: func(obj any) {
+				node := obj.(*v1.Node)
+				nodes <- node
+			},
+			DeleteFunc: func(obj any) {
 				node := obj.(*v1.Node)
 				nodes <- node
 			},
@@ -134,9 +192,13 @@ var _ = Describe("IPAM controller UTs", func() {
 		cache.WaitForCacheSync(stopChan, podInformer.HasSynced)
 		cache.WaitForCacheSync(stopChan, nodeInformer.HasSynced)
 
-		// Create a new controller. We don't register with a data feed,
-		// as the tests themselves will drive the controller.
-		c = NewIPAMController(cfg, cli, cs, podInformer.GetIndexer(), nodeInformer.GetIndexer())
+		// Create a new controller. The data feed's syncer never starts; the tests feed it updates themselves.
+		dataFeed = utils.NewDataFeed(cli, "kubernetes")
+		c = NewIPAMController(cfg, cli, cs, podInformer.GetIndexer(), nodeInformer.GetIndexer(), deferredInformers, utils.NewIPAMFeed(dataFeed).Tracker())
+		c.RegisterWith(dataFeed)
+
+		// For testing, speed up update batching.
+		c.consolidationWindow = 1 * time.Millisecond
 	})
 
 	AfterEach(func() {
@@ -147,15 +209,789 @@ var _ = Describe("IPAM controller UTs", func() {
 		close(stopChan)
 	})
 
+	It("should clean up all state from assignAllocation when releaseAllocation is called", func() {
+		c.Start(stopChan)
+
+		blockCIDR := "10.0.99.0/30"
+		a := &allocation{
+			ip:     "10.0.99.1",
+			handle: "test-handle-cleanup",
+			attrs: map[string]string{
+				ipam.AttributeNode:      "test-node",
+				ipam.AttributePod:       "test-pod",
+				ipam.AttributeNamespace: "default",
+			},
+			block: blockCIDR,
+		}
+
+		done := c.pause()
+
+		// Set up a minimal block entry so assertConsistentState is happy.
+		c.allBlocks[blockCIDR] = model.KVPair{}
+
+		c.assignAllocation(blockCIDR, a)
+
+		// Verify assignAllocation populated all maps.
+		Expect(c.allocationsByBlock[blockCIDR]).To(HaveKey(a.id()))
+		Expect(c.allocationState.allocationsByNode["test-node"]).To(HaveKey(a.id()))
+		Expect(c.handleTracker.allocationsByHandle[a.handle]).To(HaveKey(a.id()))
+
+		// Also mark as a confirmed leak so we can verify that is cleaned too.
+		a.markConfirmedLeak()
+		c.confirmedLeaks[a.id()] = a
+
+		c.releaseAllocation(a)
+
+		// Verify releaseAllocation cleaned all maps.
+		Expect(c.allocationsByBlock[blockCIDR]).NotTo(HaveKey(a.id()))
+		Expect(c.allocationState.allocationsByNode).NotTo(HaveKey("test-node"))
+		Expect(c.handleTracker.allocationsByHandle).NotTo(HaveKey(a.handle))
+		Expect(c.confirmedLeaks).NotTo(HaveKey(a.id()))
+		done()
+	})
+
+	It("should label an in-use address with no node as unknown_node only when its block has no host affinity", func() {
+		c.Start(stopChan)
+		resume := c.pause()
+		defer resume()
+
+		poolName := "unknown-node-test-pool"
+		poolKVP := model.KVPair{
+			Key: model.ResourceKey{Kind: apiv3.KindIPPool, Name: poolName},
+			Value: &apiv3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: poolName},
+				Spec:       apiv3.IPPoolSpec{CIDR: "10.0.97.0/24"},
+			},
+		}
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: poolKVP}})
+		c.handleUpdate(poolKVP)
+
+		// Neither address carries a node attribute. The LoadBalancer block has no host to fall back to, the other does.
+		handle := "unknown-node-test-handle"
+		lbAffinity := model.IPAMAffinityLoadBalancer
+		hostAffinity := "host:node-a"
+		ordinal := 0
+		blockWithOneAddress := func(cidr string, affinity *string) model.KVPair {
+			ipNet := net.MustParseCIDR(cidr)
+			return model.KVPair{
+				Key: model.BlockKey{CIDR: model.PrefixFromIPNet(ipNet)},
+				Value: &model.AllocationBlock{
+					CIDR:        ipNet,
+					Affinity:    affinity,
+					Allocations: []*int{&ordinal, nil, nil, nil},
+					Unallocated: []int{1, 2, 3},
+					Attributes: []model.AllocationAttribute{{
+						HandleID: &handle,
+						ActiveOwnerAttrs: map[string]string{
+							ipam.AttributePod:       "pod",
+							ipam.AttributeNamespace: "default",
+						},
+					}},
+				},
+			}
+		}
+		dataFeed.OnUpdates([]bapi.Update{
+			{KVPair: blockWithOneAddress("10.0.97.0/30", &lbAffinity)},
+			{KVPair: blockWithOneAddress("10.0.97.4/30", &hostAffinity)},
+		})
+
+		c.datastoreReady = true
+		c.syncStatus = bapi.InSync
+		c.updateMetrics()
+
+		inUse := func(node string) float64 {
+			return testutil.ToFloat64(inUseAllocationGauges[poolName].With(prometheus.Labels{"node": node}))
+		}
+		Expect(inUse(unknownNodeLabel)).To(Equal(1.0))
+		Expect(inUse("node-a")).To(Equal(1.0))
+	})
+
+	It("should count a reclamation against the pool even when the release deletes the block", func() {
+		c.Start(stopChan)
+		resume := c.pause()
+		defer resume()
+
+		poolName := "reclaim-test-pool"
+		poolKVP := model.KVPair{
+			Key: model.ResourceKey{Kind: apiv3.KindIPPool, Name: poolName},
+			Value: &apiv3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: poolName},
+				Spec:       apiv3.IPPoolSpec{CIDR: "10.0.98.0/24"},
+			},
+		}
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: poolKVP}})
+		c.handleUpdate(poolKVP)
+
+		// A tunnel address on a deleted node is a leak the GC confirms from the cache alone.
+		cidr := net.MustParseCIDR("10.0.98.0/30")
+		blockKey := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
+		handle := "reclaim-test-handle"
+		attrs := map[string]string{
+			ipam.AttributeNode: "gone-node",
+			ipam.AttributeType: ipam.AttributeTypeVXLAN,
+		}
+		ordinal := 0
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: model.KVPair{
+			Key: blockKey,
+			Value: &model.AllocationBlock{
+				CIDR:        cidr,
+				Allocations: []*int{&ordinal, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes:  []model.AllocationAttribute{{HandleID: &handle, ActiveOwnerAttrs: attrs}},
+			},
+		}}})
+
+		a := &allocation{ip: "10.0.98.0", handle: handle, attrs: attrs, block: cidr.String()}
+		c.allBlocks[cidr.String()] = model.KVPair{}
+		c.assignAllocation(cidr.String(), a)
+		a.markConfirmedLeak()
+		c.confirmedLeaks[a.id()] = a
+
+		// Freeing the block's last address deletes the block, and the tracker hears about it mid-release.
+		fakeClient, ok := cli.IPAM().(*fakeIPAMClient)
+		Expect(ok).To(BeTrue())
+		fakeClient.onRelease = func() {
+			dataFeed.OnUpdates([]bapi.Update{{KVPair: model.KVPair{Key: blockKey}}})
+		}
+		DeferCleanup(func() { fakeClient.onRelease = nil })
+
+		Expect(c.garbageCollectKnownLeaks()).To(Succeed())
+		Expect(testutil.ToFloat64(gcReclamationCounters[poolName].With(prometheus.Labels{"node": "gone-node"}))).To(Equal(1.0))
+	})
+
+	It("should publish the pool size and reserved-IP gauges from the shared tracker", func() {
+		c.Start(stopChan)
+		resume := c.pause()
+		defer resume()
+
+		poolSizeGauge.Reset()
+		poolReservedGauge.Reset()
+		poolName := "reserved-gauge-test-pool"
+		reservedGauge := func() float64 {
+			c.updatePoolMetrics()
+			return testutil.ToFloat64(poolReservedGauge.With(prometheus.Labels{"ippool": poolName}))
+		}
+
+		// The controller decides which pools to report, and the tracker what each one reserves.
+		poolKVP := model.KVPair{
+			Key: model.ResourceKey{Kind: apiv3.KindIPPool, Name: poolName},
+			Value: &apiv3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: poolName},
+				Spec:       apiv3.IPPoolSpec{CIDR: "10.0.0.0/24"},
+			},
+		}
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: poolKVP}})
+		c.handleUpdate(poolKVP)
+		Expect(reservedGauge()).To(BeZero(), "no reservations yet")
+		Expect(testutil.ToFloat64(poolSizeGauge.With(prometheus.Labels{"ippool": poolName}))).To(Equal(256.0))
+
+		// No block covers this space, so the count cannot come from the block state
+		// the controller tracks.  The two reservations overlap, so the shared /29
+		// must only be counted once.
+		reservationKey := model.ResourceKey{Kind: apiv3.KindIPReservation, Name: "test-reservation"}
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: model.KVPair{
+			Key: reservationKey,
+			Value: &apiv3.IPReservation{
+				ObjectMeta: metav1.ObjectMeta{Name: reservationKey.Name},
+				Spec:       apiv3.IPReservationSpec{ReservedCIDRs: []string{"10.0.0.128/28", "10.0.0.128/29"}},
+			},
+		}}})
+		Expect(reservedGauge()).To(Equal(16.0))
+
+		// Deleting the reservation frees the addresses again.
+		dataFeed.OnUpdates([]bapi.Update{{KVPair: model.KVPair{Key: reservationKey}}})
+		Expect(reservedGauge()).To(BeZero())
+
+		// Deleting the pool should take its gauges with it.
+		c.onPoolDeleted(poolName)
+		Expect(testutil.CollectAndCount(poolSizeGauge)).To(BeZero())
+		Expect(testutil.CollectAndCount(poolReservedGauge)).To(BeZero())
+	})
+
+	It("should keep publishing pool gauges for a Terminating pool until it is gone", func() {
+		c.Start(stopChan)
+		resume := c.pause()
+		defer resume()
+
+		poolSizeGauge.Reset()
+		poolReservedGauge.Reset()
+		now := metav1.Now()
+		poolKey := model.ResourceKey{Kind: apiv3.KindIPPool, Name: "terminating-pool"}
+		poolKVP := model.KVPair{
+			Key: poolKey,
+			Value: &apiv3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "terminating-pool", DeletionTimestamp: &now},
+				Spec:       apiv3.IPPoolSpec{CIDR: "10.0.0.0/24"},
+			},
+		}
+		dataFeed.OnUpdates([]bapi.Update{
+			{KVPair: poolKVP},
+			{KVPair: model.KVPair{
+				Key: model.ResourceKey{Kind: apiv3.KindIPReservation, Name: "r"},
+				Value: &apiv3.IPReservation{
+					ObjectMeta: metav1.ObjectMeta{Name: "r"},
+					Spec:       apiv3.IPReservationSpec{ReservedCIDRs: []string{"10.0.0.0/28"}},
+				},
+			}},
+		})
+		c.handleUpdate(poolKVP)
+
+		c.updatePoolMetrics()
+		labels := prometheus.Labels{"ippool": "terminating-pool"}
+		Expect(testutil.ToFloat64(poolSizeGauge.With(labels))).To(Equal(256.0))
+		Expect(testutil.ToFloat64(poolReservedGauge.With(labels))).To(Equal(16.0))
+
+		// The finalizer releasing the pool takes the gauges with it.
+		c.handleUpdate(model.KVPair{Key: poolKey})
+		Expect(testutil.CollectAndCount(poolSizeGauge)).To(BeZero())
+		Expect(testutil.CollectAndCount(poolReservedGauge)).To(BeZero())
+	})
+
+	Describe("VMI allocation validation", func() {
+		makeVMIAllocation := func(ns, vmName string) *allocation {
+			return &allocation{
+				ip:     "10.0.0.1",
+				handle: "vmi-handle",
+				attrs: map[string]string{
+					ipam.AttributeNamespace: ns,
+					ipam.AttributeVMIName:   vmName,
+				},
+			}
+		}
+
+		It("should treat matching VM allocation as valid", func() {
+			c.Start(stopChan)
+			resume := c.pause()
+			defer resume()
+
+			namespace := "default"
+			vmName := "test-vm"
+			vmUID := "vm-uid"
+			runStrategy := kubevirtv1.RunStrategyAlways
+			vm := &kubevirtv1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      vmName,
+					Namespace: namespace,
+					UID:       types.UID(vmUID),
+				},
+				Spec: kubevirtv1.VirtualMachineSpec{
+					RunStrategy: &runStrategy,
+				},
+			}
+
+			Expect(vmIndexer.Add(vm)).NotTo(HaveOccurred())
+
+			allocation := makeVMIAllocation(namespace, vmName)
+			Expect(c.isVMAllocationValid(allocation)).To(BeTrue())
+		})
+
+		It("should treat allocation as invalid if VM not found", func() {
+			c.Start(stopChan)
+			namespace := "default"
+
+			allocation := makeVMIAllocation(namespace, "invalid-vm-name")
+			Expect(c.isVMAllocationValid(allocation)).To(BeFalse())
+		})
+
+		It("should treat allocation as valid if VM not found but Standalone VMI exist", func() {
+			c.Start(stopChan)
+			namespace := "default"
+			vmiName := "test-vm"
+			vmiUID := "vmi-uid"
+
+			vmi := &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      vmiName,
+					Namespace: namespace,
+					UID:       types.UID(vmiUID),
+				},
+			}
+			Expect(vmiIndexer.Add(vmi)).NotTo(HaveOccurred())
+
+			allocation := makeVMIAllocation(namespace, vmiName)
+			Expect(c.isVMAllocationValid(allocation)).To(BeTrue())
+		})
+
+		It("should treat allocation as invalid if VMI exists but is owned by a deleted VM", func() {
+			c.Start(stopChan)
+			namespace := "default"
+			vmiName := "test-vm"
+			vmiUID := "vmi-uid"
+			isController := true
+
+			// VMI with a VM ownerReference — but the VM is not in the cache.
+			vmi := &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      vmiName,
+					Namespace: namespace,
+					UID:       types.UID(vmiUID),
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "kubevirt.io/v1",
+							Kind:       "VirtualMachine",
+							Name:       vmiName,
+							Controller: &isController,
+						},
+					},
+				},
+			}
+			Expect(vmiIndexer.Add(vmi)).NotTo(HaveOccurred())
+
+			allocation := makeVMIAllocation(namespace, vmiName)
+			Expect(c.isVMAllocationValid(allocation)).To(BeFalse())
+		})
+
+		It("should treat allocation as valid if namespace or vmName attributes are missing", func() {
+			c.Start(stopChan)
+
+			allocation := makeVMIAllocation("", "")
+			Expect(c.isVMAllocationValid(allocation)).To(BeTrue())
+		})
+
+		It("should treat allocation as valid if KubeVirt indexers are nil (KubeVirt not installed)", func() {
+			// Create a DeferredInformers with no indexers set (KubeVirt not installed).
+			c.deferredInformers = &kubevirt.DeferredInformers{}
+			c.Start(stopChan)
+
+			allocation := makeVMIAllocation("default", "some-vm")
+			Expect(c.isVMAllocationValid(allocation)).To(BeTrue())
+		})
+
+		Describe("with no owner, as a stopped VM's address has", func() {
+			makeOwnerless := func(handle string) *allocation {
+				return &allocation{ip: "10.0.0.1", handle: handle}
+			}
+			makeVM := func(ns, name string) *kubevirtv1.VirtualMachine {
+				return &kubevirtv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+			}
+			longName := strings.Repeat("v", 120)
+
+			It("should be a VM allocation filed under the stopped-VM bucket", func() {
+				c.Start(stopChan)
+				a := makeOwnerless(vmipam.CreateVMHandleID("", "default", "test-vm"))
+				Expect(a.isVMAllocation()).To(BeTrue())
+				Expect(a.node()).To(Equal(stoppedVMNode))
+			})
+
+			It("should not be a VM allocation on a pod handle", func() {
+				c.Start(stopChan)
+				a := makeOwnerless("k8s-pod-network.0123456789abcdef")
+				Expect(a.isVMAllocation()).To(BeFalse())
+				Expect(a.node()).To(BeEmpty())
+			})
+
+			It("should be valid while the VM its handle names exists", func() {
+				c.Start(stopChan)
+				Expect(vmIndexer.Add(makeVM("default", "test-vm"))).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(vmipam.CreateVMHandleID("", "default", "test-vm")))).To(BeTrue())
+			})
+
+			It("should be invalid when only a different VM exists", func() {
+				c.Start(stopChan)
+				Expect(vmIndexer.Add(makeVM("default", "other-vm"))).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(vmipam.CreateVMHandleID("", "default", "test-vm")))).To(BeFalse())
+			})
+
+			It("should be valid while a standalone VMI its handle names exists", func() {
+				c.Start(stopChan)
+				vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-vm"}}
+				Expect(vmiIndexer.Add(vmi)).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(vmipam.CreateVMHandleID("", "default", "test-vm")))).To(BeTrue())
+			})
+
+			It("should match a VM whose long name was hashed into the handle", func() {
+				c.Start(stopChan)
+				handle := vmipam.CreateVMHandleID("", "default", longName)
+				Expect(handle).NotTo(ContainSubstring(longName))
+
+				Expect(vmIndexer.Add(makeVM("default", longName+"x"))).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(handle))).To(BeFalse())
+
+				Expect(vmIndexer.Add(makeVM("default", longName))).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(handle))).To(BeTrue())
+			})
+
+			It("should match a VM on a network whose name contains the handle infix", func() {
+				c.Start(stopChan)
+				handle := vmipam.CreateVMHandleID("a.vmi.b", "default", "test-vm")
+				Expect(c.isVMAllocationValid(makeOwnerless(handle))).To(BeFalse())
+
+				Expect(vmIndexer.Add(makeVM("default", "test-vm"))).NotTo(HaveOccurred())
+				Expect(c.isVMAllocationValid(makeOwnerless(handle))).To(BeTrue())
+			})
+
+			It("should be valid when KubeVirt is not installed", func() {
+				c.deferredInformers = &kubevirt.DeferredInformers{}
+				c.Start(stopChan)
+				Expect(c.isVMAllocationValid(makeOwnerless(vmipam.CreateVMHandleID("", "default", "test-vm")))).To(BeTrue())
+			})
+		})
+	})
+
+	Describe("VM allocation GC through checkAllocations", func() {
+		var handle string
+		var blockCIDR string
+
+		// setupVMNodes creates the Calico node "cnode" and its Kubernetes node "kname".
+		setupVMNodes := func() {
+			n := internalapi.Node{}
+			n.Name = "cnode"
+			n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+			_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			kn := v1.Node{}
+			kn.Name = "kname"
+			_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			var node *v1.Node
+			Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
+		}
+
+		// setupVMAllocation creates a Calico node, Kubernetes node, and a VM-type
+		// IPAM allocation block. The allocation has both Pod and VMIName attributes
+		// to match real KubeVirt allocations.
+		setupVMAllocation := func() {
+			setupVMNodes()
+
+			handle = "vmi-handle"
+			idx := 0
+			cidr := net.MustParseCIDR("10.0.0.0/30")
+			aff := "host:cnode"
+			key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes: []model.AllocationAttribute{
+					{
+						HandleID: &handle,
+						ActiveOwnerAttrs: map[string]string{
+							ipam.AttributeNode:      "cnode",
+							ipam.AttributePod:       "virt-launcher-test-vm-xxxxx",
+							ipam.AttributeNamespace: "default",
+							ipam.AttributeVMIName:   "test-vm",
+						},
+					},
+				},
+			}
+			kvp := model.KVPair{Key: key, Value: &b}
+			blockCIDR = kvp.Key.(model.BlockKey).CIDR.String()
+			update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
+			deliver(update)
+		}
+
+		It("should GC VM allocation after grace period when VM is missing", func() {
+			// Use a short grace period for testing.
+			c.vmRecreationGracePeriod = gracePeriod
+
+			c.Start(stopChan)
+			setupVMAllocation()
+
+			// Wait for internal caches to update.
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[blockCIDR]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			c.onStatusUpdate(bapi.InSync)
+
+			// VM does not exist in virtClient, so the allocation should eventually be GC'd
+			// after the grace period.
+			fakeClient := cli.IPAM().(*fakeIPAMClient)
+			Eventually(func() bool {
+				return fakeClient.handlesReleased[handle]
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
+		})
+
+		It("should not GC VM allocation within grace period", func() {
+			// Use a very long grace period so it never expires during the test.
+			c.vmRecreationGracePeriod = 1 * time.Hour
+
+			c.Start(stopChan)
+			setupVMAllocation()
+
+			// Wait for internal caches to update.
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[blockCIDR]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			c.onStatusUpdate(bapi.InSync)
+
+			// VM does not exist, but grace period is long.
+			// The allocation should be a candidate leak but NOT confirmed.
+			fakeClient := cli.IPAM().(*fakeIPAMClient)
+
+			// Wait for at least one GC cycle to run so the allocation is marked as a candidate.
+			allocID := fmt.Sprintf("%s/%s", handle, "10.0.0.0")
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode["cnode"][allocID]
+				return a != nil && a.leakedAt != nil
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "allocation should be a candidate leak")
+
+			// The handle should NOT be released (grace period not expired).
+			Consistently(func() bool {
+				return fakeClient.handlesReleased[handle]
+			}, assertionTimeout, 100*time.Millisecond).Should(BeFalse())
+		})
+
+		It("should stop GC when VM reappears during grace period", func() {
+			// Use a very long grace period so it never expires during the test.
+			c.vmRecreationGracePeriod = 1 * time.Hour
+
+			c.Start(stopChan)
+			setupVMAllocation()
+
+			// Wait for internal caches to update.
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[blockCIDR]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			c.onStatusUpdate(bapi.InSync)
+
+			// Wait for the allocation to become a candidate leak.
+			allocID := fmt.Sprintf("%s/%s", handle, "10.0.0.0")
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode["cnode"][allocID]
+				return a != nil && a.leakedAt != nil
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "allocation should be a candidate leak")
+
+			// Now create the VM so it exists.
+			runStrategy := kubevirtv1.RunStrategyAlways
+			vm := &kubevirtv1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+					UID:       "vm-uid",
+				},
+				Spec: kubevirtv1.VirtualMachineSpec{
+					RunStrategy: &runStrategy,
+				},
+			}
+			Expect(vmIndexer.Add(vm)).NotTo(HaveOccurred())
+
+			// The allocation should be marked valid and leakedAt cleared.
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode["cnode"][allocID]
+				return a != nil && a.leakedAt == nil && !a.confirmedLeak
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "allocation should be marked valid after VM reappears")
+		})
+
+		Describe("for a stopped VM's address", func() {
+			var vmHandle string
+			var blockAffinity *string
+
+			// deliverStoppedVMBlock sends a block holding one address on the VM's handle, owned as given. CNI DEL
+			// clears the owner when the VM stops, which bumps the address's sequence number.
+			deliverStoppedVMBlock := func(owner map[string]string, seq uint64) {
+				idx := 0
+				cidr := net.MustParseCIDR("10.0.0.0/30")
+				b := model.AllocationBlock{
+					CIDR:           cidr,
+					Affinity:       blockAffinity,
+					Allocations:    []*int{&idx, nil, nil, nil},
+					Unallocated:    []int{1, 2, 3},
+					SequenceNumber: seq,
+					Attributes:     []model.AllocationAttribute{{HandleID: &vmHandle, ActiveOwnerAttrs: owner}},
+				}
+				b.SetSequenceNumberForOrdinal(0)
+				kvp := model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+				blockCIDR = cidr.String()
+				deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVUpdated})
+			}
+
+			// filedUnder returns the node the GC files the VM's address under, or "" when it isn't filed.
+			filedUnder := func() string {
+				done := c.pause()
+				defer done()
+				for node, allocs := range c.allocationState.allocationsByNode {
+					if _, ok := allocs[fmt.Sprintf("%s/%s", vmHandle, "10.0.0.0")]; ok {
+						return node
+					}
+				}
+				return ""
+			}
+
+			// released reports whether the GC has released the VM's handle.
+			released := func() bool {
+				fakeClient, ok := cli.IPAM().(*fakeIPAMClient)
+				Expect(ok).To(BeTrue())
+				return fakeClient.handlesReleased[vmHandle]
+			}
+
+			BeforeEach(func() {
+				vmHandle = vmipam.CreateVMHandleID("", "default", "test-vm")
+				aff := "host:cnode"
+				blockAffinity = &aff
+			})
+
+			It("should hold the address while the VM exists and release it once the VM is deleted", func() {
+				c.vmRecreationGracePeriod = gracePeriod
+				vm := &kubevirtv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-vm"}}
+				Expect(vmIndexer.Add(vm)).NotTo(HaveOccurred())
+
+				c.Start(stopChan)
+				setupVMNodes()
+				deliverStoppedVMBlock(nil, 1)
+				Eventually(filedUnder, time.Second, 100*time.Millisecond).Should(Equal(stoppedVMNode))
+				c.onStatusUpdate(bapi.InSync)
+
+				Consistently(released, assertionTimeout, 100*time.Millisecond).Should(BeFalse(), "address released while its VM exists")
+
+				Expect(vmIndexer.Delete(vm)).NotTo(HaveOccurred())
+				Eventually(released, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "address not released after its VM was deleted")
+			})
+
+			It("should release the address of a deleted VM in a block with no affinity", func() {
+				c.vmRecreationGracePeriod = gracePeriod
+				blockAffinity = nil
+
+				c.Start(stopChan)
+				deliverStoppedVMBlock(nil, 1)
+				Eventually(filedUnder, time.Second, 100*time.Millisecond).Should(Equal(stoppedVMNode))
+				c.onStatusUpdate(bapi.InSync)
+
+				Eventually(released, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "address not released after its VM was deleted")
+			})
+
+			It("should keep the VM grace period when the block's node is deleted", func() {
+				c.vmRecreationGracePeriod = 1 * time.Hour
+
+				// The block stays affine to cnode, but no Calico or Kubernetes node exists for it.
+				c.Start(stopChan)
+				deliverStoppedVMBlock(nil, 1)
+				Eventually(filedUnder, time.Second, 100*time.Millisecond).Should(Equal(stoppedVMNode))
+				c.onStatusUpdate(bapi.InSync)
+
+				allocID := fmt.Sprintf("%s/%s", vmHandle, "10.0.0.0")
+				Eventually(func() bool {
+					done := c.pause()
+					defer done()
+					a := c.allocationState.allocationsByNode[stoppedVMNode][allocID]
+					return a != nil && a.isCandidateLeak()
+				}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "allocation should be a candidate leak")
+				Consistently(released, assertionTimeout, 100*time.Millisecond).Should(BeFalse(), "address released inside the VM grace period")
+			})
+
+			It("should move an address from its pod's node to the stopped-VM bucket when CNI DEL clears its owner", func() {
+				c.Start(stopChan)
+				deliverStoppedVMBlock(map[string]string{
+					ipam.AttributeNode:      "other-node",
+					ipam.AttributePod:       "virt-launcher-test-vm-xxxxx",
+					ipam.AttributeNamespace: "default",
+					ipam.AttributeVMIName:   "test-vm",
+				}, 1)
+				Eventually(filedUnder, time.Second, 100*time.Millisecond).Should(Equal("other-node"))
+
+				deliverStoppedVMBlock(nil, 2)
+				Eventually(filedUnder, time.Second, 100*time.Millisecond).Should(Equal(stoppedVMNode))
+			})
+		})
+	})
+
+	Describe("pod allocation validation", func() {
+		currentSandbox := strings.Repeat("b", 64)
+		replacedSandbox := strings.Repeat("a", 64)
+
+		// createSandboxPod creates a pod on node kname that has not reported an IP. A non-empty
+		// containerID is recorded the way the CNI plugin records the pod's current sandbox.
+		createSandboxPod := func(phase v1.PodPhase, containerID string) {
+			pod := v1.Pod{}
+			pod.Name = "test-pod"
+			pod.Namespace = "test-namespace"
+			pod.Spec.NodeName = "kname"
+			pod.Status.Phase = phase
+			if containerID != "" {
+				pod.Annotations = map[string]string{conversion.AnnotationContainerID: containerID}
+			}
+			_, err := createPod(context.TODO(), cs, &pod)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		podAllocation := func(handle string) *allocation {
+			return &allocation{
+				ip:     "10.0.0.1",
+				handle: handle,
+				knode:  "kname",
+				attrs: map[string]string{
+					ipam.AttributeNode:      "cnode",
+					ipam.AttributePod:       "test-pod",
+					ipam.AttributeNamespace: "test-namespace",
+				},
+			}
+		}
+
+		DescribeTable("should judge an allocation by its pod's current sandbox and phase",
+			func(phase v1.PodPhase, podContainerID, handle string, want allocationVerdict) {
+				c.Start(stopChan)
+				createSandboxPod(phase, podContainerID)
+				Expect(c.judgeAllocation(podAllocation(handle), false)).To(Equal(want))
+			},
+			Entry("in use on the current sandbox", v1.PodPending, currentSandbox, "k8s-pod-network."+currentSandbox, allocationInUse),
+			Entry("unused from a replaced sandbox", v1.PodPending, currentSandbox, "k8s-pod-network."+replacedSandbox, allocationUnused),
+			Entry("unused from a replaced sandbox on a dotted network name", v1.PodPending, currentSandbox, "secondary.network."+replacedSandbox, allocationUnused),
+			Entry("in use when a hashed VM handle ends in a runtime-shaped ID", v1.PodPending, currentSandbox, "k8s-pod-network.vmi."+replacedSandbox, allocationInUse),
+			Entry("in use when the pod records no sandbox", v1.PodPending, "", "k8s-pod-network."+replacedSandbox, allocationInUse),
+			Entry("in use when the handle names no sandbox", v1.PodPending, currentSandbox, "k8s-pod-network.test-namespace.test-pod", allocationInUse),
+			Entry("in use while running without a reported IP", v1.PodRunning, currentSandbox, "k8s-pod-network."+currentSandbox, allocationInUse),
+			Entry("unused once the pod has succeeded", v1.PodSucceeded, currentSandbox, "k8s-pod-network."+currentSandbox, allocationUnused),
+			Entry("unused once the pod has failed", v1.PodFailed, "", "k8s-pod-network."+currentSandbox, allocationUnused),
+		)
+
+		It("should judge an allocation whose pod doesn't exist as owner gone", func() {
+			c.Start(stopChan)
+			Expect(c.judgeAllocation(podAllocation("k8s-pod-network."+currentSandbox), false)).To(Equal(allocationOwnerGone))
+		})
+
+		It("should trust a reported pod IP over a container ID annotation from an abandoned sandbox", func() {
+			c.Start(stopChan)
+
+			// An abandoned sandbox's ADD finished after the live sandbox's ADD, so the
+			// annotation names the abandoned sandbox while the pod reports the live one's IP.
+			pod := v1.Pod{}
+			pod.Name = "test-pod"
+			pod.Namespace = "test-namespace"
+			pod.Spec.NodeName = "kname"
+			pod.Status.Phase = v1.PodRunning
+			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.PodIPs = []v1.PodIP{{IP: "10.0.0.1"}}
+			pod.Annotations = map[string]string{conversion.AnnotationContainerID: replacedSandbox}
+			_, err := createPod(context.TODO(), cs, &pod)
+			Expect(err).NotTo(HaveOccurred())
+
+			live := podAllocation("k8s-pod-network." + currentSandbox)
+			Expect(c.allocationIsValid(live, false)).To(BeTrue())
+
+			abandoned := podAllocation("k8s-pod-network." + replacedSandbox)
+			abandoned.ip = "10.0.0.2"
+			Expect(c.allocationIsValid(abandoned, false)).To(BeFalse())
+		})
+	})
+
 	It("should handle node updates and maintain its node cache", func() {
 		// Start the controller.
 		c.Start(stopChan)
 
 		calicoNodeName := "cname"
-		key := model.ResourceKey{Name: calicoNodeName, Kind: libapiv3.KindNode}
-		n := libapiv3.Node{}
+		key := model.ResourceKey{Name: calicoNodeName, Kind: internalapi.KindNode}
+		n := internalapi.Node{}
 		n.Name = calicoNodeName
-		n.Spec.OrchRefs = []libapiv3.OrchRef{
+		n.Spec.OrchRefs = []internalapi.OrchRef{
 			{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes},
 		}
 		kvp := model.KVPair{
@@ -168,7 +1004,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 
 		// Send a new Node update.
-		c.onUpdate(update)
+		deliver(update)
 
 		// Check internal state is updated. Because the main loop is
 		// in a different goroutine, this might take a short period of time.
@@ -182,7 +1018,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		// This should be rare, or maybe never happen, but we should handle it anyway.
 		n.Spec.OrchRefs[0].NodeName = "kname2"
 		update.UpdateType = bapi.UpdateTypeKVUpdated
-		c.onUpdate(update)
+		deliver(update)
 
 		// Expect the cache to be updated.
 		Eventually(func() string {
@@ -192,8 +1028,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		}, 1*time.Second, 100*time.Millisecond).Should(Equal("kname2"), "Cache not updated after UPDATE")
 
 		// Send a delete for the node, which should remove the entry from the cache.
-		update.KVPair.Value = nil
-		c.onUpdate(update)
+		update.Value = nil
+		deliver(update)
 		Eventually(func() map[string]string {
 			done := c.pause()
 			defer done()
@@ -202,9 +1038,9 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		// Recreate the Calico node as a non-Kubernetes node.
 		n.Spec.OrchRefs[0].Orchestrator = apiv3.OrchestratorOpenStack
-		update.KVPair.Value = &n
+		update.Value = &n
 		update.UpdateType = bapi.UpdateTypeKVNew
-		c.onUpdate(update)
+		deliver(update)
 
 		// Expect the cache to be updated, mapping the Calico name to "".
 		Eventually(func() bool {
@@ -215,8 +1051,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue(), "Cache not updated as expected after ADD of non-k8s node")
 
 		// Send a delete for the non-Kubernetes node, which should remove the entry from the cache.
-		update.KVPair.Value = nil
-		c.onUpdate(update)
+		update.Value = nil
+		deliver(update)
 		Eventually(func() map[string]string {
 			done := c.pause()
 			defer done()
@@ -231,7 +1067,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		// Add a new block with no allocations.
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -245,7 +1081,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Expect new entries in the internal maps.
 		Eventually(func() model.KVPair {
@@ -261,7 +1097,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() map[string]*allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"]
+			return c.allocationState.allocationsByNode["cnode"]
 		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
 
 		// Now, allocate an address in the block and send it in as an update.
@@ -270,19 +1106,19 @@ var _ = Describe("IPAM controller UTs", func() {
 		b.Allocations[0] = &idx
 		b.Unallocated = []int{1, 2, 3}
 		b.Attributes = append(b.Attributes, model.AllocationAttribute{
-			AttrPrimary: &handle,
-			AttrSecondary: map[string]string{
+			HandleID: &handle,
+			ActiveOwnerAttrs: map[string]string{
 				ipam.AttributeNode:      "cnode",
 				ipam.AttributePod:       "test-pod",
 				ipam.AttributeNamespace: "test-namespace",
 			},
 		})
-		c.onUpdate(update)
+		deliver(update)
 
 		expectedAllocation := &allocation{
 			ip:     "10.0.0.0",
 			handle: handle,
-			attrs:  b.Attributes[0].AttrSecondary,
+			attrs:  b.Attributes[0].ActiveOwnerAttrs,
 			block:  "10.0.0.0/30",
 		}
 
@@ -303,9 +1139,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() map[string]*allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"]
+			return c.allocationState.allocationsByNode["cnode"]
 		}, 1*time.Second, 100*time.Millisecond).ShouldNot(BeNil())
-
 		Eventually(func() *allocation {
 			done := c.pause()
 			defer done()
@@ -314,14 +1149,14 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() *allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"][id]
+			return c.allocationState.allocationsByNode["cnode"][id]
 		}, 1*time.Second, 100*time.Millisecond).Should(Equal(expectedAllocation))
 
 		// Release the address from above and expect original state to be restored.
 		b.Allocations[0] = nil
 		b.Unallocated = []int{1, 2, 3, 0}
 		b.Attributes = []model.AllocationAttribute{}
-		c.onUpdate(update)
+		deliver(update)
 		Eventually(func() model.KVPair {
 			done := c.pause()
 			defer done()
@@ -335,7 +1170,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() map[string]*allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"]
+			return c.allocationState.allocationsByNode["cnode"]
 		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
 		Eventually(func() *allocation {
 			done := c.pause()
@@ -346,12 +1181,12 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() *allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"][id]
+			return c.allocationState.allocationsByNode["cnode"][id]
 		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
 
 		// Delete the block and expect everything to be cleaned up.
 		update.Value = nil
-		c.onUpdate(update)
+		deliver(update)
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
@@ -361,7 +1196,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() map[string]*allocation {
 			done := c.pause()
 			defer done()
-			return c.allocationsByNode["cnode"]
+			return c.allocationState.allocationsByNode["cnode"]
 		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
 		Eventually(func() map[string]*allocation {
 			done := c.pause()
@@ -370,188 +1205,259 @@ var _ = Describe("IPAM controller UTs", func() {
 		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
 	})
 
-	It("should maintain pool and block mappings", func() {
-		// Start the controller.
+	Describe("cold IP garbage collection", func() {
+		var fakeIPAM *fakeIPAMClient
+
+		cidrOf := func(kvp model.KVPair) string {
+			return kvp.Key.(model.BlockKey).CIDR.String()
+		}
+
+		// coldBlock builds a block affine to cnode containing a single IP whose
+		// ReleasedAt is set to releasedAt, i.e. an IP in cooldown.
+		coldBlock := func(cidrStr string, releasedAt metav1.Time) model.KVPair {
+			cidr := net.MustParseCIDR(cidrStr)
+			aff := "host:cnode"
+			idx := 0
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes:  []model.AllocationAttribute{{ReleasedAt: &releasedAt}},
+			}
+			return model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+		}
+
+		// liveBlock builds a block affine to cnode with a single normal allocation
+		// and no IPs in cooldown.
+		liveBlock := func(cidrStr string) model.KVPair {
+			cidr := net.MustParseCIDR(cidrStr)
+			aff := "host:cnode"
+			idx := 0
+			handle := "live-handle"
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes: []model.AllocationAttribute{{
+					HandleID:         &handle,
+					ActiveOwnerAttrs: map[string]string{ipam.AttributeNode: "cnode"},
+				}},
+			}
+			return model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+		}
+
+		BeforeEach(func() {
+			fakeIPAM = cli.IPAM().(*fakeIPAMClient)
+			fakeIPAM.config.IPCooldownSeconds = 3600
+			c.Start(stopChan)
+		})
+
+		It("only garbage collects blocks whose cooldown has elapsed", func() {
+			expired := coldBlock("10.0.0.0/30", metav1.NewTime(time.Now().Add(-2*time.Hour)))
+			cooling := coldBlock("10.0.1.0/30", metav1.NewTime(time.Now()))
+			live := liveBlock("10.0.2.0/30")
+
+			for _, kvp := range []model.KVPair{expired, cooling, live} {
+				deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+			}
+
+			// Both cooldown blocks are tracked; the live block is not.
+			Eventually(func() map[string]metav1.Time {
+				done := c.pause()
+				defer done()
+				return maps.Clone(c.coldBlocks)
+			}, 1*time.Second, 100*time.Millisecond).Should(And(
+				HaveKey(cidrOf(expired)),
+				HaveKey(cidrOf(cooling)),
+				Not(HaveKey(cidrOf(live))),
+			))
+
+			// Only the block past its cooldown is visited.
+			done := c.pause()
+			Expect(c.garbageCollectColdIPs()).To(Succeed())
+			done()
+			Expect(fakeIPAM.gcBlocks()).To(ConsistOf(cidrOf(expired)))
+		})
+
+		It("stops tracking a block once its cooldown IPs are deallocated", func() {
+			block := coldBlock("10.0.0.0/30", metav1.NewTime(time.Now().Add(-2*time.Hour)))
+			deliver(bapi.Update{KVPair: block, UpdateType: bapi.UpdateTypeKVNew})
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.coldBlocks[cidrOf(block)]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			// The IP is deallocated, so the block no longer carries a ReleasedAt.
+			b := block.Value.(*model.AllocationBlock)
+			b.Allocations[0] = nil
+			b.Unallocated = []int{0, 1, 2, 3}
+			b.Attributes = []model.AllocationAttribute{}
+			deliver(bapi.Update{KVPair: block, UpdateType: bapi.UpdateTypeKVUpdated})
+
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.coldBlocks[cidrOf(block)]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeFalse())
+		})
+	})
+
+	It("should refresh the sequence number of an already-tracked allocation on block update", func() {
+		// Regression test: if a reallocation bumps an allocation's sequence number
+		// but we keep the stale one, every GC release of that IP fails with "update
+		// conflict" forever (until restart). See onBlockUpdated.
 		c.Start(stopChan)
 
-		// Add first block with no pools established.
-		firstBlockCIDR := net.MustParseCIDR("192.168.0.0/30")
-		firstBlockAff := "host:cnode"
-		firstBlockKey := model.BlockKey{CIDR: firstBlockCIDR}
-		firstBlock := model.AllocationBlock{
-			CIDR:        firstBlockCIDR,
-			Affinity:    &firstBlockAff,
-			Allocations: []*int{nil, nil, nil, nil},
-			Unallocated: []int{0, 1, 2, 3},
-			Attributes:  []model.AllocationAttribute{},
+		// A /30 block affine to "cnode" with one address allocated to a handle,
+		// at the block's current sequence number (10).
+		cidr := net.MustParseCIDR("10.0.0.0/30")
+		aff := "host:cnode"
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
+		idx := 0
+		handle := "test-handle"
+		b := model.AllocationBlock{
+			CIDR:           cidr,
+			Affinity:       &aff,
+			Allocations:    []*int{&idx, nil, nil, nil},
+			Unallocated:    []int{1, 2, 3},
+			SequenceNumber: 10,
+			Attributes: []model.AllocationAttribute{
+				{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
+						ipam.AttributeNode:      "cnode",
+						ipam.AttributePod:       "test-pod",
+						ipam.AttributeNamespace: "test-namespace",
+					},
+				},
+			},
 		}
-		firstBlockKVP := model.KVPair{
-			Key:   firstBlockKey,
-			Value: &firstBlock,
+		b.SetSequenceNumberForOrdinal(0)
+		kvp := model.KVPair{Key: key, Value: &b}
+		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
+		id := fmt.Sprintf("%s/%s", handle, "10.0.0.0")
+		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
+		deliver(update)
+
+		// The allocation is tracked with the original sequence number.
+		Eventually(func() uint64 {
+			done := c.pause()
+			defer done()
+			if a := c.allocationsByBlock[blockCIDR][id]; a != nil {
+				return a.sequenceNumber
+			}
+			return 0
+		}, 1*time.Second, 100*time.Millisecond).Should(Equal(uint64(10)))
+
+		// Mark it a leak candidate - state tied to the current incarnation that
+		// must not survive a reallocation.
+		func() {
+			done := c.pause()
+			defer done()
+			c.allocationsByBlock[blockCIDR][id].markLeak(gracePeriod)
+			Expect(c.allocationsByBlock[blockCIDR][id].isCandidateLeak()).To(BeTrue())
+		}()
+
+		// Reallocate: same (handle, IP), but the block is rewritten with a newer
+		// sequence number.
+		b.SequenceNumber = 11
+		b.SetSequenceNumberForOrdinal(0)
+		deliver(update)
+
+		// The cache must now track the latest sequence number.
+		Eventually(func() uint64 {
+			done := c.pause()
+			defer done()
+			if a := c.allocationsByBlock[blockCIDR][id]; a != nil {
+				return a.sequenceNumber
+			}
+			return 0
+		}, 1*time.Second, 100*time.Millisecond).Should(Equal(uint64(11)))
+
+		func() {
+			done := c.pause()
+			defer done()
+
+			// Reallocation clears the stale leak state...
+			a := c.allocationsByBlock[blockCIDR][id]
+			Expect(a.isCandidateLeak()).To(BeFalse())
+			Expect(a.isConfirmedLeak()).To(BeFalse())
+
+			// ...and release uses the current sequence number, so it won't conflict.
+			opts := a.ReleaseOptions()
+			Expect(opts.SequenceNumber).NotTo(BeNil())
+			Expect(*opts.SequenceNumber).To(Equal(uint64(11)))
+		}()
+
+		// assertConsistentState pauses internally; don't call it while paused.
+		assertConsistentState(c)
+	})
+
+	It("should label blocks with the pool the shared tracker attributes them to", func() {
+		c.Start(stopChan)
+
+		blockUpdate := func(cidr string) bapi.Update {
+			ipNet := net.MustParseCIDR(cidr)
+			aff := "host:cnode"
+			return bapi.Update{
+				KVPair: model.KVPair{
+					Key: model.BlockKey{CIDR: model.PrefixFromIPNet(ipNet)},
+					Value: &model.AllocationBlock{
+						CIDR:        ipNet,
+						Affinity:    &aff,
+						Allocations: []*int{nil, nil, nil, nil},
+						Unallocated: []int{0, 1, 2, 3},
+					},
+				},
+				UpdateType: bapi.UpdateTypeKVNew,
+			}
 		}
-		firstBlockUpdate := bapi.Update{KVPair: firstBlockKVP, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(firstBlockUpdate)
-
-		// Expect new entries in the pool manager maps under unknown pool.
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[firstBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(unknownPoolLabel))
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[unknownPoolLabel]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(map[string]bool{firstBlockCIDR.String(): true}))
-		Eventually(func() map[string]*apiv3.IPPool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.allPools
-		}, 1*time.Second, 100*time.Millisecond).Should(BeEmpty())
-
-		// Establish first pool for the first block.
-		firstIPPoolName := "ippool-1"
-		firstIPPoolKey := model.ResourceKey{Name: firstIPPoolName, Kind: apiv3.KindIPPool}
-		firstIPPool := apiv3.IPPool{}
-		firstIPPool.Name = firstIPPoolName
-		firstIPPool.Spec.CIDR = "192.168.0.0/24"
-		firstIPPool.Spec.BlockSize = 30
-		firstIPPool.Spec.NodeSelector = "all()"
-		firstIPPool.Spec.Disabled = false
-		firstPoolKVP := model.KVPair{
-			Key:   firstIPPoolKey,
-			Value: &firstIPPool,
+		poolUpdate := func(name, cidr string, deleting bool) bapi.Update {
+			pool := apiv3.IPPool{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: apiv3.IPPoolSpec{CIDR: cidr, BlockSize: 30}}
+			if deleting {
+				now := metav1.Now()
+				pool.DeletionTimestamp = &now
+			}
+			return bapi.Update{
+				KVPair: model.KVPair{
+					Key:   model.ResourceKey{Name: name, Kind: apiv3.KindIPPool},
+					Value: &pool,
+				},
+				UpdateType: bapi.UpdateTypeKVNew,
+			}
 		}
-		firstPoolUpdate := bapi.Update{
-			KVPair:     firstPoolKVP,
-			UpdateType: bapi.UpdateTypeKVNew,
+		labelOf := func(cidr string) func() string {
+			return func() string {
+				done := c.pause()
+				defer done()
+				return c.poolLabel(cidr)
+			}
 		}
-		c.onUpdate(firstPoolUpdate)
 
-		// Expect first block to be associated with first pool.
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[firstBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(firstIPPoolName))
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[firstIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(map[string]bool{firstBlockCIDR.String(): true}))
-		Eventually(func() *apiv3.IPPool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.allPools[firstIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(&firstIPPool))
+		// A block that arrives before any pool has none.
+		deliver(blockUpdate("192.168.0.0/30"))
+		Eventually(labelOf("192.168.0.0/30"), time.Second, 100*time.Millisecond).Should(Equal(unknownPoolLabel))
 
-		// Create a second pool and a second block immediately associated to it.
-		secondIPPoolName := "ippool-2"
-		secondIPPoolKey := model.ResourceKey{Name: secondIPPoolName, Kind: apiv3.KindIPPool}
-		secondIPPool := apiv3.IPPool{}
-		secondIPPool.Name = secondIPPoolName
-		secondIPPool.Spec.CIDR = "10.16.0.0/24"
-		secondIPPool.Spec.BlockSize = 30
-		secondIPPool.Spec.NodeSelector = "all()"
-		secondIPPool.Spec.Disabled = false
-		secondIPPoolKVP := model.KVPair{
-			Key:   secondIPPoolKey,
-			Value: &secondIPPool,
-		}
-		secondPoolUpdate := bapi.Update{
-			KVPair:     secondIPPoolKVP,
-			UpdateType: bapi.UpdateTypeKVNew,
-		}
-		c.onUpdate(secondPoolUpdate)
+		// A pool that covers it claims it, and a narrower pool inside that one wins it.
+		deliver(poolUpdate("wide", "192.168.0.0/16", false))
+		Eventually(labelOf("192.168.0.0/30"), time.Second, 100*time.Millisecond).Should(Equal("wide"))
+		deliver(poolUpdate("narrow", "192.168.0.0/24", false))
+		Eventually(labelOf("192.168.0.0/30"), time.Second, 100*time.Millisecond).Should(Equal("narrow"))
 
-		secondBlockCIDR := net.MustParseCIDR("10.16.0.0/30")
-		secondBlockAff := "host:cnode"
-		secondBlockKey := model.BlockKey{CIDR: secondBlockCIDR}
-		secondBlock := model.AllocationBlock{
-			CIDR:        secondBlockCIDR,
-			Affinity:    &secondBlockAff,
-			Allocations: []*int{nil, nil, nil, nil},
-			Unallocated: []int{0, 1, 2, 3},
-			Attributes:  []model.AllocationAttribute{},
-		}
-		secondBlockKVP := model.KVPair{
-			Key:   secondBlockKey,
-			Value: &secondBlock,
-		}
-		secondBlockUpdate := bapi.Update{KVPair: secondBlockKVP, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(secondBlockUpdate)
+		// A Terminating pool keeps its block until the pool is gone, then the wider pool gets it back.
+		deliver(poolUpdate("narrow", "192.168.0.0/24", true))
+		Consistently(labelOf("192.168.0.0/30"), 300*time.Millisecond, 100*time.Millisecond).Should(Equal("narrow"))
+		deliver(bapi.Update{KVPair: model.KVPair{Key: model.ResourceKey{Name: "narrow", Kind: apiv3.KindIPPool}}})
+		Eventually(labelOf("192.168.0.0/30"), time.Second, 100*time.Millisecond).Should(Equal("wide"))
 
-		// Expect second block to be associated with second pool.
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[secondBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(secondIPPoolName))
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[secondIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(map[string]bool{secondBlockCIDR.String(): true}))
-		Eventually(func() *apiv3.IPPool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.allPools[secondIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(&secondIPPool))
-
-		// Delete second block (associated with second pool). Expect block to be removed from pool maps.
-		secondBlockUpdate.KVPair.Value = nil
-		c.onUpdate(secondBlockUpdate)
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[secondBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(BeEmpty())
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[secondIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(BeEmpty())
-
-		// Delete first pool. Expect first block to be associated with unknown pool, and pool removed from pool cache.
-		firstPoolUpdate.KVPair.Value = nil
-		c.onUpdate(firstPoolUpdate)
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[firstBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(unknownPoolLabel))
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[unknownPoolLabel]
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(map[string]bool{firstBlockCIDR.String(): true}))
-		Eventually(func() *apiv3.IPPool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.allPools[firstIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(BeNil())
-
-		// Delete first block (unassociated with a pool). Expect block to be removed from pool maps.
-		firstBlockUpdate.KVPair.Value = nil
-		c.onUpdate(firstBlockUpdate)
-		Eventually(func() string {
-			done := c.pause()
-			defer done()
-			return c.poolManager.poolsByBlock[firstBlockCIDR.String()]
-		}, 1*time.Second, 100*time.Millisecond).Should(BeEmpty())
-		Eventually(func() map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool[firstIPPoolName]
-		}, 1*time.Second, 100*time.Millisecond).Should(BeEmpty())
-
-		// The unknown pool has no more blocks, it should be removed from the blocksByPool map.
-		// The second pool has no more blocks, it should remain from the blocksByPool map since it is an active pool.
-		Eventually(func() map[string]map[string]bool {
-			done := c.pause()
-			defer done()
-			return c.poolManager.blocksByPool
-		}, 1*time.Second, 100*time.Millisecond).Should(Equal(map[string]map[string]bool{"ippool-2": {}}))
+		// Without any pool, the block has no label again.
+		deliver(bapi.Update{KVPair: model.KVPair{Key: model.ResourceKey{Name: "wide", Kind: apiv3.KindIPPool}}})
+		Eventually(labelOf("192.168.0.0/30"), time.Second, 100*time.Millisecond).Should(Equal(unknownPoolLabel))
 	})
 
 	It("should handle node deletion properly", func() {
@@ -563,7 +1469,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -571,8 +1477,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       "test-pod",
 						ipam.AttributeNamespace: "test-namespace",
@@ -586,7 +1492,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for internal caches to update.
 		Eventually(func() bool {
@@ -601,7 +1507,7 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		// Trigger a node deletion. The node referenced in the allocation above
 		// never existed in the k8s API and neither does the pod, so this should result in a GC.
-		c.OnKubernetesNodeDeleted()
+		c.OnKubernetesNodeDeleted(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "kname"}})
 
 		// Confirm the IP and block affinity were released.
 		fakeClient := cli.IPAM().(*fakeIPAMClient)
@@ -634,7 +1540,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 
 		// Send a new ClusterInformation update.
-		c.onUpdate(update)
+		deliver(update)
 
 		Eventually(func() bool {
 			done := c.pause()
@@ -643,15 +1549,15 @@ var _ = Describe("IPAM controller UTs", func() {
 		}, 1*time.Second, 100*time.Millisecond).Should(Equal(false), "Cache not updated after UPDATE")
 
 		isReady = true
-		c.onUpdate(update)
+		deliver(update)
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
 			return c.datastoreReady
 		}, 1*time.Second, 100*time.Millisecond).Should(Equal(true), "Cache not updated after ADD")
 
-		update.KVPair.Value = nil
-		c.onUpdate(update)
+		update.Value = nil
+		deliver(update)
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
@@ -661,9 +1567,9 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should clean up leaked IP addresses", func() {
 		// Add a new block with one allocation - on a valid node but no corresponding pod.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -672,17 +1578,17 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Start the controller.
 		c.Start(stopChan)
-		var node *v1.Node
-		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		idx := 0
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -690,8 +1596,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       "test-pod",
 						ipam.AttributeNamespace: "test-namespace",
@@ -705,7 +1611,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for internal caches to update.
 		Eventually(func() bool {
@@ -733,9 +1639,9 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should handle blocks losing their affinity", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		kn := v1.Node{}
@@ -750,7 +1656,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Name = "test-pod"
 		pod.Namespace = "test-namespace"
 		pod.Spec.NodeName = "kname"
-		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
+		_, err = createPod(context.TODO(), cs, &pod)
 		Expect(err).NotTo(HaveOccurred())
 		var gotPod *v1.Pod
 		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
@@ -763,7 +1669,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -771,8 +1677,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -786,7 +1692,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for controller state to update. The block
 		// should appear in allBlocks.
@@ -801,7 +1707,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
-			_, ok := c.allocationsByNode["cnode"]
+			_, ok := c.allocationState.allocationsByNode["cnode"]
 			return ok
 		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
 
@@ -813,8 +1719,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -827,7 +1733,7 @@ var _ = Describe("IPAM controller UTs", func() {
 			Value: &b2,
 		}
 		update2 := bapi.Update{KVPair: kvp2, UpdateType: bapi.UpdateTypeKVUpdated}
-		c.onUpdate(update2)
+		deliver(update2)
 
 		// Block still exists.
 		Eventually(func() bool {
@@ -841,7 +1747,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
-			_, ok := c.allocationsByNode["cnode"]
+			_, ok := c.allocationState.allocationsByNode["cnode"]
 			return ok
 		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
 
@@ -867,7 +1773,7 @@ var _ = Describe("IPAM controller UTs", func() {
 				Value: &b3,
 			}
 			update3 := bapi.Update{KVPair: kvp3, UpdateType: bapi.UpdateTypeKVUpdated}
-			c.onUpdate(update3)
+			deliver(update3)
 		})
 
 		// Block still exists, but is empty. Note: In a real system,
@@ -883,7 +1789,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
-			_, ok := c.allocationsByNode["cnode"]
+			_, ok := c.allocationState.allocationsByNode["cnode"]
 			return ok
 		}, 1*time.Second, 100*time.Millisecond).Should(BeFalse())
 
@@ -897,11 +1803,12 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should NOT clean up IPs if another valid IP shares the handle", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
+
 		kn := v1.Node{}
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
@@ -919,7 +1826,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Spec.NodeName = "kname"
 		pod.Status.PodIP = "10.0.0.0"
 		pod.Status.PodIPs = []v1.PodIP{{IP: "10.0.0.0"}}
-		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
+		_, err = createPod(context.TODO(), cs, &pod)
 		Expect(err).NotTo(HaveOccurred())
 		var gotPod *v1.Pod
 		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
@@ -929,7 +1836,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -937,8 +1844,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -951,11 +1858,11 @@ var _ = Describe("IPAM controller UTs", func() {
 			Value: &b,
 		}
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Allocate an IPv6 address to the pod as well.
 		cidrv6 := net.MustParseCIDR("fe80::00/126")
-		key2 := model.BlockKey{CIDR: cidrv6}
+		key2 := model.BlockKey{CIDR: model.PrefixFromIPNet(cidrv6)}
 		b2 := model.AllocationBlock{
 			CIDR:        cidrv6,
 			Affinity:    &aff,
@@ -963,8 +1870,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -977,7 +1884,7 @@ var _ = Describe("IPAM controller UTs", func() {
 			Value: &b2,
 		}
 		updateV6 := bapi.Update{KVPair: kvpV6, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(updateV6)
+		deliver(updateV6)
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -1005,7 +1912,7 @@ var _ = Describe("IPAM controller UTs", func() {
 				// Should have two allocations.
 				done := c.pause()
 				defer done()
-				return len(c.allocationsByNode["cnode"])
+				return len(c.allocationState.allocationsByNode["cnode"])
 			}, 1*time.Second, 100*time.Millisecond).Should(Equal(2))
 		})
 
@@ -1019,7 +1926,7 @@ var _ = Describe("IPAM controller UTs", func() {
 			Consistently(func() bool {
 				done := c.pause()
 				defer done()
-				a := c.allocationsByNode["cnode"]["test-handle/10.0.0.0"]
+				a := c.allocationState.allocationsByNode["cnode"]["test-handle/10.0.0.0"]
 				return a.isConfirmedLeak()
 			}, assertionTimeout, 100*time.Millisecond).Should(BeFalse())
 
@@ -1027,7 +1934,7 @@ var _ = Describe("IPAM controller UTs", func() {
 			Eventually(func() bool {
 				done := c.pause()
 				defer done()
-				a := c.allocationsByNode["cnode"]["test-handle/fe80::"]
+				a := c.allocationState.allocationsByNode["cnode"]["test-handle/fe80::"]
 				return a.isConfirmedLeak()
 			}, assertionTimeout, 1*time.Second).Should(BeTrue())
 
@@ -1052,15 +1959,179 @@ var _ = Describe("IPAM controller UTs", func() {
 		})
 
 		By("Verifying final state", func() {
-			// The handle should now be marked as a leak. This may take some time, as the IPv4 address needs to go
-			// through the grace period.
+			// After the pod is deleted, all IPs sharing the handle become leaks and
+			// GC releases them. Once released, the handle is cleaned up from the tracker.
 			Eventually(func() bool {
 				done := c.pause()
 				defer done()
-				return c.handleTracker.isConfirmedLeak(handle)
-			}, assertionTimeout, 1*time.Second).Should(BeTrue())
 
-			// Confirm the IPs were released.
+				if !fakeClient.handlesReleased[handle] {
+					return false
+				}
+
+				// Verify that the handle has been removed from the handle tracker.
+				_, ok := c.handleTracker.allocationsByHandle[handle]
+				return !ok
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
+		})
+	})
+
+	It("should clean up a replaced sandbox's IP while the pod has no IP", func() {
+		n := internalapi.Node{}
+		n.Name = "cnode"
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		kn := v1.Node{}
+		kn.Name = "kname"
+		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
+
+		// The pod's sandbox was rebuilt without ever reporting an IP. Each sandbox got an
+		// allocation of its own, and the CNI plugin recorded the newer one on the pod.
+		currentSandbox := strings.Repeat("b", 64)
+		replacedSandbox := strings.Repeat("a", 64)
+		currentHandle := "k8s-pod-network." + currentSandbox
+		replacedHandle := "k8s-pod-network." + replacedSandbox
+
+		pod := v1.Pod{}
+		pod.Name = "test-pod"
+		pod.Namespace = "test-namespace"
+		pod.Spec.NodeName = "kname"
+		pod.Status.Phase = v1.PodPending
+		pod.Annotations = map[string]string{conversion.AnnotationContainerID: currentSandbox}
+		_, err = createPod(context.TODO(), cs, &pod)
+		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
+
+		c.Start(stopChan)
+
+		replacedIdx := 0
+		currentIdx := 1
+		cidr := net.MustParseCIDR("10.0.0.0/30")
+		aff := "host:cnode"
+		podAttrs := map[string]string{
+			ipam.AttributeNode:      "cnode",
+			ipam.AttributePod:       pod.Name,
+			ipam.AttributeNamespace: pod.Namespace,
+		}
+		b := model.AllocationBlock{
+			CIDR:        cidr,
+			Affinity:    &aff,
+			Allocations: []*int{&replacedIdx, &currentIdx, nil, nil},
+			Unallocated: []int{2, 3},
+			Attributes: []model.AllocationAttribute{
+				{HandleID: &replacedHandle, ActiveOwnerAttrs: podAttrs},
+				{HandleID: &currentHandle, ActiveOwnerAttrs: maps.Clone(podAttrs)},
+			},
+		}
+		kvp := model.KVPair{
+			Key:   model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)},
+			Value: &b,
+		}
+		deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+
+		Eventually(func() int {
+			done := c.pause()
+			defer done()
+			return len(c.allocationState.allocationsByNode["cnode"])
+		}, 1*time.Second, 100*time.Millisecond).Should(Equal(2))
+
+		c.onStatusUpdate(bapi.InSync)
+
+		fakeClient, ok := cli.IPAM().(*fakeIPAMClient)
+		Expect(ok).To(BeTrue())
+		Eventually(func() bool {
+			return fakeClient.handlesReleased[replacedHandle]
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
+		Consistently(func() bool {
+			return fakeClient.handlesReleased[currentHandle]
+		}, assertionTimeout, 100*time.Millisecond).Should(BeFalse())
+	})
+
+	It("should wait out the grace period for a live pod's IP when its node can't be found", func() {
+		c.config.LeakGracePeriod = &metav1.Duration{Duration: time.Hour}
+
+		// No Calico or Kubernetes node exists, as when a node lookup misses a live node. The
+		// pod is mid-ADD: its new sandbox has an allocation, but the annotation still names
+		// the sandbox before it.
+		currentSandbox := strings.Repeat("b", 64)
+		replacedSandbox := strings.Repeat("a", 64)
+		handle := "k8s-pod-network." + currentSandbox
+
+		pod := v1.Pod{}
+		pod.Name = "test-pod"
+		pod.Namespace = "test-namespace"
+		pod.Spec.NodeName = "node1"
+		pod.Status.Phase = v1.PodPending
+		pod.Annotations = map[string]string{conversion.AnnotationContainerID: replacedSandbox}
+		_, err := createPod(context.TODO(), cs, &pod)
+		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
+
+		c.Start(stopChan)
+
+		idx := 0
+		cidr := net.MustParseCIDR("10.0.0.0/30")
+		aff := "host:node1"
+		block := model.AllocationBlock{
+			CIDR:        cidr,
+			Affinity:    &aff,
+			Allocations: []*int{&idx, nil, nil, nil},
+			Unallocated: []int{1, 2, 3},
+			Attributes: []model.AllocationAttribute{
+				{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
+						ipam.AttributeNode:      "node1",
+						ipam.AttributePod:       pod.Name,
+						ipam.AttributeNamespace: pod.Namespace,
+					},
+				},
+			},
+		}
+		kvp := model.KVPair{
+			Key:   model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)},
+			Value: &block,
+		}
+		deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+
+		Eventually(func() int {
+			done := c.pause()
+			defer done()
+			return len(c.allocationState.allocationsByNode["node1"])
+		}, 1*time.Second, 100*time.Millisecond).Should(Equal(1))
+
+		c.onStatusUpdate(bapi.InSync)
+
+		allocID := handle + "/10.0.0.0"
+		fakeClient, ok := cli.IPAM().(*fakeIPAMClient)
+		Expect(ok).To(BeTrue())
+		By("holding the live pod's IP as a candidate leak", func() {
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode["node1"][allocID]
+				return a != nil && a.isCandidateLeak()
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
+			Consistently(func() bool {
+				return fakeClient.handlesReleased[handle]
+			}, assertionTimeout, 100*time.Millisecond).Should(BeFalse())
+			Expect(fakeClient.affinityReleased("node1")).To(BeFalse())
+		})
+
+		By("releasing it at once when the pod is deleted", func() {
+			err := cs.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			var deleted *v1.Pod
+			Eventually(pods).WithTimeout(time.Second).Should(Receive(&deleted))
+			c.OnKubernetesPodDeleted(deleted)
+
 			Eventually(func() bool {
 				return fakeClient.handlesReleased[handle]
 			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
@@ -1072,9 +2143,9 @@ var _ = Describe("IPAM controller UTs", func() {
 		c.config.LeakGracePeriod = &metav1.Duration{Duration: 0 * time.Second}
 
 		// Add a new block with one allocation - on a valid node but no corresponding pod.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1093,7 +2164,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -1101,8 +2172,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       "test-pod",
 						ipam.AttributeNamespace: "test-namespace",
@@ -1116,7 +2187,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for internal caches to update.
 		Eventually(func() bool {
@@ -1144,9 +2215,9 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should clean up empty blocks", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		kn := v1.Node{}
@@ -1161,7 +2232,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Name = "test-pod"
 		pod.Namespace = "test-namespace"
 		pod.Spec.NodeName = "kname"
-		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
+		_, err = createPod(context.TODO(), cs, &pod)
 		Expect(err).NotTo(HaveOccurred())
 		var gotPod *v1.Pod
 		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
@@ -1174,7 +2245,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -1182,8 +2253,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{1, 2, 3},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -1197,7 +2268,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for controller state to update. The block
 		// should appear in allBlocks.
@@ -1212,13 +2283,13 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
-			_, ok := c.allocationsByNode["cnode"]
+			_, ok := c.allocationState.allocationsByNode["cnode"]
 			return ok
 		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 		// Add a new block with no allocations.
 		cidr2 := net.MustParseCIDR("10.0.0.4/30")
-		key2 := model.BlockKey{CIDR: cidr2}
+		key2 := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr2)}
 		b2 := model.AllocationBlock{
 			CIDR:        cidr2,
 			Affinity:    &aff,
@@ -1231,7 +2302,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR2 := kvp2.Key.(model.BlockKey).CIDR.String()
 		update2 := bapi.Update{KVPair: kvp2, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update2)
+		deliver(update2)
 
 		// The controller should now recognize an empty block.
 		Eventually(func() bool {
@@ -1253,11 +2324,12 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should clean up empty blocks even if the node is full", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
+
 		kn := v1.Node{}
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
@@ -1270,7 +2342,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Name = "test-pod"
 		pod.Namespace = "test-namespace"
 		pod.Spec.NodeName = "kname"
-		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
+		_, err = createPod(context.TODO(), cs, &pod)
 		Expect(err).NotTo(HaveOccurred())
 		var gotPod *v1.Pod
 		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
@@ -1283,7 +2355,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		handle := "test-handle"
 		cidr := net.MustParseCIDR("10.0.0.0/30")
 		aff := "host:cnode"
-		key := model.BlockKey{CIDR: cidr}
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 		b := model.AllocationBlock{
 			CIDR:        cidr,
 			Affinity:    &aff,
@@ -1291,8 +2363,8 @@ var _ = Describe("IPAM controller UTs", func() {
 			Unallocated: []int{},
 			Attributes: []model.AllocationAttribute{
 				{
-					AttrPrimary: &handle,
-					AttrSecondary: map[string]string{
+					HandleID: &handle,
+					ActiveOwnerAttrs: map[string]string{
 						ipam.AttributeNode:      "cnode",
 						ipam.AttributePod:       pod.Name,
 						ipam.AttributeNamespace: pod.Namespace,
@@ -1306,7 +2378,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
 		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update)
+		deliver(update)
 
 		// Wait for controller state to update. The block
 		// should appear in allBlocks.
@@ -1321,13 +2393,13 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(func() bool {
 			done := c.pause()
 			defer done()
-			_, ok := c.allocationsByNode["cnode"]
+			_, ok := c.allocationState.allocationsByNode["cnode"]
 			return ok
 		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 		// Add a new block with no allocations.
 		cidr2 := net.MustParseCIDR("10.0.0.4/30")
-		key2 := model.BlockKey{CIDR: cidr2}
+		key2 := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr2)}
 		b2 := model.AllocationBlock{
 			CIDR:        cidr2,
 			Affinity:    &aff,
@@ -1340,7 +2412,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		blockCIDR2 := kvp2.Key.(model.BlockKey).CIDR.String()
 		update2 := bapi.Update{KVPair: kvp2, UpdateType: bapi.UpdateTypeKVNew}
-		c.onUpdate(update2)
+		deliver(update2)
 
 		// The controller should now recognize an empty block.
 		Eventually(func() bool {
@@ -1365,11 +2437,12 @@ var _ = Describe("IPAM controller UTs", func() {
 
 	It("should NOT clean up all blocks assigned to a node", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
+
 		kn := v1.Node{}
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
@@ -1382,7 +2455,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Name = "test-pod"
 		pod.Namespace = "test-namespace"
 		pod.Spec.NodeName = "kname"
-		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
+		_, err = createPod(context.TODO(), cs, &pod)
 		Expect(err).NotTo(HaveOccurred())
 		var gotPod *v1.Pod
 		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
@@ -1391,14 +2464,14 @@ var _ = Describe("IPAM controller UTs", func() {
 		c.Start(stopChan)
 
 		// Add 5 empty blocks to the node.
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			unallocated := make([]int, 64)
-			for i := 0; i < len(unallocated); i++ {
+			for i := range unallocated {
 				unallocated[i] = i
 			}
 			cidr := net.MustParseCIDR(fmt.Sprintf("10.0.%d.0/24", i))
 			aff := "host:cnode"
-			key := model.BlockKey{CIDR: cidr}
+			key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 			b := model.AllocationBlock{
 				CIDR:        cidr,
 				Affinity:    &aff,
@@ -1411,7 +2484,7 @@ var _ = Describe("IPAM controller UTs", func() {
 				Value: &b,
 			}
 			update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-			c.onUpdate(update)
+			deliver(update)
 		}
 
 		// Wait for controller state to update with all blocks.
@@ -1453,9 +2526,9 @@ var _ = Describe("IPAM controller UTs", func() {
 	// Reference: https://github.com/projectcalico/calico/issues/7987
 	It("should clean up small IPAM blocks", func() {
 		// Create Calico and k8s nodes for the test.
-		n := libapiv3.Node{}
+		n := internalapi.Node{}
 		n.Name = "cnode"
-		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
 		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		kn := v1.Node{}
@@ -1470,14 +2543,14 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		// Add small, empty blocks to the node.
 		// Use a block size of 31, resulting in 2 allocations per block.
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			unallocated := make([]int, 64)
-			for i := 0; i < len(unallocated); i++ {
+			for i := range unallocated {
 				unallocated[i] = i
 			}
 			cidr := net.MustParseCIDR(fmt.Sprintf("10.0.%d.0/31", i))
 			aff := "host:cnode"
-			key := model.BlockKey{CIDR: cidr}
+			key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
 			b := model.AllocationBlock{
 				CIDR:        cidr,
 				Affinity:    &aff,
@@ -1490,7 +2563,7 @@ var _ = Describe("IPAM controller UTs", func() {
 				Value: &b,
 			}
 			update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
-			c.onUpdate(update)
+			deliver(update)
 		}
 
 		// Wait for controller state to update with all blocks.
@@ -1526,4 +2599,700 @@ var _ = Describe("IPAM controller UTs", func() {
 		Eventually(numBlocks, 1*time.Second, 100*time.Millisecond).Should(Equal(1))
 		Consistently(numBlocks, assertionTimeout, 100*time.Millisecond).Should(Equal(1))
 	})
+
+	It("should delete empty IPAM blocks when the node no longer exists", func() {
+		// This testcase handles an edge case in our code, to make sure we spot node affinities that
+		// must be released even when there are no allocations in the block. Since much of the GC controller logic
+		// is based on allocations, it's important to have an explicit test for this case.
+
+		// Create an empty block with an affinity to a node that doesn't exist. Then, trigger a full GC cycle. The controller
+		// should spot the empty block and release it.
+		deliver(createBlock(nil, "dead-node", "10.0.0.0/26"))
+
+		// Start the controller.
+		c.Start(stopChan)
+
+		// Mark the syncer as InSync so that the GC will be enabled.
+		c.fullScanNextSync("forced by test")
+		c.onStatusUpdate(bapi.InSync)
+
+		// Expect the block to be released.
+		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("dead-node")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "Affinity for dead-node should be released")
+	})
+
+	Context("with a 1hr grace period", func() {
+		ns := "test-namespace"
+		podsNode1 := []v1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod1-1", Namespace: ns},
+				Spec:       v1.PodSpec{NodeName: "node1"},
+				Status:     v1.PodStatus{PodIP: "10.0.1.1", PodIPs: []v1.PodIP{{IP: "10.0.1.1"}}},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod1-2", Namespace: ns},
+				Spec:       v1.PodSpec{NodeName: "node1"},
+				Status:     v1.PodStatus{PodIP: "10.0.1.2", PodIPs: []v1.PodIP{{IP: "10.0.1.2"}}},
+			},
+		}
+		podsNode2 := []v1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod2-1", Namespace: ns},
+				Spec:       v1.PodSpec{NodeName: "node2"},
+				Status:     v1.PodStatus{PodIP: "10.0.2.1", PodIPs: []v1.PodIP{{IP: "10.0.2.1"}}},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod2-2", Namespace: ns},
+				Spec:       v1.PodSpec{NodeName: "node2"},
+				Status:     v1.PodStatus{PodIP: "10.0.2.2", PodIPs: []v1.PodIP{{IP: "10.0.2.2"}}},
+			},
+		}
+
+		BeforeEach(func() {
+			// Set the controller's grace period to a large value, to take the periodic GC out of the equation.
+			// This suite of tests is focused on response to events, not periodic GC.
+			c.config.LeakGracePeriod = &metav1.Duration{Duration: 1 * time.Hour}
+
+			// Create Calico and k8s nodes for the test.
+			for _, name := range []string{"node1", "node2"} {
+				n := internalapi.Node{}
+				n.Name = name
+				n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: name, Orchestrator: apiv3.OrchestratorKubernetes}}
+				_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+
+				kn := v1.Node{}
+				kn.Name = name
+				_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				var node *v1.Node
+				Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
+			}
+
+			// Create some pods in the API, across two different nodes.
+			for _, p := range append(podsNode1, podsNode2...) {
+				_, err := createPod(context.TODO(), cs, &p)
+				Expect(err).NotTo(HaveOccurred())
+				var gotPod *v1.Pod
+				Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
+			}
+
+			// Create some IPAM blocks, assigning IPs to the pods.
+			deliver(createBlock(podsNode1, "node1", "10.0.1.0/24"))
+			deliver(createBlock(podsNode2, "node2", "10.0.2.0/24"))
+
+			// Mark the syncer as InSync so that the GC will be enabled.
+			c.onStatusUpdate(bapi.InSync)
+
+			// Start the controller.
+			c.Start(stopChan)
+		})
+
+		It("should handle node deletion events", func() {
+			// Delete node1.
+			Expect(cs.CoreV1().Nodes().Delete(context.TODO(), "node1", metav1.DeleteOptions{})).NotTo(HaveOccurred())
+			c.OnKubernetesNodeDeleted(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}})
+			Eventually(nodes).WithTimeout(time.Second).Should(Receive())
+
+			// The allocations won't be marked as leaked yet, since the controller is confused about the node's status (deleted,
+			// but still has pods).
+			Eventually(func() error {
+				done := c.pause()
+				defer done()
+				if _, ok := c.allocationState.allocationsByNode["node1"]; !ok {
+					return fmt.Errorf("node1 not found")
+				}
+				if _, ok := c.allocationState.allocationsByNode["node1"]["pod1-1/10.0.1.1"]; !ok {
+					return fmt.Errorf("allocation not found")
+				}
+				if c.allocationState.allocationsByNode["node1"]["pod1-1/10.0.1.1"].leakedAt != nil {
+					return fmt.Errorf("allocation was marked as leaked")
+				}
+				return nil
+			}, 15*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred())
+
+			// Delete the pods too.
+			Expect(cs.CoreV1().Pods(ns).Delete(context.TODO(), podsNode1[0].Name, metav1.DeleteOptions{})).NotTo(HaveOccurred())
+			Expect(cs.CoreV1().Pods(ns).Delete(context.TODO(), podsNode1[1].Name, metav1.DeleteOptions{})).NotTo(HaveOccurred())
+
+			// Trigger another sync.
+			c.OnKubernetesNodeDeleted(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}})
+
+			// All state should be cleaned up now.
+			fakeClient := cli.IPAM().(*fakeIPAMClient)
+			Eventually(func() error {
+				done := c.pause()
+				defer done()
+				if _, ok := c.allocationState.allocationsByNode["node1"]; ok {
+					return fmt.Errorf("node1 still being tracked")
+				}
+				if !fakeClient.affinityReleased("node1") {
+					return fmt.Errorf("node1 affinity not released")
+				}
+				if len(fakeClient.handlesReleased) != 2 {
+					return fmt.Errorf("expected 2 handles to be released, got %d", len(fakeClient.handlesReleased))
+				}
+				return nil
+			}, 15*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred())
+		})
+	})
+
+	Context("with a large number of nodes and allocations", func() {
+		// This is a sort of stress test to see how well the controller handles a large number of nodes and allocations.
+		numNodes := 1000
+		podsPerNode := 5
+
+		var allPods []v1.Pod
+		var allBlocks []bapi.Update
+
+		// We need a separate fake clientset with a large watcher buffer for bulk creation,
+		// and direct access to the informer store for fast pod population.
+		var scaleCS kubernetes.Interface
+		var scalePodIndexer cache.Indexer
+		var scaleNodeIndexer cache.Indexer
+
+		BeforeEach(func() {
+			// Create a new fake clientset for the scale test. We'll populate the informer
+			// caches directly to avoid the slow create→watch→inform round-trip.
+			scaleCS = fake.NewClientset()
+
+			scaleFactory := informers.NewSharedInformerFactory(scaleCS, 0)
+			scalePodInformer := scaleFactory.Core().V1().Pods().Informer()
+			scaleNodeInformer := scaleFactory.Core().V1().Nodes().Informer()
+			scaleFactory.Start(stopChan)
+			Expect(cache.WaitForCacheSync(stopChan, scalePodInformer.HasSynced, scaleNodeInformer.HasSynced)).To(BeTrue(), "informer caches failed to sync")
+
+			scalePodIndexer = scalePodInformer.GetIndexer()
+			scaleNodeIndexer = scaleNodeInformer.GetIndexer()
+
+			// Recreate the controller with the scale-specific indexers and clientset.
+			cfg := config.NodeControllerConfig{
+				LeakGracePeriod: &metav1.Duration{Duration: 1 * time.Hour},
+			}
+			dataFeed = utils.NewDataFeed(cli, "kubernetes")
+			c = NewIPAMController(cfg, cli, scaleCS, scalePodIndexer, scaleNodeIndexer, deferredInformers, utils.NewIPAMFeed(dataFeed).Tracker())
+			c.RegisterWith(dataFeed)
+			c.consolidationWindow = 1 * time.Second
+
+			// Start the controller.
+			c.Start(stopChan)
+
+			// Create Calico nodes via the fake Calico client, and add K8s nodes
+			// directly to the informer cache to avoid watch channel overflow.
+			for i := range numNodes {
+				n := internalapi.Node{}
+				n.Name = fmt.Sprintf("node%d", i)
+				n.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: n.Name, Orchestrator: apiv3.OrchestratorKubernetes}}
+				_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+
+				kn := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: n.Name}}
+				Expect(scaleNodeIndexer.Add(kn)).NotTo(HaveOccurred())
+			}
+
+			// Build pods and blocks in memory, then add pods directly to the indexer.
+			// This bypasses the fake K8s client entirely for bulk creation, avoiding
+			// the serial create→watch→inform bottleneck that previously took ~60s.
+			t := converter.PodTransformer(true)
+			for nodeNum := range numNodes {
+				baseIPInt := big.NewInt(int64(0x0a000000 + nodeNum*64))
+				baseIP := net.BigIntToIP(baseIPInt, false)
+				blockCIDR := fmt.Sprintf("%s/26", baseIP.String())
+
+				podIP := baseIP
+				nodeName := fmt.Sprintf("node%d", nodeNum)
+				nodePods := []v1.Pod{}
+				for podNum := range podsPerNode {
+					p := v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      fmt.Sprintf("pod%d-%d", nodeNum, podNum),
+							Namespace: "test-namespace",
+						},
+						Spec: v1.PodSpec{NodeName: nodeName},
+						Status: v1.PodStatus{
+							PodIP:  podIP.String(),
+							PodIPs: []v1.PodIP{{IP: podIP.String()}},
+						},
+					}
+					allPods = append(allPods, p)
+					nodePods = append(nodePods, p)
+					podIP = net.IncrementIP(podIP, big.NewInt(1))
+				}
+				allBlocks = append(allBlocks, createBlock(nodePods, nodeName, blockCIDR))
+			}
+
+			// Add all pods to the indexer. Apply the same transformer used by production code.
+			for i := range allPods {
+				transformed, err := t(&allPods[i])
+				Expect(err).NotTo(HaveOccurred())
+				Expect(scalePodIndexer.Add(transformed)).NotTo(HaveOccurred())
+			}
+
+			By("Sending updates for all blocks")
+			for _, u := range allBlocks {
+				deliver(u)
+			}
+			c.onStatusUpdate(bapi.InSync)
+
+			By("Waiting for controller to be in sync")
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				return len(c.allBlocks) == numNodes
+			}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				return len(c.allocationState.dirtyNodes) == 0
+			}, 10*time.Second, 100*time.Millisecond).Should(BeTrue(), "Controller did not process all blocks")
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				return c.fullSyncRequired
+			}, 5*time.Second, 100*time.Millisecond).Should(BeFalse())
+		})
+
+		It("should detect a leaked IP reasonably quickly", func() {
+			By("Deleting a pod to trigger a leak")
+
+			// Delete one of the pods to trigger a leak, and check that the controller detects it.
+			// Remove it from the indexer (so the pod lister can't find it) and notify the controller.
+			pod := allPods[numNodes-1]
+			Expect(scalePodIndexer.Delete(&pod)).NotTo(HaveOccurred())
+			c.OnKubernetesPodDeleted(&pod)
+
+			// Delete a pod on node 0 but don't inform the controller. This should not trigger a leak,
+			// since the controller is not aware of the pod deletion.
+			pod2 := allPods[0]
+			Expect(scalePodIndexer.Delete(&pod2)).NotTo(HaveOccurred())
+
+			// Wait for the controller to detect the leak. This should happen quickly, since the controller
+			// will only need to process a single block.
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode[pod.Spec.NodeName][fmt.Sprintf("%s/%s", pod.Name, pod.Status.PodIP)]
+				return a.leakedAt != nil
+			}, 3*time.Second, 100*time.Millisecond).Should(BeTrue(), "IP was not marked as leaked")
+			Consistently(func() bool {
+				// While it would not be WRONG to mark the other pod as leaked, we know that the controller won't do so
+				// because we haven't told it the pod was deleted. This verifies that the controller is doing work incrementally based
+				// on the events it receives, rather than brute force syncing.
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode[pod2.Spec.NodeName][fmt.Sprintf("%s/%s", pod2.Name, pod2.Status.PodIP)]
+				return a.leakedAt == nil
+			}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "IP was unexpected marked as leaked")
+
+			By("Triggering a full IPAM scan")
+			// Now do a brute force full scan to ensure that the controller eventually catches up.
+			c.fullScanNextSync("forced by test")
+			c.onStatusUpdate(bapi.InSync)
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				a := c.allocationState.allocationsByNode[pod2.Spec.NodeName][fmt.Sprintf("%s/%s", pod2.Name, pod2.Status.PodIP)]
+				return a.leakedAt != nil
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue(), "IP was not marked as leaked")
+		})
+	})
+
+	It("should clean up node with tunnel IPs in a single sync pass", func() {
+		// Start the controller.
+		c.Start(stopChan)
+
+		// Create a block with a tunnel address allocation for a node that doesn't exist.
+		tunnelHandle := "vxlan-tunnel-addr-dead-node"
+		cidr := net.MustParseCIDR("10.0.0.0/30")
+		aff := "host:dead-node"
+		idx := 0
+		key := model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}
+		b := model.AllocationBlock{
+			CIDR:        cidr,
+			Affinity:    &aff,
+			Allocations: []*int{&idx, nil, nil, nil},
+			Unallocated: []int{1, 2, 3},
+			Attributes: []model.AllocationAttribute{
+				{
+					HandleID: &tunnelHandle,
+					ActiveOwnerAttrs: map[string]string{
+						ipam.AttributeNode: "dead-node",
+						ipam.AttributeType: ipam.AttributeTypeVXLAN,
+					},
+				},
+			},
+		}
+		kvp := model.KVPair{Key: key, Value: &b}
+		update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
+		deliver(update)
+
+		// Wait for internal caches to update.
+		blockCIDR := kvp.Key.(model.BlockKey).CIDR.String()
+		Eventually(func() bool {
+			done := c.pause()
+			defer done()
+			_, ok := c.allBlocks[blockCIDR]
+			return ok
+		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+		// Mark the syncer as InSync and trigger a full scan.
+		c.fullScanNextSync("forced by test")
+		c.onStatusUpdate(bapi.InSync)
+
+		// Both the tunnel IP GC and the node affinity release should eventually complete.
+		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		Eventually(func() bool {
+			return fakeClient.handlesReleased[tunnelHandle]
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "Tunnel IP handle should be released via GC")
+
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("dead-node")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "Node affinity should be released")
+	})
+
+	// Regression test for https://github.com/projectcalico/calico/issues/8643
+	//
+	// Scenario: When nodes are rapidly scaled down, the IPAM GC controller can get
+	// stuck in an infinite retry loop. The root cause is that if
+	// ReleaseHostAffinities(mustBeEmpty=true) fails (e.g., because blocks still have
+	// allocations due to a race between IP release and block update propagation),
+	// dirty nodes accumulated and each subsequent sync processed more and more
+	// nodes, increasing contention and making recovery impossible.
+	//
+	// The fix uses incremental dirty-node tracking: each node is individually marked
+	// clean as it is successfully processed or released. Failed nodes simply remain
+	// dirty and are retried on the next pass.
+	//
+	// This test creates three deleted nodes, injects cleanup errors for two of them,
+	// and verifies that:
+	//   - The healthy node is cleaned up immediately
+	//   - The failing nodes are retained and retried
+	//   - As errors are cleared, each node is eventually cleaned up
+	It("should not get stuck when node cleanup fails (issue #8643)", func() {
+		// Start the controller.
+		c.Start(stopChan)
+
+		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		fc := cli.(*FakeCalicoClient)
+
+		// Inject errors for node-b and node-c to simulate "block not empty" failures.
+		// node-a will succeed immediately.
+		fc.SetReleaseHostAffinityError("node-b", fmt.Errorf("block is not empty"))
+		fc.SetReleaseHostAffinityError("node-c", fmt.Errorf("block is not empty"))
+
+		// Create blocks with tunnel address allocations for three nodes that don't
+		// exist in Kubernetes (simulating node deletion during scale-down).
+		type testNode struct {
+			name   string
+			cidr   string
+			handle string
+		}
+		nodes := []testNode{
+			{"node-a", "10.0.0.0/30", "vxlan-tunnel-addr-node-a"},
+			{"node-b", "10.0.1.0/30", "vxlan-tunnel-addr-node-b"},
+			{"node-c", "10.0.2.0/30", "vxlan-tunnel-addr-node-c"},
+		}
+		for _, n := range nodes {
+			cidr := net.MustParseCIDR(n.cidr)
+			aff := fmt.Sprintf("host:%s", n.name)
+			handle := n.handle
+			idx := 0
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes: []model.AllocationAttribute{
+					{
+						HandleID: &handle,
+						ActiveOwnerAttrs: map[string]string{
+							ipam.AttributeNode: n.name,
+							ipam.AttributeType: ipam.AttributeTypeVXLAN,
+						},
+					},
+				},
+			}
+			kvp := model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+			deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+		}
+
+		// Wait for all blocks to be cached.
+		for _, n := range nodes {
+			cidr := n.cidr
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[cidr]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue(), "Block %s should be cached", cidr)
+		}
+
+		// Trigger a full sync.
+		c.fullScanNextSync("forced by test")
+		c.onStatusUpdate(bapi.InSync)
+
+		// node-a should be cleaned up (no error injected).
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-a")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-a affinity should be released")
+
+		// node-b and node-c should NOT be released — their cleanup is failing.
+		Consistently(func() bool {
+			return fakeClient.affinityReleased("node-b") || fakeClient.affinityReleased("node-c")
+		}, 2*time.Second, 100*time.Millisecond).Should(BeFalse(), "node-b and node-c should not be released while errors persist")
+
+		// Verify that the dirty node count is bounded — it should only contain the two failing
+		// nodes, not grow unbounded across syncs.
+		done := c.pause()
+		Expect(len(c.allocationState.dirtyNodes)).To(BeNumerically("<=", 2),
+			"dirty node count should not grow unbounded")
+		done()
+
+		// Clear the error for node-b. The retry controller will eventually schedule
+		// another sync and node-b should be cleaned up.
+		fc.SetReleaseHostAffinityError("node-b", nil)
+
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-b")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-b affinity should be released after error is cleared")
+
+		// node-c should still be failing.
+		Expect(fakeClient.affinityReleased("node-c")).To(BeFalse(), "node-c should still be stuck")
+
+		// Clear the error for node-c.
+		fc.SetReleaseHostAffinityError("node-c", nil)
+
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-c")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-c affinity should be released after error is cleared")
+	})
+
+	// Regression test: a stale-revision conflict during the cold IP GC sweep must not
+	// abort the whole IPAM sync. The controller GCs blocks using cached revisions from
+	// the syncer, so conflicts with concurrent writers are routine; before the fix, the
+	// first ErrorResourceUpdateConflict aborted syncIPAM before releaseUnusedBlocks and
+	// releaseNodes, so a single contended block starved deleted-node cleanup indefinitely.
+	It("should clean up deleted nodes even when cold IP GC hits update conflicts", func() {
+		c.Start(stopChan)
+
+		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		fc := cli.(*FakeCalicoClient)
+
+		// node-gc-a's block persistently fails cold GC with a CAS conflict, as happens
+		// when the syncer cache is stale relative to the datastore.
+		fc.SetColdGCError("10.1.0.0/30", cerrors.ErrorResourceUpdateConflict{Identifier: "10.1.0.0/30"})
+
+		// Create blocks with tunnel address allocations for two nodes that don't exist
+		// in Kubernetes.
+		type testNode struct {
+			name   string
+			cidr   string
+			handle string
+		}
+		nodes := []testNode{
+			{"node-gc-a", "10.1.0.0/30", "vxlan-tunnel-addr-node-gc-a"},
+			{"node-gc-b", "10.1.1.0/30", "vxlan-tunnel-addr-node-gc-b"},
+		}
+		// The cold IP GC sweep only visits blocks with an elapsed cooldown IP.
+		releasedAt := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+		for _, n := range nodes {
+			cidr := net.MustParseCIDR(n.cidr)
+			aff := fmt.Sprintf("host:%s", n.name)
+			handle := n.handle
+			idx := 0
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes: []model.AllocationAttribute{
+					{
+						HandleID:   &handle,
+						ReleasedAt: &releasedAt,
+						ActiveOwnerAttrs: map[string]string{
+							ipam.AttributeNode: n.name,
+							ipam.AttributeType: ipam.AttributeTypeVXLAN,
+						},
+					},
+				},
+			}
+			kvp := model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+			deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+		}
+
+		// Wait for all blocks to be cached.
+		for _, n := range nodes {
+			cidr := n.cidr
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[cidr]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue(), "Block %s should be cached", cidr)
+		}
+
+		// Trigger a full sync.
+		c.fullScanNextSync("forced by test")
+		c.onStatusUpdate(bapi.InSync)
+
+		// Despite the persistent conflict on node-gc-a's block, both nodes should be
+		// cleaned up: the conflict only skips that block's GC, not the rest of the sync.
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-gc-a")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-gc-a affinity should be released despite cold GC conflict")
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-gc-b")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-gc-b affinity should be released")
+
+		// The sweep should also have carried on past the conflicting block.
+		Expect(fakeClient.coldGCVisited("10.1.1.0/30")).To(BeTrue(), "cold GC should visit the healthy block")
+	})
+
+	// Regression test: verifies the controller makes progress even when ALL nodes fail
+	// cleanup simultaneously (zero progress in a pass). The dirty node set should stay
+	// bounded across syncs, and nodes should recover once errors clear.
+	It("should handle all nodes failing cleanup without growing dirty set", func() {
+		c.Start(stopChan)
+
+		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		fc := cli.(*FakeCalicoClient)
+
+		// Inject errors for ALL nodes.
+		fc.SetReleaseHostAffinityError("node-x", fmt.Errorf("block is not empty"))
+		fc.SetReleaseHostAffinityError("node-y", fmt.Errorf("block is not empty"))
+
+		type testNode struct {
+			name   string
+			cidr   string
+			handle string
+		}
+		nodes := []testNode{
+			{"node-x", "10.0.10.0/30", "vxlan-tunnel-addr-node-x"},
+			{"node-y", "10.0.11.0/30", "vxlan-tunnel-addr-node-y"},
+		}
+		for _, n := range nodes {
+			cidr := net.MustParseCIDR(n.cidr)
+			aff := fmt.Sprintf("host:%s", n.name)
+			handle := n.handle
+			idx := 0
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: []*int{&idx, nil, nil, nil},
+				Unallocated: []int{1, 2, 3},
+				Attributes: []model.AllocationAttribute{
+					{
+						HandleID: &handle,
+						ActiveOwnerAttrs: map[string]string{
+							ipam.AttributeNode: n.name,
+							ipam.AttributeType: ipam.AttributeTypeVXLAN,
+						},
+					},
+				},
+			}
+			kvp := model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &b}
+			deliver(bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew})
+		}
+
+		// Wait for blocks to be cached.
+		for _, n := range nodes {
+			cidr := n.cidr
+			Eventually(func() bool {
+				done := c.pause()
+				defer done()
+				_, ok := c.allBlocks[cidr]
+				return ok
+			}, 1*time.Second, 100*time.Millisecond).Should(BeTrue(), "Block %s should be cached", cidr)
+		}
+
+		// Trigger a full sync.
+		c.fullScanNextSync("forced by test")
+		c.onStatusUpdate(bapi.InSync)
+
+		// Neither node should be released since all are failing.
+		Consistently(func() bool {
+			return fakeClient.affinityReleased("node-x") || fakeClient.affinityReleased("node-y")
+		}, 2*time.Second, 100*time.Millisecond).Should(BeFalse(), "no nodes should be released while all errors persist")
+
+		// Dirty node count should stay bounded at the number of failing nodes (2),
+		// not grow across repeated sync attempts.
+		done := c.pause()
+		Expect(len(c.allocationState.dirtyNodes)).To(BeNumerically("<=", 2),
+			"dirty node count should not grow unbounded when all nodes fail")
+		done()
+
+		// Clear errors — both nodes should recover.
+		fc.SetReleaseHostAffinityError("node-x", nil)
+		fc.SetReleaseHostAffinityError("node-y", nil)
+
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-x")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-x should be released after error is cleared")
+
+		Eventually(func() bool {
+			return fakeClient.affinityReleased("node-y")
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue(), "node-y should be released after error is cleared")
+	})
 })
+
+// createBlock creates a block based on the given pods and CIDR, and sends it as an update to the controller.
+func createBlock(pods []v1.Pod, host, cidrStr string) bapi.Update {
+	var affinity *string
+	if host != "" {
+		aff := fmt.Sprintf("host:%s", host)
+		affinity = &aff
+	}
+	cidr := net.MustParseCIDR(cidrStr)
+
+	// Create a bootstrap block for access to IPToOrdinal.
+	block := model.AllocationBlock{CIDR: cidr}
+
+	assignments := map[int]int{}
+	attrs := []model.AllocationAttribute{}
+	for i, pod := range pods {
+		attrs = append(attrs, model.AllocationAttribute{
+			HandleID: &pod.Name,
+			ActiveOwnerAttrs: map[string]string{
+				ipam.AttributeNode:      host,
+				ipam.AttributePod:       pod.Name,
+				ipam.AttributeNamespace: pod.Namespace,
+			},
+		})
+		ord, err := block.IPToOrdinal(net.MustParseIP(pod.Status.PodIP))
+		Expect(err).NotTo(HaveOccurred())
+		assignments[ord] = i
+	}
+
+	alloc, unalloc := makeAllocationsArrays(int(cidr.Network().NumAddrs().Int64()), assignments)
+	block = model.AllocationBlock{
+		CIDR:        cidr,
+		Affinity:    affinity,
+		Allocations: alloc,
+		Unallocated: unalloc,
+		Attributes:  attrs,
+	}
+	kvp := model.KVPair{Key: model.BlockKey{CIDR: model.PrefixFromIPNet(cidr)}, Value: &block}
+	return bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
+}
+
+// makeAllocationsArray creates an array of pointers to integers, with the given assignments.
+// assigned is a map of ordinal to attribute index.
+func makeAllocationsArrays(n int, assinged map[int]int) ([]*int, []int) {
+	allocs := make([]*int, n)
+	for i := range allocs {
+		allocs[i] = nil
+	}
+	for k, v := range assinged {
+		allocs[k] = &v
+	}
+
+	unalloc := []int{}
+	for i := range allocs {
+		if allocs[i] == nil {
+			unalloc = append(unalloc, i)
+		}
+	}
+	return allocs, unalloc
+}

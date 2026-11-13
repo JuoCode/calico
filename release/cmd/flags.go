@@ -1,0 +1,728 @@
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/sirupsen/logrus"
+	cli "github.com/urfave/cli/v3"
+
+	"github.com/projectcalico/calico/release/internal/defaults"
+	"github.com/projectcalico/calico/release/internal/github"
+	"github.com/projectcalico/calico/release/internal/images"
+)
+
+var globalFlags = append([]cli.Flag{debugFlag}, append(ciFlags, slackFlags...)...)
+
+// Flag categories group flags in --help output.
+const (
+	gitCategory               = "Git Repository"
+	developmentCategory       = "Development"
+	containerImageCategory    = "Container Image"
+	cloudCategory             = "Cloud Configuration"
+	operatorCategory          = "Tigera Operator"
+	ciCategory                = "CI Environment"
+	slackCategory             = "Slack"
+	imageScannerCategory      = "Image Scanning Service"
+	hashreleaseServerCategory = "Hashrelease Server"
+	stepControlCategory       = "Step Control"
+)
+
+// debugFlag is a flag used to enable verbose log output
+var debugFlag = &cli.BoolFlag{
+	Name:        "debug",
+	Aliases:     []string{"d"},
+	Usage:       "Enable verbose log output",
+	Sources:     cli.EnvVars("DEBUG"),
+	Value:       false,
+	Destination: &debug,
+}
+
+// Product repository flags are flags used to interact with the product repository
+var (
+	productFlags = []cli.Flag{
+		orgFlag,
+		repoFlag,
+		repoRemoteFlag,
+		releaseBranchPrefixFlag,
+		devTagSuffixFlag,
+	}
+
+	// Git flags for interacting with the git repository
+	orgFlagName = "org"
+	orgFlag     = &cli.StringFlag{
+		Name:     orgFlagName,
+		Category: gitCategory,
+		Usage:    "The GitHub organization to use for the release",
+		Sources:  cli.NewValueSourceChain(cli.EnvVar("ORGANIZATION"), defaults.MK(defaults.KeyOrganization)),
+		Value:    defaults.Builtin(defaults.KeyOrganization),
+	}
+	repoFlagName = "repo"
+	repoFlag     = &cli.StringFlag{
+		Name:     repoFlagName,
+		Category: gitCategory,
+		Usage:    "The GitHub repository to use for the release",
+		Sources:  cli.NewValueSourceChain(cli.EnvVar("GIT_REPO"), defaults.MK(defaults.KeyGitRepo)),
+		Value:    defaults.Builtin(defaults.KeyGitRepo),
+	}
+	repoRemoteFlagName = "remote"
+	repoRemoteFlag     = &cli.StringFlag{
+		Name:     repoRemoteFlagName,
+		Category: gitCategory,
+		Usage:    "The remote for the git repository",
+		Sources:  cli.NewValueSourceChain(cli.EnvVar("GIT_REMOTE"), defaults.MK(defaults.KeyGitRemote)),
+		Value:    defaults.Builtin(defaults.KeyGitRemote),
+	}
+
+	// Branch/Tag flags are flags used for branch & tag management
+	releaseBranchPrefixFlagName = "release-branch-prefix"
+	releaseBranchPrefixFlag     = &cli.StringFlag{
+		Name:     releaseBranchPrefixFlagName,
+		Category: gitCategory,
+		Usage:    "The stardard prefix used to denote release branches",
+		Sources:  cli.NewValueSourceChain(cli.EnvVar("RELEASE_BRANCH_PREFIX"), defaults.MK(defaults.KeyReleaseBranchPrefix)),
+		Value:    defaults.Builtin(defaults.KeyReleaseBranchPrefix),
+	}
+	devTagSuffixFlagName = "dev-tag-suffix"
+	devTagSuffixFlag     = &cli.StringFlag{
+		Name:     devTagSuffixFlagName,
+		Category: gitCategory,
+		Usage:    "The suffix used to denote development tags",
+		Sources:  cli.NewValueSourceChain(cli.EnvVar("DEV_TAG_SUFFIX"), defaults.MK(defaults.KeyDevTagSuffix)),
+		Value:    defaults.Builtin(defaults.KeyDevTagSuffix),
+	}
+	mainBranchFlag = &cli.StringFlag{
+		Name:     "main-branch",
+		Category: gitCategory,
+		Usage:    "The main/default branch for the repo",
+		Sources:  cli.EnvVars("MAIN_BRANCH"),
+		Value:    defaults.Branch,
+		Action: func(_ context.Context, c *cli.Command, str string) error {
+			if str != defaults.Branch {
+				logrus.Warnf("The new branch will be created from %s which is not the default branch %s", str, defaults.Branch)
+			}
+			return nil
+		},
+	}
+)
+
+// Mode flags control the execution mode of the release tool.
+var (
+	localFlag = &cli.BoolFlag{
+		Name:    "local",
+		Usage:   "Run local actions as normal and remote changes as dry runs",
+		Sources: cli.EnvVars("LOCAL"),
+		Value:   false,
+	}
+	planFlag = &cli.BoolFlag{
+		Name:     "plan",
+		Category: stepControlCategory,
+		Sources:  cli.EnvVars("PLAN"),
+		Usage:    "Print what each step would do without acting.",
+	}
+	skipFlagName = "skip"
+	skipFlag     = func(validSteps []string) *cli.StringSliceFlag {
+		return &cli.StringSliceFlag{
+			Name:     skipFlagName,
+			Category: stepControlCategory,
+			Sources:  cli.EnvVars("SKIP_STEPS"),
+			Usage:    "Step names to skip. Valid: " + strings.Join(validSteps, ", "),
+			Action: func(_ context.Context, _ *cli.Command, vals []string) error {
+				if validSteps == nil { // no validations to run
+					return nil
+				}
+				unknown := []string{}
+				for _, v := range vals {
+					if !slices.Contains(validSteps, v) {
+						unknown = append(unknown, v)
+					}
+				}
+				if len(unknown) > 0 {
+					return fmt.Errorf("unknown --skip steps %q; valid steps: %s", unknown, strings.Join(validSteps, ", "))
+				}
+				return nil
+			},
+		}
+	}
+	forceFlag = &cli.BoolFlag{
+		Name:     "force",
+		Category: stepControlCategory,
+		Usage:    "Ignore safety check and force the action to proceed",
+		Sources:  cli.EnvVars("FORCE"),
+	}
+)
+
+// Development flags are flags used to control development behavior of the release process
+var (
+	validationFlagName = "validation"
+	validationFlag     = &cli.BoolWithInverseFlag{
+		Name:     validationFlagName,
+		Category: developmentCategory,
+		Usage:    "Run validation checks",
+		Sources:  cli.EnvVars("VALIDATION", "RELEASE_VALIDATION"),
+		Value:    true,
+		Action: func(_ context.Context, c *cli.Command, b bool) error {
+			if b {
+				return nil
+			}
+			if c.Bool(branchCheckFlagName) {
+				return fmt.Errorf("--%s must be set when --%s is set", inverseFlagName(branchCheckFlagName), inverseFlagName(validationFlagName))
+			}
+			// image-scan is only registered on publish commands; only enforce the
+			// dependency where the flag actually exists.
+			if hasFlag(c, imageScanFlagName) && c.Bool(imageScanFlagName) {
+				return fmt.Errorf("--%s must be set when --%s is set", inverseFlagName(imageScanFlagName), inverseFlagName(validationFlagName))
+			}
+			return nil
+		},
+	}
+	branchCheckFlagName = "branch-check"
+	branchCheckFlag     = &cli.BoolWithInverseFlag{
+		Name:     branchCheckFlagName,
+		Category: developmentCategory,
+		Usage:    "Check that the current branch is a valid branch for release",
+		Sources:  cli.EnvVars("BRANCH_CHECK", "RELEASE_BRANCH_CHECK"),
+		Value:    true,
+	}
+)
+
+// Container image flags are flags used to control container image building and publishing
+var (
+	registryFlag = &cli.StringSliceFlag{
+		Name:     "registry",
+		Category: containerImageCategory,
+		Usage:    "Override default registries for the release. Repeat for multiple registries.",
+		Sources:  cli.EnvVars("REGISTRIES"), // avoid DEV_REGISTRIES as it is already used by the build system (lib.Makefile).
+	}
+	helmRegistryFlag = &cli.StringSliceFlag{
+		Name:     "helm-registry",
+		Category: containerImageCategory,
+		Usage:    "Override default OCI-based helm chart registries for the release. Repeat for multiple registries.",
+		Sources:  cli.EnvVars("HELM_REGISTRIES"),
+	}
+
+	archOptions = defaults.Architectures
+	archFlag    = &cli.StringSliceFlag{
+		Name:     "architecture",
+		Category: containerImageCategory,
+		Aliases:  []string{"arch"},
+		Usage:    "The architecture to use for the release. Repeat for multiple architectures.",
+		Sources:  cli.EnvVars("ARCHS"), // avoid ARCHES as it is already used by the build system (lib.Makefile).
+		Value:    archOptions,
+		Action: func(_ context.Context, c *cli.Command, values []string) error {
+			for _, arch := range values {
+				if !slices.Contains(archOptions, arch) {
+					return fmt.Errorf("invalid architecture %s", arch)
+				}
+			}
+			return nil
+		},
+	}
+
+	// fromRegistryFlag and fromTagFlag publish by retagging images that are
+	// already published, instead of pushing a fresh build.
+	fromRegistryFlag = &cli.StringFlag{
+		Name:     "from-registry",
+		Category: containerImageCategory,
+		Usage:    "Publish by retagging the images already in this registry.",
+		Sources:  cli.EnvVars("FROM_REGISTRY"),
+	}
+	fromTagFlag = &cli.StringFlag{
+		Name:     "from-tag",
+		Category: containerImageCategory,
+		Usage:    "The tag to retag from. Required with --from-registry.",
+		Sources:  cli.EnvVars("FROM_TAG"),
+	}
+	skipDevImageRetagFlag = &cli.BoolFlag{
+		Name:     "skip-dev-image-retag",
+		Category: containerImageCategory,
+		Usage:    "Leave the dev tag in place when retagging.",
+		Sources:  cli.EnvVars("SKIP_DEV_IMAGE_RETAG"),
+	}
+
+	// imageReleaseDirsFlag limits a run to some of the directories that ship
+	// images.
+	imageReleaseDirsFlag = &cli.StringSliceFlag{
+		Name:     "image-release-dir",
+		Category: containerImageCategory,
+		Usage:    "Limit image building and publishing to these directories. Repeat for multiple directories.",
+		Sources:  cli.EnvVars("IMAGE_RELEASE_DIRS"),
+		Action: func(_ context.Context, c *cli.Command, dirs []string) error {
+			// Build and publish cover different directories; accept either.
+			valid := append(images.VariantDirs(images.BuildVariants), images.VariantDirs(images.PublishVariants)...)
+			var invalid []string
+			for _, dir := range dirs {
+				if !slices.Contains(valid, dir) {
+					invalid = append(invalid, dir)
+				}
+			}
+			if len(invalid) > 0 {
+				return fmt.Errorf("invalid image release dirs specified: %s", strings.Join(invalid, ", "))
+			}
+			return nil
+		},
+	}
+)
+
+var (
+	awsProfileFlag = &cli.StringFlag{
+		Name:     "aws-profile",
+		Category: cloudCategory,
+		Usage:    "The AWS profile to use",
+		Sources:  cli.EnvVars("AWS_PROFILE"),
+	}
+	s3BucketFlag = &cli.StringFlag{
+		Name:     "s3-bucket",
+		Category: cloudCategory,
+		Usage:    "The S3 bucket to publish release artifacts to.",
+		Sources:  cli.EnvVars("S3_BUCKET"),
+	}
+)
+
+// Operator flags are flags used to interact with Tigera operator repository
+var (
+	operatorBuildCommandFlags = []cli.Flag{
+		operatorRegistryFlag,
+		operatorFlag(envBuildOperator, envReleaseOperator),
+	}
+
+	operatorPublishCommandFlags = []cli.Flag{
+		operatorRegistryFlag,
+		operatorFlag(envPublishOperator, envReleaseOperator),
+	}
+
+	// Container image flags
+	operatorRegistryFlag = &cli.StringSliceFlag{
+		Name:     "operator-registry",
+		Category: operatorCategory,
+		Usage:    "The registry to use for operator, repeat for multiple registries. If not set, the default registries will be used.",
+		Sources:  cli.EnvVars("OPERATOR_REGISTRY", "OPERATOR_REGISTRIES"),
+	}
+
+	operatorFlagName   = "operator"
+	envBuildOperator   = "BUILD_OPERATOR"
+	envPublishOperator = "PUBLISH_OPERATOR"
+	envReleaseOperator = "RELEASE_OPERATOR"
+	operatorFlag       = func(envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     operatorFlagName,
+			Category: operatorCategory,
+			Usage:    "Include Tigera operator in the release steps",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    true,
+		}
+	}
+)
+
+// External flags are flags used to interact with external services
+var (
+	// CI flags for interacting with CI services
+	ciFlags = []cli.Flag{ciFlag, ciBaseURLFlag, ciJobIDFlag}
+	ciFlag  = &cli.BoolFlag{
+		Name:     "ci",
+		Category: ciCategory,
+		Usage:    "Run in a continuous integration (CI) environment",
+		Sources:  cli.EnvVars("CI"),
+		Value:    false,
+	}
+	ciBaseURLFlag = &cli.StringFlag{
+		Name:     "ci-url",
+		Category: ciCategory,
+		Usage:    "The CI base URL, used to build links to CI jobs",
+		Sources:  cli.EnvVars("SEMAPHORE_ORGANIZATION_URL"),
+	}
+	ciJobIDFlag = &cli.StringFlag{
+		Name:     "ci-job-id",
+		Category: ciCategory,
+		Usage:    "The CI job ID for the run",
+		Sources:  cli.EnvVars("SEMAPHORE_JOB_ID"),
+	}
+
+	// Slack flags for posting messages to Slack
+	slackFlags     = []cli.Flag{slackTokenFlag, slackChannelFlag, notifyFlag}
+	slackTokenFlag = &cli.StringFlag{
+		Name:     "slack-token",
+		Category: slackCategory,
+		Usage:    "The Slack token to use for posting messages",
+		Sources:  cli.EnvVars("SLACK_API_TOKEN"),
+	}
+	slackChannelFlag = &cli.StringFlag{
+		Name:     "slack-channel",
+		Category: slackCategory,
+		Usage:    "The Slack channel to post messages",
+		Sources:  cli.EnvVars("SLACK_CHANNEL"),
+	}
+	notifyFlag = &cli.BoolWithInverseFlag{
+		Name:     "notify",
+		Category: slackCategory,
+		Usage:    "Sending notifications to Slack",
+		Sources:  cli.EnvVars("NOTIFY"),
+		Value:    true,
+		Action: func(_ context.Context, c *cli.Command, b bool) error {
+			// Check slack configuration
+			if b && (c.String(slackTokenFlag.Name) == "" || c.String(slackChannelFlag.Name) == "") {
+				if c.Bool(ciFlag.Name) {
+					return fmt.Errorf("missing Slack token or channel in CI environment")
+				}
+				logrus.Warnf("This command may require sending Slack notifications, ensure %s and %s flags are set", slackTokenFlag.Name, slackChannelFlag.Name)
+			}
+			return nil
+		},
+	}
+
+	// Image scanner flags for interacting with the image scanning service
+	imageScanFlags = []cli.Flag{
+		imageScanFlag,
+		imageScannerAPIFlag,
+		imageScannerTokenFlag,
+		imageScannerSelectFlag,
+	}
+	imageScannerAPIFlag = &cli.StringFlag{
+		Name:     "image-scanner-api",
+		Category: imageScannerCategory,
+		Usage:    "The URL for the Image Scanning Service API",
+		Sources:  cli.EnvVars("IMAGE_SCANNER_API"),
+	}
+	imageScannerTokenFlag = &cli.StringFlag{
+		Name:     "image-scanner-token",
+		Category: imageScannerCategory,
+		Usage:    "The token for the Image Scanning Service API",
+		Sources:  cli.EnvVars("IMAGE_SCANNING_TOKEN"),
+	}
+	imageScannerSelectFlag = &cli.StringFlag{
+		Name:     "image-scanner-select",
+		Category: imageScannerCategory,
+		Usage:    "The name of the scanner to use",
+		Sources:  cli.EnvVars("IMAGE_SCANNER_SELECT"),
+		Value:    "all",
+	}
+	imageScanFlagName = "image-scan"
+	imageScanFlag     = &cli.BoolWithInverseFlag{
+		Name:     imageScanFlagName,
+		Category: imageScannerCategory,
+		Usage:    "Submit the image to the image scan service",
+		Sources:  cli.EnvVars("RELEASE_IMAGE_SCAN"),
+		Value:    true,
+		Action: func(_ context.Context, c *cli.Command, b bool) error {
+			logrus.WithField(imageScanFlagName, b).Info("Image scanning configuration")
+			if b && !imageScanningAPIConfig(c).Valid() {
+				if !c.Bool(ciFlag.Name) {
+					logrus.Warn("Image scanning configuration is incomplete")
+				}
+				return fmt.Errorf("invalid configuration for image scanning. Either set --%s and --%s or set --%s", imageScannerAPIFlag.Name, imageScannerTokenFlag.Name, inverseFlagName(imageScanFlagName))
+			}
+			return nil
+		},
+	}
+)
+
+// Hashrelease specific flags.
+var (
+	hashreleaseFlag = &cli.BoolFlag{
+		Name:     "hashrelease",
+		Category: stepControlCategory,
+		Usage:    "Indicates that the release is a hashrelease",
+		Sources:  cli.EnvVars("HASHRELEASE"),
+	}
+
+	// Hashrelease server configuration flags.
+	hashreleaseServerFlags = []cli.Flag{hashreleaseServerBucketFlag}
+	publishHashreleaseFlag = &cli.BoolWithInverseFlag{
+		Name:     "publish-to-hashrelease-server",
+		Category: hashreleaseServerCategory,
+		Usage:    "Publish the hashrelease to the hashrelease server",
+		Sources:  cli.EnvVars("PUBLISH_TO_HASHRELEASE_SERVER"),
+		Value:    true,
+	}
+	latestFlag = &cli.BoolWithInverseFlag{
+		Name:     "latest",
+		Category: hashreleaseServerCategory,
+		Usage:    "Publish the hashrelease as the latest hashrelease",
+		Sources:  cli.EnvVars("LATEST"),
+		Value:    true,
+	}
+	hashreleaseServerBucketFlag = &cli.StringFlag{
+		Name:     "hashrelease-server-bucket",
+		Category: hashreleaseServerCategory,
+		Usage:    "The bucket name for the hashrelease server",
+		Sources:  cli.EnvVars("HASHRELEASE_SERVER_BUCKET"),
+	}
+)
+
+// Step control flags gate logical release steps.
+const (
+	// Images.
+	imagesFlagName          = "images"
+	envBuildImages          = "BUILD_CONTAINER_IMAGES"
+	envPublishImages        = "PUBLISH_IMAGES"
+	envReleaseImages        = "RELEASE_IMAGES"
+	archiveImagesFlagName   = "archive-images"
+	envArchiveImages        = "ARCHIVE_IMAGES"
+	envBuildArchiveImages   = "BUILD_IMAGES_ARCHIVE"
+	envReleaseArchiveImages = "RELEASE_IMAGES_ARCHIVE"
+
+	// Helm charts.
+	helmChartsFlagName = "helm-charts"
+	envBuildCharts     = "BUILD_CHARTS"
+	envPublishCharts   = "PUBLISH_CHARTS"
+	envReleaseCharts   = "RELEASE_CHARTS"
+
+	// Helm index.
+	helmIndexFlagName   = "helm-index"
+	envHelmIndexLegacy  = "UPDATE_HELM_INDEX"
+	envBuildHelmIndex   = "BUILD_HELM_INDEX"
+	envPublishHelmIndex = "PUBLISH_HELM_INDEX"
+	envReleaseHelmIndex = "RELEASE_HELM_INDEX"
+
+	// Windows archive (build-only).
+	windowsArchiveFlagName   = "windows-archive"
+	envBuildWindowsArchive   = "BUILD_WINDOWS_ARCHIVE"
+	envReleaseWindowsArchive = "RELEASE_WINDOWS_ARCHIVE"
+
+	// Build-only.
+	envBuildManifests     = "BUILD_MANIFESTS"
+	envReleaseManifests   = "RELEASE_MANIFESTS"
+	envBuildOCPBundle     = "BUILD_OCP_BUNDLE"
+	envReleaseOCPBundle   = "RELEASE_OCP_BUNDLE"
+	envBuildBinaries      = "BUILD_BINARIES"
+	envReleaseBinaries    = "RELEASE_BINARIES"
+	envBuildTarball       = "BUILD_TARBALL"
+	envReleaseTarball     = "RELEASE_TARBALL"
+	envBuildE2EBinaries   = "BUILD_E2E_BINARIES"
+	envReleaseE2EBinaries = "RELEASE_E2E_BINARIES"
+	envBuildReleaseNotes  = "BUILD_RELEASE_NOTES"
+	envReleaseNotes       = "RELEASE_NOTES"
+
+	// Publish-only.
+	envPublishGitRefLegacy  = "PUBLISH_GIT_TAG"
+	envPublishGitRef        = "PUBLISH_GIT_REF"
+	envReleaseGitRef        = "RELEASE_GIT_REF"
+	envPublishGithubRelease = "PUBLISH_GITHUB_RELEASE"
+	envReleaseGithub        = "RELEASE_GITHUB"
+	envReleaseGithubRelease = "RELEASE_GITHUB_RELEASE"
+	envDraftGithubRelease   = "PUBLISH_GITHUB_RELEASE_DRAFT"
+	envReleaseGithubDraft   = "RELEASE_GITHUB_DRAFT"
+)
+
+var (
+	buildStepFlags = func(hashrelease bool) []cli.Flag {
+		f := []cli.Flag{
+			manifestsFlag,
+			ocpBundleFlag,
+			imagesFlag(!hashrelease, envBuildImages, envReleaseImages),
+			archiveImagesFlag(!hashrelease, envArchiveImages, envBuildArchiveImages, envReleaseArchiveImages),
+			binariesFlag,
+			helmChartsFlag(envBuildCharts, envReleaseCharts),
+			helmIndexFlag(envHelmIndexLegacy, envBuildHelmIndex, envReleaseHelmIndex),
+			tarballFlag,
+			windowsArchiveFlag(envBuildWindowsArchive, envReleaseWindowsArchive),
+		}
+		if hashrelease {
+			f = append(f, releaseNotesFlag, e2eBinariesFlag)
+		}
+		return f
+	}
+	publishStepFlags = func(hashrelease bool) []cli.Flag {
+		f := []cli.Flag{
+			imagesFlag(!hashrelease, envPublishImages, envReleaseImages),
+			helmChartsFlag(envPublishCharts, envReleaseCharts),
+		}
+		if hashrelease {
+			return f
+		}
+		return append(f,
+			helmIndexFlag(envHelmIndexLegacy, envPublishHelmIndex, envReleaseHelmIndex),
+			gitRefFlag,
+			githubReleaseFlag,
+			draftGithubReleaseFlag)
+	}
+
+	imagesFlag = func(value bool, envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     imagesFlagName,
+			Category: stepControlCategory,
+			Usage:    "Include container images in the release step",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    value,
+			Action: func(_ context.Context, c *cli.Command, b bool) error {
+				// archive-images is build-only; only enforce the dependency
+				// where the flag is registered. The "images on but not
+				// archived" warning is emitted from archiveImagesFlag.Action
+				// instead so it doesn't fire on publish commands where
+				// archive-images doesn't exist.
+				if hasFlag(c, archiveImagesFlagName) && !b && c.Bool(archiveImagesFlagName) {
+					return fmt.Errorf("cannot archive images without building them; use --%s flag to build images", imagesFlagName)
+				}
+				return nil
+			},
+		}
+	}
+	archiveImagesFlag = func(value bool, envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     archiveImagesFlagName,
+			Category: stepControlCategory,
+			Usage:    "Archive container images in the release tarball",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    value,
+			Action: func(_ context.Context, c *cli.Command, b bool) error {
+				if b && !c.Bool(imagesFlagName) {
+					return fmt.Errorf("cannot archive images without building them; use --%s flag to build images", imagesFlagName)
+				}
+				if !b && c.Bool(imagesFlagName) {
+					logrus.Warnf("Images are included but not archived; to include images in the archive set --%s", archiveImagesFlagName)
+				}
+				return nil
+			},
+		}
+	}
+	helmChartsFlag = func(envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     helmChartsFlagName,
+			Category: stepControlCategory,
+			Usage:    "Include Helm charts in the release step",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    true,
+			Action: func(_ context.Context, c *cli.Command, b bool) error {
+				if b {
+					return nil
+				}
+				if c.Bool(helmIndexFlagName) {
+					return fmt.Errorf("--%s must be set when --%s is set", inverseFlagName(helmIndexFlagName), inverseFlagName(helmChartsFlagName))
+				}
+				return nil
+			},
+		}
+	}
+	helmIndexFlag = func(envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     helmIndexFlagName,
+			Category: stepControlCategory,
+			Usage:    "Build/update the Helm chart index",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    true,
+		}
+	}
+	binariesFlag = &cli.BoolWithInverseFlag{
+		Name:     "binaries",
+		Category: stepControlCategory,
+		Usage:    "Include binaries in the release step",
+		Sources:  cli.EnvVars(envBuildBinaries, envReleaseBinaries),
+		Value:    true,
+	}
+	e2eBinariesFlag = &cli.BoolWithInverseFlag{
+		Name:     "e2e-binaries",
+		Category: stepControlCategory,
+		Usage:    "Build multi-arch e2e test binaries",
+		Sources:  cli.EnvVars(envBuildE2EBinaries, envReleaseE2EBinaries),
+		Value:    true,
+	}
+	releaseNotesFlag = &cli.BoolWithInverseFlag{
+		Name:     "release-notes",
+		Category: stepControlCategory,
+		Usage:    "Generate release notes",
+		Sources:  cli.EnvVars(envBuildReleaseNotes, envReleaseNotes),
+		Value:    true,
+		Action: func(_ context.Context, c *cli.Command, b bool) error {
+			if !b || !c.Bool(validationFlag.Name) {
+				return nil
+			}
+			if c.String(orgFlag.Name) != defaults.ProjectCalicoOrg || c.String(repoFlag.Name) != defaults.CalicoRepoName {
+				return fmt.Errorf("release notes can only be generated from %s/%s", defaults.ProjectCalicoOrg, defaults.CalicoRepoName)
+			}
+			if !github.Authenticated(commandRunner) {
+				return fmt.Errorf("release notes need GitHub authentication")
+			}
+			return nil
+		},
+	}
+	manifestsFlag = &cli.BoolWithInverseFlag{
+		Name:     "manifests",
+		Category: stepControlCategory,
+		Usage:    "Include manifests in the release step",
+		Sources:  cli.EnvVars(envBuildManifests, envReleaseManifests),
+		Value:    true,
+	}
+	ocpBundleFlag = &cli.BoolWithInverseFlag{
+		Name:     "ocp-bundle",
+		Category: stepControlCategory,
+		Usage:    "Include OCP bundle in the release step",
+		Sources:  cli.EnvVars(envBuildOCPBundle, envReleaseOCPBundle),
+		Value:    true,
+	}
+	windowsArchiveFlag = func(envVars ...string) *cli.BoolWithInverseFlag {
+		return &cli.BoolWithInverseFlag{
+			Name:     windowsArchiveFlagName,
+			Category: stepControlCategory,
+			Usage:    "Include Windows archive in the release step",
+			Sources:  cli.EnvVars(envVars...),
+			Value:    true,
+		}
+	}
+	tarballFlag = &cli.BoolWithInverseFlag{
+		Name:     "tarball",
+		Category: stepControlCategory,
+		Usage:    "Include the release tarball in the release step",
+		Sources:  cli.EnvVars(envBuildTarball, envReleaseTarball),
+		Value:    true,
+	}
+	gitRefFlag = &cli.BoolWithInverseFlag{
+		Name:     "git-ref",
+		Category: stepControlCategory,
+		Usage:    "Push the git ref(s) to the remote",
+		Sources:  cli.EnvVars(envPublishGitRefLegacy, envPublishGitRef, envReleaseGitRef),
+		Value:    true,
+	}
+	draftGithubReleaseFlag = &cli.BoolWithInverseFlag{
+		Name:     "draft-github-release",
+		Category: stepControlCategory,
+		Usage:    "Publish GitHub Release in drafts mode",
+		Sources:  cli.EnvVars(envDraftGithubRelease, envReleaseGithubDraft),
+		Value:    true,
+	}
+	githubReleaseFlag = &cli.BoolWithInverseFlag{
+		Name:     "github-release",
+		Category: stepControlCategory,
+		Usage:    "Publish the GitHub release",
+		Sources:  cli.EnvVars(envPublishGithubRelease, envReleaseGithub, envReleaseGithubRelease),
+		Value:    true,
+		Action: func(_ context.Context, _ *cli.Command, b bool) error {
+			if !b {
+				return nil
+			}
+			if !github.Authenticated(commandRunner) {
+				return fmt.Errorf("publishing a release needs GitHub authentication")
+			}
+			return nil
+		},
+	}
+)
+
+func inverseFlagName(name string) string {
+	return "no-" + name
+}
+
+// hasFlag reports whether the command has a flag registered under the given
+// name (or one of its aliases). Used by cross-flag Action callbacks to skip
+// dependency checks against flags that aren't registered on the current
+// command (e.g. image-scan is publish-only).
+func hasFlag(c *cli.Command, name string) bool {
+	return slices.ContainsFunc(c.Flags, func(f cli.Flag) bool {
+		return slices.Contains(f.Names(), name)
+	})
+}

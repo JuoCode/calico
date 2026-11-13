@@ -14,23 +14,26 @@
 package ipam
 
 import (
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"context"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
 )
 
 // Interface used to access the enabled IPPools.
 type PoolAccessorInterface interface {
 	// Returns a list of enabled pools sorted in alphanumeric name order.
-	GetEnabledPools(ipVersion int) ([]v3.IPPool, error)
+	GetEnabledPools(ctx context.Context, ipVersion int) ([]v3.IPPool, error)
 	// Returns a list of all pools sorted in alphanumeric name order.
-	GetAllPools() ([]v3.IPPool, error)
+	GetAllPools(ctx context.Context) ([]v3.IPPool, error)
 }
 
 // SelectsNode determines whether or not the IPPool's nodeSelector
 // matches the labels on the given node.
-func SelectsNode(pool v3.IPPool, n libapiv3.Node) (bool, error) {
+func SelectsNode(pool v3.IPPool, n internalapi.Node) (bool, error) {
 	// No node selector means that the pool matches the node.
 	if len(pool.Spec.NodeSelector) == 0 {
 		return true, nil
@@ -42,4 +45,25 @@ func SelectsNode(pool v3.IPPool, n libapiv3.Node) (bool, error) {
 	}
 	// Return whether or not the selector matches.
 	return sel.Evaluate(n.Labels), nil
+}
+
+// SelectsNamespace determines whether or not the IPPool's namespaceSelector
+// matches the labels on the given namespace.
+func SelectsNamespace(pool v3.IPPool, namespace *corev1.Namespace) (bool, error) {
+	// No namespace selector means that the pool matches the namespace.
+	if len(pool.Spec.NamespaceSelector) == 0 {
+		return true, nil
+	}
+
+	// Check for valid selector syntax.
+	sel, err := selector.Parse(pool.Spec.NamespaceSelector)
+	if err != nil {
+		return false, err
+	}
+
+	// Return whether or not the selector matches.
+	if namespace != nil {
+		return sel.Evaluate(namespace.Labels), nil
+	}
+	return sel.Evaluate(map[string]string{}), nil
 }

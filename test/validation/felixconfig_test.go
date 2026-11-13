@@ -1,0 +1,402 @@
+// Copyright (c) 2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validation_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// These three were defaulted on write by libcalico-go, which the native CRD path
+// does not run. The values match Felix's own built-in defaults.
+func TestFelixConfiguration_SchemaDefaults(t *testing.T) {
+	name := uniqueName("felixconfig-defaults")
+	mustCreate(t, &v3.FelixConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       v3.FelixConfigurationSpec{},
+	})
+
+	got := &v3.FelixConfiguration{}
+	if err := testClient.Get(context.Background(), client.ObjectKey{Name: name}, got); err != nil {
+		t.Fatalf("failed to get config: %v", err)
+	}
+
+	if got.Spec.FloatingIPs == nil || *got.Spec.FloatingIPs != v3.FloatingIPsDisabled {
+		t.Errorf("expected spec.floatingIPs=%q, got %v", v3.FloatingIPsDisabled, got.Spec.FloatingIPs)
+	}
+	if got.Spec.BPFConnectTimeLoadBalancing == nil || *got.Spec.BPFConnectTimeLoadBalancing != v3.BPFConnectTimeLBTCP {
+		t.Errorf("expected spec.bpfConnectTimeLoadBalancing=%q, got %v", v3.BPFConnectTimeLBTCP, got.Spec.BPFConnectTimeLoadBalancing)
+	}
+	if got.Spec.BPFHostNetworkedNATWithoutCTLB == nil || *got.Spec.BPFHostNetworkedNATWithoutCTLB != v3.BPFHostNetworkedNATEnabled {
+		t.Errorf("expected spec.bpfHostNetworkedNATWithoutCTLB=%q, got %v", v3.BPFHostNetworkedNATEnabled, got.Spec.BPFHostNetworkedNATWithoutCTLB)
+	}
+}
+
+// Felix treats an absent programClusterRoutes as EnabledIPIPOnly, so the schema default puts that
+// in the datastore where a reader can see it.
+func TestFelixConfiguration_ProgramClusterRoutesDefault(t *testing.T) {
+	defaulted := uniqueName("felixconfig-cluster-routes")
+	mustCreate(t, &v3.FelixConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: defaulted},
+		Spec:       v3.FelixConfigurationSpec{},
+	})
+
+	got := &v3.FelixConfiguration{}
+	if err := testClient.Get(context.Background(), client.ObjectKey{Name: defaulted}, got); err != nil {
+		t.Fatalf("failed to get config: %v", err)
+	}
+	if got.Spec.ProgramClusterRoutes == nil || *got.Spec.ProgramClusterRoutes != v3.EnabledIPIPOnly {
+		t.Errorf("expected spec.programClusterRoutes=%q, got %v", v3.EnabledIPIPOnly, got.Spec.ProgramClusterRoutes)
+	}
+
+	explicit := uniqueName("felixconfig-cluster-routes")
+	mustCreate(t, &v3.FelixConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: explicit},
+		Spec:       v3.FelixConfigurationSpec{ProgramClusterRoutes: ptr.To(v3.Disabled)},
+	})
+
+	got = &v3.FelixConfiguration{}
+	if err := testClient.Get(context.Background(), client.ObjectKey{Name: explicit}, got); err != nil {
+		t.Fatalf("failed to get config: %v", err)
+	}
+	if got.Spec.ProgramClusterRoutes == nil || *got.Spec.ProgramClusterRoutes != v3.Disabled {
+		t.Errorf("expected spec.programClusterRoutes=%q, got %v", v3.Disabled, got.Spec.ProgramClusterRoutes)
+	}
+}
+
+func TestFelixConfiguration_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		obj     client.Object
+		wantErr string
+	}{
+		{
+			name: "routeTableRange and routeTableRanges both set is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec: v3.FelixConfigurationSpec{
+					RouteTableRange:  &v3.RouteTableRange{Min: 1, Max: 250},
+					RouteTableRanges: &v3.RouteTableRanges{{Min: 1, Max: 250}},
+				},
+			},
+			wantErr: "routeTableRange and routeTableRanges cannot both be set",
+		},
+		{
+			name: "routeTableRange alone is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec: v3.FelixConfigurationSpec{
+					RouteTableRange: &v3.RouteTableRange{Min: 1, Max: 250},
+				},
+			},
+		},
+		{
+			name: "routeTableRanges alone is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec: v3.FelixConfigurationSpec{
+					RouteTableRanges: &v3.RouteTableRanges{{Min: 1, Max: 250}},
+				},
+			},
+		},
+		{
+			name: "natOutgoingAddress with IPv6 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{NATOutgoingAddress: "fd00::1"},
+			},
+			wantErr: "natOutgoingAddress must be a valid IPv4 address",
+		},
+		{
+			name: "natOutgoingAddress with invalid string is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{NATOutgoingAddress: "not-an-ip"},
+			},
+			wantErr: "natOutgoingAddress must be a valid IPv4 address",
+		},
+		{
+			name: "natOutgoingAddress with IPv4 is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{NATOutgoingAddress: "10.0.0.1"},
+			},
+		},
+		{
+			name: "deviceRouteSourceAddress with IPv6 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{DeviceRouteSourceAddress: "fd00::1"},
+			},
+			wantErr: "deviceRouteSourceAddress must be a valid IPv4 address",
+		},
+		{
+			name: "deviceRouteSourceAddress with invalid string is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{DeviceRouteSourceAddress: "not-an-ip"},
+			},
+			wantErr: "deviceRouteSourceAddress must be a valid IPv4 address",
+		},
+		{
+			name: "deviceRouteSourceAddressIPv6 with IPv4 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{DeviceRouteSourceAddressIPv6: "10.0.0.1"},
+			},
+			wantErr: "deviceRouteSourceAddressIPv6 must be a valid IPv6 address",
+		},
+		{
+			name: "deviceRouteSourceAddressIPv6 with invalid string is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{DeviceRouteSourceAddressIPv6: "not-an-ip"},
+			},
+			wantErr: "deviceRouteSourceAddressIPv6 must be a valid IPv6 address",
+		},
+		{
+			name: "deviceRouteSourceAddressIPv6 with IPv6 is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{DeviceRouteSourceAddressIPv6: "fd00::1"},
+			},
+		},
+		{
+			name: "routeTableRange min=0 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRange: &v3.RouteTableRange{Min: 0, Max: 250}},
+			},
+			wantErr: "must be a range of route table indices within 1..250",
+		},
+		{
+			name: "routeTableRange max > 250 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRange: &v3.RouteTableRange{Min: 1, Max: 251}},
+			},
+			wantErr: "must be a range of route table indices within 1..250",
+		},
+		{
+			name: "routeTableRange min > max is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRange: &v3.RouteTableRange{Min: 200, Max: 100}},
+			},
+			wantErr: "must be a range of route table indices within 1..250",
+		},
+		{
+			name: "routeTableIDRange min=0 is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRanges: &v3.RouteTableRanges{{Min: 0, Max: 100}}},
+			},
+			wantErr: "min must be >= 1",
+		},
+		{
+			name: "routeTableIDRange min > max is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRanges: &v3.RouteTableRanges{{Min: 200, Max: 100}}},
+			},
+			wantErr: "min must not be greater than max",
+		},
+		{
+			name: "routeTableIDRange max above 32 bits is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRanges: &v3.RouteTableRanges{{Min: 4294967000, Max: 4294967296}}},
+			},
+			wantErr: "max must be <= 4294967295",
+		},
+		{
+			name: "routeTableRanges covering 65535 tables is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRanges: &v3.RouteTableRanges{{Min: 1, Max: 252}, {Min: 256, Max: 65538}}},
+			},
+		},
+		{
+			name: "routeTableRanges covering more than 65535 tables is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{RouteTableRanges: &v3.RouteTableRanges{{Min: 1, Max: 252}, {Min: 256, Max: 65539}}},
+			},
+			wantErr: "routeTableRanges must cover at most 65535 tables in total",
+		},
+		{
+			name: "kubeNodePortRanges with numeric ports and ranges is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec: v3.FelixConfigurationSpec{KubeNodePortRanges: &[]numorstring.Port{
+					numorstring.SinglePort(30000),
+					{MinPort: 30001, MaxPort: 32767},
+				}},
+			},
+		},
+		{
+			name: "kubeNodePortRanges with a named port is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{KubeNodePortRanges: &[]numorstring.Port{{PortName: "http"}}},
+			},
+			wantErr: "kubeNodePortRanges must not contain named ports",
+		},
+		{
+			name: "externalNodesList with IPv4 CIDRs and addresses is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{ExternalNodesCIDRList: &[]string{"10.0.0.0/24", "192.168.1.1"}},
+			},
+		},
+		{
+			name: "externalNodesList with an IPv6 CIDR is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{ExternalNodesCIDRList: &[]string{"fd00::/64"}},
+			},
+			wantErr: "externalNodesList entries must be IPv4 CIDRs or IPv4 addresses",
+		},
+		{
+			name: "externalNodesList with an invalid CIDR is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{ExternalNodesCIDRList: &[]string{"10.0.0.0/33"}},
+			},
+			wantErr: "externalNodesList entries must be IPv4 CIDRs or IPv4 addresses",
+		},
+		{
+			name: "openstackRegion that is a DNS label is accepted",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{OpenstackRegion: strings.Repeat("r", 46)},
+			},
+		},
+		{
+			name: "openstackRegion longer than 46 characters is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{OpenstackRegion: strings.Repeat("r", 47)},
+			},
+			wantErr: "spec.openstackRegion: Too long",
+		},
+		{
+			name: "openstackRegion that is not a DNS label is rejected",
+			obj: &v3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("felixconfig")},
+				Spec:       v3.FelixConfigurationSpec{OpenstackRegion: "Region_One"},
+			},
+			wantErr: "spec.openstackRegion: Invalid value",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantErr != "" {
+				expectCreateFails(t, tt.obj, tt.wantErr)
+			} else {
+				expectCreateSucceeds(t, tt.obj)
+			}
+		})
+	}
+}
+
+// The bounds come from the libcalico-go struct tags, which only the calicoctl
+// path enforced before they reached the schema.
+func TestFelixConfiguration_NumericBounds(t *testing.T) {
+	bounded := []struct {
+		field string
+		min   int64
+		max   int64
+	}{
+		{field: "debugPort", min: 0, max: 65535},
+		{field: "bpfExtToServiceConnmark", min: 0, max: 4294967295},
+		{field: "bpfKubeProxyHealthzPort", min: 0, max: 65535},
+		{field: "ipv4NormalRoutePriority", min: 1, max: 2147483646},
+		{field: "ipv4ElevatedRoutePriority", min: 1, max: 2147483646},
+		{field: "ipv6NormalRoutePriority", min: 1, max: 2147483646},
+		{field: "ipv6ElevatedRoutePriority", min: 1, max: 2147483646},
+		{field: "wireguardListeningPort", min: 1, max: 65535},
+		{field: "wireguardListeningPortV6", min: 1, max: 65535},
+		{field: "wireguardRoutingRulePriority", min: 1, max: 32765},
+		{field: "bpfMaglevMaxEndpointsPerService", min: 1, max: 3000},
+		{field: "bpfMaglevMaxServices", min: 1, max: 3000},
+	}
+
+	newConfig := func(field string, value int64) *unstructured.Unstructured {
+		return &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "projectcalico.org/v3",
+				"kind":       "FelixConfiguration",
+				"metadata":   map[string]interface{}{"name": uniqueName("felixconfig")},
+				"spec":       map[string]interface{}{field: value},
+			},
+		}
+	}
+
+	for _, b := range bounded {
+		t.Run(b.field+" below minimum", func(t *testing.T) {
+			expectCreateFails(t, newConfig(b.field, b.min-1), b.field)
+		})
+		t.Run(b.field+" above maximum", func(t *testing.T) {
+			expectCreateFails(t, newConfig(b.field, b.max+1), b.field)
+		})
+		t.Run(b.field+" at the bounds", func(t *testing.T) {
+			expectCreateSucceeds(t, newConfig(b.field, b.min))
+			expectCreateSucceeds(t, newConfig(b.field, b.max))
+		})
+	}
+}
+
+// Felix compiles these with regexp.Compile. The schema rule evaluates each value
+// as a regexp, so the rejection carries the parse error rather than a rule message.
+func TestFelixConfiguration_RegexpFields(t *testing.T) {
+	fields := []string{
+		"logDebugFilenameRegex",
+		"nftablesFlowTableDataIfacePattern",
+		"bpfDataIfacePattern",
+		"bpfL3IfacePattern",
+		"bpfDisableGROForIfaces",
+		"mtuIfacePattern",
+	}
+
+	newConfig := func(field, value string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "projectcalico.org/v3",
+				"kind":       "FelixConfiguration",
+				"metadata":   map[string]interface{}{"name": uniqueName("felixconfig")},
+				"spec":       map[string]interface{}{field: value},
+			},
+		}
+	}
+
+	for _, field := range fields {
+		t.Run(field+" valid regexp", func(t *testing.T) {
+			expectCreateSucceeds(t, newConfig(field, "^(en.*|eth[0-9]+)$"))
+		})
+		t.Run(field+" invalid regexp", func(t *testing.T) {
+			expectCreateFails(t, newConfig(field, "eth["), "error parsing regexp")
+		})
+	}
+}

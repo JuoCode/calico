@@ -44,10 +44,13 @@ import (
 	"github.com/projectcalico/calico/felix/fv/utils"
 )
 
+// noKeepAlive is set from --no-keepalive.
+var noKeepAlive bool
+
 const usage = `test-connection: test connection to some target, for Felix FV testing.
 
 Usage:
-  test-connection <namespace-path> <ip-address> <port> [--source-ip=<source_ip>] [--source-port=<source>] [--protocol=<protocol>] [--duration=<seconds>] [--loop-with-file=<file>] [--sendlen=<bytes>] [--recvlen=<bytes>] [--log-pongs] [--stdin] [--timeout=<seconds>]
+  test-connection <namespace-path> <ip-address> <port> [--source-ip=<source_ip>] [--source-port=<source>] [--protocol=<protocol>] [--duration=<seconds>] [--loop-with-file=<file>] [--sendlen=<bytes>] [--recvlen=<bytes>] [--log-pongs] [--stdin] [--timeout=<seconds>] [--sleep=<seconds>] [--send-rst] [--no-keepalive]
 
 Options:
   --source-ip=<source_ip>  Source IP to use for the connection [default: 0.0.0.0].
@@ -61,6 +64,9 @@ Options:
   --recvlen=<bytes>        Tell the other side to send this many additional bytes
   --stdin                  Read and send data from stdin
   --timeout=<seconds>      Exit after timeout if pong not received
+  --sleep=<seconds>        How long to sleep before sending another ping
+  --send-rst               Close connection with TCP RST (SO_LINGER 0) instead of graceful FIN
+  --no-keepalive           Disable TCP keepalive probes, which Go enables by default
 
 If connection is successful, test-connection exits successfully.
 
@@ -151,7 +157,17 @@ func main() {
 		log.WithError(err).Fatal("Invalid --stdin")
 	}
 
-	var timeout time.Duration
+	sendRST, err := arguments.Bool("--send-rst")
+	if err != nil {
+		log.WithError(err).Fatal("Invalid --send-rst")
+	}
+
+	noKeepAlive, err = arguments.Bool("--no-keepalive")
+	if err != nil {
+		log.WithError(err).Fatal("Invalid --no-keepalive")
+	}
+
+	var timeout, sleep time.Duration
 
 	if toval := arguments["--timeout"]; toval != nil {
 		timeoutSecs, err := strconv.ParseFloat(toval.(string), 64)
@@ -160,6 +176,15 @@ func main() {
 			log.WithField("timeout", timeout).Fatal("Invalid --timeout argument")
 		}
 		timeout = time.Duration(timeoutSecs * float64(time.Second))
+	}
+
+	if toval := arguments["--sleep"]; toval != nil {
+		secs, err := strconv.ParseFloat(toval.(string), 64)
+		if err != nil {
+			// panic on error
+			log.WithField("sleep", sleep).Fatal("Invalid --sleep argument")
+		}
+		sleep = time.Duration(secs * float64(time.Second))
 	}
 
 	log.Infof("Test connection from namespace %v IP %v port %v to IP %v port %v proto %v "+
@@ -182,7 +207,7 @@ func main() {
 		// Test connection from wherever we are already running.
 		if err == nil {
 			err = tryConnect(ipAddress, port, sourceIpAddress, sourcePort, protocol,
-				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout)
+				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout, sleep, sendRST)
 		}
 	} else {
 		// Get the specified network namespace (representing a workload).
@@ -201,7 +226,7 @@ func main() {
 				return e
 			}
 			return tryConnect(ipAddress, port, sourceIpAddress, sourcePort, protocol,
-				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout)
+				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout, sleep, sendRST)
 		})
 	}
 
@@ -261,7 +286,7 @@ type protocolDriver interface {
 }
 
 func NewTestConn(remoteIpAddr, remotePort, sourceIpAddr, sourcePort, protocol string,
-	duration time.Duration, sendLen, recvLen int, stdin bool) (*testConn, error) {
+	duration time.Duration, sendLen, recvLen int, stdin bool, sendRST bool) (*testConn, error) {
 	err := utils.RunCommand("ip", "r")
 	if err != nil {
 		return nil, err
@@ -321,6 +346,7 @@ func NewTestConn(remoteIpAddr, remotePort, sourceIpAddr, sourcePort, protocol st
 			driver = &connectedTCP{
 				localAddr:  localAddr,
 				remoteAddr: remoteAddr,
+				sendRST:    sendRST,
 			}
 		}
 	}
@@ -353,10 +379,10 @@ func NewTestConn(remoteIpAddr, remotePort, sourceIpAddr, sourcePort, protocol st
 }
 
 func tryConnect(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol string,
-	seconds int, loopFile string, sendLen, recvLen int, logPongs, stdin bool, timeout time.Duration) error {
+	seconds int, loopFile string, sendLen, recvLen int, logPongs, stdin bool, timeout, sleep time.Duration, sendRST bool) error {
 
 	tc, err := NewTestConn(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol,
-		time.Duration(seconds)*time.Second, sendLen, recvLen, stdin)
+		time.Duration(seconds)*time.Second, sendLen, recvLen, stdin, sendRST)
 	if err != nil {
 		tc.sendErrorResp(err)
 		log.WithError(err).Fatal("Failed to create TestConn")
@@ -408,7 +434,7 @@ func tryConnect(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol str
 	}
 
 	if loopFile != "" {
-		return tc.tryLoopFile(loopFile, logPongs, timeout)
+		return tc.tryLoopFile(loopFile, logPongs, timeout, sleep)
 	}
 
 	if tc.config.ConnType == connectivity.ConnectionTypePing {
@@ -426,7 +452,7 @@ func (tc *testConn) GetTestMessage(sequence int) connectivity.Request {
 	return req
 }
 
-func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Duration) error {
+func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout, sleep time.Duration) error {
 	req := tc.GetTestMessage(0)
 	msg, err := json.Marshal(req)
 	if err != nil {
@@ -434,10 +460,10 @@ func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Dur
 	}
 
 	ls := newLoopState(loopFile)
+	ls.sleep = sleep
 	var lastResponse connectivity.Response
 
 	var retryStart time.Time
-	var zeroTime time.Time
 
 	for {
 		err = tc.protocol.Send(msg)
@@ -452,7 +478,7 @@ func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Dur
 			if err := tc.protocol.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
 				return err
 			}
-			if retryStart == zeroTime {
+			if retryStart.IsZero() {
 				retryStart = time.Now()
 			}
 		}
@@ -462,7 +488,7 @@ func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Dur
 			if logPongs {
 				fmt.Println("PONG")
 			}
-			retryStart = zeroTime
+			retryStart = time.Time{}
 		} else if os.IsTimeout(err) {
 			fmt.Printf("receive timeout\n")
 			if timeout > 0 {
@@ -478,6 +504,20 @@ func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Dur
 			continue
 		} else {
 			fmt.Printf("err = %+v\n", err)
+			// If the initial exchange has completed and the loop file exists,
+			// we were asked to stop. The connection error is expected during
+			// shutdown, so exit cleanly. We only check after sentInitial so
+			// that startup failures still fail loudly (the loop file is
+			// expected to exist before the first successful exchange).
+			if ls.sentInitial && ls.loopFile != "" {
+				if _, statErr := os.Stat(ls.loopFile); statErr == nil {
+					log.WithError(err).Info("Connection error during shutdown, exiting cleanly")
+					if rmErr := os.Remove(ls.loopFile); rmErr != nil {
+						log.WithError(rmErr).Info("Failed to remove loop file during shutdown")
+					}
+					break
+				}
+			}
 			log.WithError(err).Fatal("Failed to receive")
 		}
 
@@ -629,9 +669,7 @@ func (tc *testConn) tryConnectWithPacketLoss() error {
 	var lastResponse connectivity.Response
 
 	// Start a reader
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 
 		lastSequence := 0
 		count := 0
@@ -690,12 +728,10 @@ func (tc *testConn) tryConnectWithPacketLoss() error {
 				count++
 			}
 		}
-	}()
+	})
 
 	// start a writer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 
 		count := 0
 		for {
@@ -732,7 +768,7 @@ func (tc *testConn) tryConnectWithPacketLoss() error {
 			}
 		}
 
-	}()
+	})
 
 	// Wait for writer and reader to complete.
 	wg.Wait()
@@ -756,6 +792,7 @@ func (tc *testConn) Close() error {
 type loopState struct {
 	sentInitial bool
 	loopFile    string
+	sleep       time.Duration
 }
 
 func newLoopState(loopFile string) *loopState {
@@ -797,7 +834,11 @@ func (l *loopState) Next() bool {
 		}
 		l.sentInitial = true
 	}
-	time.Sleep(500 * time.Millisecond)
+	if l.sleep != 0 {
+		time.Sleep(l.sleep)
+	} else {
+		time.Sleep(500 * time.Millisecond)
+	}
 	return true
 }
 
@@ -1160,6 +1201,7 @@ func tcpForceV6(ip net.IP, port int) (net.Conn, error) {
 type connectedTCP struct {
 	localAddr  string
 	remoteAddr string
+	sendRST    bool
 
 	conn net.Conn
 	r    *bufio.Reader
@@ -1200,6 +1242,17 @@ func (d *connectedTCP) Connect() error {
 		}
 	}
 
+	if noKeepAlive {
+		// reuse.Dial may wrap the connection, so go through syscall.Conn.
+		if sc, ok := conn.(syscall.Conn); ok {
+			if raw, err := sc.SyscallConn(); err == nil {
+				_ = raw.Control(func(fd uintptr) {
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 0)
+				})
+			}
+		}
+	}
+
 	d.conn = conn
 
 	d.r = bufio.NewReader(d.conn)
@@ -1226,6 +1279,21 @@ func (d *connectedTCP) Receive() ([]byte, error) {
 func (d *connectedTCP) Close() error {
 	if d.conn == nil {
 		return nil
+	}
+	if d.sendRST {
+		// Set SO_LINGER with timeout 0 to force TCP RST on close
+		// instead of a graceful FIN shutdown.
+		if tcpConn, ok := d.conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+		} else if sc, ok := d.conn.(syscall.Conn); ok {
+			// reuse.Dial may wrap the connection; use syscall.Conn fallback.
+			if raw, err := sc.SyscallConn(); err == nil {
+				_ = raw.Control(func(fd uintptr) {
+					_ = syscall.SetsockoptLinger(int(fd), syscall.SOL_SOCKET, syscall.SO_LINGER,
+						&syscall.Linger{Onoff: 1, Linger: 0})
+				})
+			}
+		}
 	}
 	return d.conn.Close()
 }

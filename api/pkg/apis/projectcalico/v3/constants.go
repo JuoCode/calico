@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,28 @@ const (
 	OrchestratorDocker     = "libnetwork"
 	OrchestratorOpenStack  = "openstack"
 
+	// Label used to denote the Tier. This is added to policies by Calico so that label matches
+	// can be made for tiers.
+	LabelTier = "projectcalico.org/tier"
+
+	// LabelHostnameHash is applied to BlockAffinity resources for efficient lookups.
+	LabelHostnameHash = "projectcalico.org/hostname-hash"
+	// LabelAffinityType is applied to BlockAffinity resources for efficient lookups.
+	LabelAffinityType = "projectcalico.org/affinity-type"
+	// LabelIPVersion is applied to BlockAffinity resources for efficient lookups.
+	LabelIPVersion = "projectcalico.org/ip-version"
+
 	// Enum options for enable/disable fields
-	Enabled  = "Enabled"
-	Disabled = "Disabled"
+	Enabled            = "Enabled"
+	Disabled           = "Disabled"
+	EnabledIPIPOnly    = "EnabledIPIPOnly"
+	EnabledNoEncapOnly = "EnabledNoEncapOnly"
+
+	// Host name used for Service LoadBalancer
+	VirtualLoadBalancer = "load-balancer"
+
+	// Istio Labels
+	LabelIstioDataplaneMode        = "istio.io/dataplane-mode"
+	LabelIstioDataplaneModeAmbient = "ambient"
+	LabelIstioDataplaneModeNone    = "none"
 )

@@ -2,79 +2,83 @@
 # Devstack plugin code for Calico
 # ===============================
 
-mode=$1				# stack, unstack or clean
-phase=$2			# pre-install, install, post-config or extra
+mode=$1                         # stack, unstack or clean
+phase=$2                        # pre-install, install, post-config or extra
 
 if [ "${Q_AGENT}" = calico-felix ]; then
 
     case $mode in
 
-	stack)
-	    # Called by stack.sh four times for different phases of
-	    # its run.
-	    echo Calico plugin: stack
+        stack)
+            # Called by stack.sh four times for different phases of
+            # its run.
+            echo Calico plugin: stack
 
-	    case $phase in
+            case $phase in
 
-		pre-install)
-		    # Called after system (OS) setup is complete and
-		    # before project source is installed.
-		    echo Calico plugin: pre-install
+                pre-install)
+                    # Called after system (OS) setup is complete and
+                    # before project source is installed.
+                    echo Calico plugin: pre-install
 
-		    # Add Calico master PPA as a package source.
-		    sudo apt-add-repository -y ppa:project-calico/master
-		    REPOS_UPDATED=False
+                    # Add Calico master PPA as a package source.
+                    sudo apt-add-repository -y ppa:project-calico/master
+                    REPOS_UPDATED=False
 
-		    # Also add BIRD project PPA as a package source.
-		    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 sudo add-apt-repository -y ppa:cz.nic-labs/bird
+                    if [ "${CALICO_BGP_MODE}" = bird ]; then
+                        # Also add BIRD project PPA as a package source.
+                        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 sudo add-apt-repository -y ppa:cz.nic-labs/bird
+                    fi
+                    ;;
 
-		    ;;
+                install)
+                    # Called after the layer 1 and 2 projects source
+                    # and their dependencies have been installed.
+                    echo Calico plugin: install
 
-		install)
-		    # Called after the layer 1 and 2 projects source
-		    # and their dependencies have been installed.
-		    echo Calico plugin: install
+                    # Upgrade dnsmasq.
+                    install_package dnsmasq-base dnsmasq-utils
 
-		    # Upgrade dnsmasq.
-		    install_package dnsmasq-base dnsmasq-utils
+                    # Install ipset.
+                    install_package ipset
 
-		    # Install ipset.
-		    install_package ipset
+                    if [ "${CALICO_BGP_MODE}" = bird ]; then
+                        # Install BIRD.
+                        install_package bird
+                    fi
 
-		    # Install BIRD.
-		    install_package bird
-
-		    # Install the Calico agent.
-		    sudo mkdir -p /etc/calico
-		    sudo sh -c "cat > /etc/calico/felix.cfg" << EOF
+                    # Install the Calico agent.
+                    sudo mkdir -p /etc/calico
+                    sudo sh -c "cat > /etc/calico/felix.cfg" << EOF
 [global]
 DatastoreType = etcdv3
 EtcdEndpoints = http://${SERVICE_HOST}:${ETCD_PORT}
+EndpointStatusPathPrefix = none
 EOF
-		    if [ "${ENABLE_DEBUG_LOG_LEVEL}" = True ]; then
-			sudo sh -c "cat >> /etc/calico/felix.cfg" << EOF
+                    if [ "${ENABLE_DEBUG_LOG_LEVEL}" = True ]; then
+                        sudo sh -c "cat >> /etc/calico/felix.cfg" << EOF
 LogSeverityFile = info
 EOF
-		    fi
-		    install_package calico-felix
+                    fi
+                    install_package calico-felix
 
-		    # Install Calico common code, that includes BIRD templates.
-		    install_package calico-common
+                    # Install Calico common code, that includes BIRD templates.
+                    install_package calico-common
 
-		    # Install networking-calico.
-		    pip_install "${GITDIR['calico']}/networking-calico"
+                    # Install networking-calico.
+                    pip_install "${GITDIR['calico']}/networking-calico"
 
-		    ;;
+                    ;;
 
-		post-config)
-		    # Called after the layer 1 and 2 services have
-		    # been configured. All configuration files for
-		    # enabled services should exist at this point.
-		    echo Calico plugin: post-config
+                post-config)
+                    # Called after the layer 1 and 2 services have
+                    # been configured. All configuration files for
+                    # enabled services should exist at this point.
+                    echo Calico plugin: post-config
 
-		    # Update qemu configuration (shouldn't be anything
-		    # in there so safe to blow away)
-		    sudo sh -c "cat > /etc/libvirt/qemu.conf" << EOF
+                    # Update qemu configuration (shouldn't be anything
+                    # in there so safe to blow away)
+                    sudo sh -c "cat > /etc/libvirt/qemu.conf" << EOF
 user = "root"
 group = "root"
 cgroup_device_acl = [
@@ -85,85 +89,91 @@ cgroup_device_acl = [
 ]
 EOF
 
-		    # Use the Calico plugin.  We make this change here, instead
-		    # of putting 'Q_PLUGIN=calico' in the settings file,
-		    # because the latter would require adding Calico plugin
-		    # support to the core DevStack repository.
-		    iniset $NEUTRON_CONF DEFAULT core_plugin calico
+                    # Use the Calico plugin.  We make this change here, instead
+                    # of putting 'Q_PLUGIN=calico' in the settings file,
+                    # because the latter would require adding Calico plugin
+                    # support to the core DevStack repository.
+                    iniset $NEUTRON_CONF DEFAULT core_plugin calico
 
-		    # Reset service_plugins to be empty, as the Calico plugin
-		    # itself supports the 'router' extension.
-		    inidelete $NEUTRON_CONF DEFAULT service_plugins
+                    # Propagate ENABLE_DEBUG_LOG_LEVEL to neutron.conf, so that
+                    # it applies to the Calico DHCP agent on each compute node.
+                    iniset $NEUTRON_CONF DEFAULT debug $ENABLE_DEBUG_LOG_LEVEL
 
-		    # Propagate ENABLE_DEBUG_LOG_LEVEL to neutron.conf, so that
-		    # it applies to the Calico DHCP agent on each compute node.
-		    iniset $NEUTRON_CONF DEFAULT debug $ENABLE_DEBUG_LOG_LEVEL
+                    # Point the Calico DHCP agent and mechanism driver
+                    # at the etcd server.
+                    iniset $NEUTRON_CONF calico etcd_host $SERVICE_HOST
+                    iniset $NEUTRON_CONF calico etcd_port $ETCD_PORT
 
-		    # Point the Calico DHCP agent and mechanism driver
-		    # at the etcd server.
-		    iniset $NEUTRON_CONF calico etcd_host $SERVICE_HOST
-		    iniset $NEUTRON_CONF calico etcd_port $ETCD_PORT
+                    # Turn on the connection-fairy GC diagnostics in the
+                    # mech driver so any in-hub fairy finalisation in CI
+                    # logs a WARNING with the originating-checkout stack.
+                    # Cheap enough to leave on for benchmark runs and
+                    # essential for catching the deadlock pattern that
+                    # has hung resync_scale_test in the past.
+                    iniset $NEUTRON_CONF calico fairy_gc_diagnostics True
 
-		    # If CALICO_ETCD_COMPACTION_PERIOD_MINS is
-		    # defined, set that as the value of the
-		    # etcd_compaction_period_mins setting.
-		    if test -n "$CALICO_ETCD_COMPACTION_PERIOD_MINS"; then
-			iniset $NEUTRON_CONF calico etcd_compaction_period_mins $CALICO_ETCD_COMPACTION_PERIOD_MINS
-		    fi
-		    # If CALICO_ETCD_COMPACTION_MIN_REVISIONS is
-		    # defined, set that as the value of the
-		    # etcd_compaction_min_revisions setting.
-		    if test -n "$CALICO_ETCD_COMPACTION_MIN_REVISIONS"; then
-			iniset $NEUTRON_CONF calico etcd_compaction_min_revisions $CALICO_ETCD_COMPACTION_MIN_REVISIONS
-		    fi
+                    # If CALICO_ETCD_COMPACTION_PERIOD_MINS is
+                    # defined, set that as the value of the
+                    # etcd_compaction_period_mins setting.
+                    if test -n "$CALICO_ETCD_COMPACTION_PERIOD_MINS"; then
+                        iniset $NEUTRON_CONF calico etcd_compaction_period_mins $CALICO_ETCD_COMPACTION_PERIOD_MINS
+                    fi
 
-		    # Give Neutron the admin role so that it can look up
-		    # project name and parent_id fields in the Keystone DB.
-		    openstack role add admin --user neutron --project service --user-domain Default --project-domain Default
-		    ;;
+                    # If CALICO_ETCD_COMPACTION_MIN_REVISIONS is
+                    # defined, set that as the value of the
+                    # etcd_compaction_min_revisions setting.
+                    if test -n "$CALICO_ETCD_COMPACTION_MIN_REVISIONS"; then
+                        iniset $NEUTRON_CONF calico etcd_compaction_min_revisions $CALICO_ETCD_COMPACTION_MIN_REVISIONS
+                    fi
 
-		extra)
-		    # Called near the end after layer 1 and 2 services
-		    # have been started.
-		    echo Calico plugin: extra
+                    # Give Neutron the admin role so that it can look up
+                    # project name and parent_id fields in the Keystone DB.
+                    openstack role add admin --user neutron --project service --user-domain Default --project-domain Default
+                    ;;
 
-		    # Run script to automatically generate and
-		    # maintain BIRD config for the cluster.
-		    export ETCDCTL_API=3
-		    export ETCDCTL_ENDPOINTS=http://$SERVICE_HOST:$ETCD_PORT
-		    run_process calico-bird \
-                      "${DEST}/calico/devstack/auto-bird-conf.sh ${HOST_IP} ${ETCD_BIN_DIR}/etcdctl"
+                extra)
+                    # Called near the end after layer 1 and 2 services
+                    # have been started.
+                    echo Calico plugin: extra
 
-		    # Run the Calico DHCP agent.
-		    sudo mkdir /var/log/neutron || true
-		    sudo chown `whoami` /var/log/neutron
-		    run_process calico-dhcp \
-		      "/usr/local/bin/calico-dhcp-agent --config-file $NEUTRON_CONF"
+                    # Run script to automatically generate and
+                    # maintain BIRD config for the cluster.
+                    export ETCDCTL_API=3
+                    export ETCDCTL_ENDPOINTS=http://$SERVICE_HOST:$ETCD_PORT
+                    if [ "${CALICO_BGP_MODE}" = bird ]; then
+                        run_process calico-bird "${DEST}/calico/devstack/auto-bird-conf.sh ${HOST_IP} ${ETCD_BIN_DIR}/etcdctl"
+                    fi
 
-		    ;;
+                    # Run the Calico DHCP agent.
+                    sudo mkdir /var/log/neutron || true
+                    sudo chown `whoami` /var/log/neutron
+                    run_process calico-dhcp \
+                      "${DEVSTACK_VENV:-/usr/local}/bin/calico-dhcp-agent --config-file $NEUTRON_CONF"
 
-		*)
-		    echo Calico plugin: unexpected phase $phase
-		    ;;
+                    ;;
 
-	    esac
-	    ;;
+                *)
+                    echo Calico plugin: unexpected phase $phase
+                    ;;
 
-	unstack)
-	    # Called by unstack.sh before other services are shut
-	    # down.
-	    echo Calico plugin: unstack
-	    ;;
+            esac
+            ;;
 
-	clean)
-	    # Called by clean.sh before other services are cleaned,
-	    # but after unstack.sh has been called.
-	    echo Calico plugin: clean
-	    ;;
+        unstack)
+            # Called by unstack.sh before other services are shut
+            # down.
+            echo Calico plugin: unstack
+            ;;
 
-	*)
-	    echo Calico plugin: unexpected mode $mode
-	    ;;
+        clean)
+            # Called by clean.sh before other services are cleaned,
+            # but after unstack.sh has been called.
+            echo Calico plugin: clean
+            ;;
+
+        *)
+            echo Calico plugin: unexpected mode $mode
+            ;;
 
     esac
 fi

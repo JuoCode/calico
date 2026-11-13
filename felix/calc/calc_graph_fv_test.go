@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,18 +25,19 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/libcalico-go/lib/health"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	"github.com/sirupsen/logrus"
+	googleproto "google.golang.org/protobuf/proto"
 
 	. "github.com/projectcalico/calico/felix/calc"
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dataplane/mock"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/health"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 // Each entry in baseTests contains a series of states to move through (defined in
@@ -48,17 +49,50 @@ var baseTests = []StateList{
 	{},
 
 	// Add one endpoint then remove it and add another with overlapping IP.
-	{localEp1WithPolicy, localEp2WithPolicy},
+	{
+		localEp1WithPolicy,
+		localEp2WithPolicy,
+	},
+
+	// Add one endpoint then remove it and add another with overlapping IP,
+	// with policy in a non-default tier.
+	{
+		localEp1WithPolicyAndTier,
+		localEp2WithPolicyAndTier,
+	},
 
 	// Same but ingress-only policy on ep1.
 	{localEp1WithIngressPolicy, localEp2WithPolicy},
 
-	// Add one endpoint then another with an overlapping IP, then remove
-	// first.
-	{localEp1WithPolicy, localEpsWithPolicy, localEp2WithPolicy},
+	// Add one endpoint then another with an overlapping IP, then remove first.
+	{
+		localEp1WithPolicy,
+		localEpsWithPolicy,
+		localEp2WithPolicy,
+	},
+
+	// Add one endpoint then another with an overlapping IP, then remove first,
+	// with policies in none default tier.
+	{
+		localEp1WithPolicyAndTier,
+		localEpsWithPolicyAndTier,
+		localEp2WithPolicyAndTier,
+	},
 
 	// Add both endpoints, then return to empty, then add them both back.
-	{localEpsWithPolicy, initialisedStore, localEpsWithPolicy},
+	{
+		localEpsWithPolicy,
+		initialisedStore,
+		localEpsWithPolicy,
+	},
+
+	// Add both endpoints, then return to empty, then add them both back.
+	// with policies in none default tier.
+	{
+		localEpsWithPolicyAndTier,
+		initialisedStore,
+		localEpsWithPolicyAndTier,
+	},
 
 	// IP updates.
 	{localEpsWithPolicy, localEpsWithPolicyUpdatedIPs, localEp1WithIngressPolicy},
@@ -75,8 +109,56 @@ var baseTests = []StateList{
 		localEp1WithOneTierPolicyAlpha,
 	},
 
+	// Tests of policy ordering in a non-default tier. Each state has one tier but we shuffle
+	// the order of the policies within it.
+	{
+		commLocalEp1WithOneTierPolicy123,
+		commLocalEp1WithOneTierPolicy321,
+		commLocalEp1WithOneTierPolicyAlpha,
+	},
+
 	// Test mutating the profile list of some endpoints.
 	{localEpsWithNonMatchingProfile, localEpsWithProfile},
+
+	// And tier ordering.
+	{
+		localEp1WithTiers123,
+		localEp1WithTiers321,
+		localEp1WithTiersAlpha,
+		localEp1WithTiersAlpha2,
+		localEp1WithTiers321,
+		localEp1WithTiersAlpha3,
+	},
+
+	// String together some complex updates with profiles and policies
+	// coming and going.
+	{
+		localEpsWithProfile,
+		commLocalEp1WithOneTierPolicy123,
+		localEp1WithTiers321,
+		localEpsWithNonMatchingProfile,
+		localEpsWithPolicyAndTier,
+		localEpsWithUpdatedProfile,
+		localEpsWithNonMatchingProfile,
+		localEpsWithUpdatedProfileNegatedTags,
+		localEp1WithPolicyAndTier,
+		localEp1WithTiersAlpha2,
+		localEpsWithProfile,
+	},
+
+	// Test movement of policy1 from the default tier to a non-default tier and back.
+	{
+		localEp1WithPolicy,
+		localEp1WithPolicyAndTier,
+	},
+
+	// Test movement of a policy between two non-default tiers via UPDATE.
+	// Both tiers exist throughout; only the policy's Tier field changes.
+	{
+		localEp1WithTwoTiersPolicyInTier1,
+		localEp1WithTwoTiersPolicyInTier2,
+		localEp1WithTwoTiersPolicyInTier1,
+	},
 
 	// Host endpoint tests.
 	{hostEp1WithPolicy, hostEp2WithPolicy, hostEp1WithIngressPolicy, hostEp1WithEgressPolicy},
@@ -89,6 +171,15 @@ var baseTests = []StateList{
 		hostEp2WithPolicy,
 		hostEp1WithPolicyAndANetworkSet,
 		hostEp1WithPolicyAndTwoNetworkSets,
+	},
+
+	// Overlap-suppression dedup remove path (CORE-13009): add a broad CIDR, nest CIDRs under it
+	// (suppressed), then remove a middle CIDR while the ancestor still covers the leaf. The removed
+	// CIDR was never programmed, so nothing must be emitted and the leaf must stay suppressed.
+	{
+		hostEp1WithPolicyAndOverlapAncestor,
+		hostEp1WithPolicyAndOverlapNested,
+		hostEp1WithPolicyAndOverlapMiddleRemoved,
 	},
 
 	// Untracked policy on its own.
@@ -531,6 +622,21 @@ var baseTests = []StateList{
 		wireguardV6,
 		wireguardV4V6,
 	},
+
+	// Live migration: local WEP as source, then LM removed.
+	{localEp1WithPolicyLMSource, localEp1WithPolicy},
+	// Live migration: local WEP as source (workload-level), then LM removed.
+	{localEp1WithPolicyLMSourceWorkloadLevel, localEp1WithPolicy},
+	// Live migration: local WEP as target by direct name, then LM removed.
+	{localEp1WithPolicyLMTargetByName, localEp1WithPolicy},
+
+	// Istio tests - verify that the all-istio-weps IPSet is populated correctly
+	{
+		istioWithAmbientPod,
+		istioWithMixedPods,
+		istioSelectorEdgeCases,
+		istioWithAmbientNetworkSet,
+	},
 }
 
 var logOnce sync.Once
@@ -542,7 +648,7 @@ func testExpanders() (testExpanders []func(baseTest StateList) (desc string, map
 
 	if os.Getenv("DISABLE_TEST_EXPANSION") == "true" {
 		logOnce.Do(func() {
-			log.Info("Test expansion disabled")
+			logrus.Info("Test expansion disabled")
 		})
 		return
 	}
@@ -605,7 +711,7 @@ var _ = Describe("Calculation graph state sequencing tests:", func() {
 // deterministic test!
 var _ = Describe("Async calculation graph state sequencing tests:", func() {
 	if os.Getenv("DISABLE_ASYNC_TESTS") == "true" {
-		log.Info("Async tests disabled")
+		logrus.Info("Async tests disabled")
 		return
 	}
 	for _, test := range baseTests {
@@ -617,17 +723,17 @@ var _ = Describe("Async calculation graph state sequencing tests:", func() {
 		for _, expander := range testExpanders() {
 			expanderDesc, expandedTests := expander(baseTest)
 			for _, test := range expandedTests {
-				test := test
 				It("should handle: "+baseTest.String()+" "+expanderDesc, func() {
 					// Create the calculation graph.
 					conf := config.New()
 					conf.FelixHostname = localHostname
 					conf.BPFEnabled = true
-					conf.SetUseNodeResourceUpdates(test.UsesNodeResources())
+					conf.IstioAmbientMode = "Enabled"
 					conf.RouteSource = test.RouteSource()
-					outputChan := make(chan interface{})
+					outputChan := make(chan any)
 					conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
-					asyncGraph := NewAsyncCalcGraph(conf, []chan<- interface{}{outputChan}, nil)
+					lookupsCache := NewLookupsCache()
+					asyncGraph := NewAsyncCalcGraph(conf, []chan<- any{outputChan}, nil, lookupsCache)
 					// And a validation filter, with a channel between it
 					// and the async graph.
 					validator := NewValidationFilter(asyncGraph, conf)
@@ -640,10 +746,10 @@ var _ = Describe("Async calculation graph state sequencing tests:", func() {
 					done := make(chan bool, 2)
 					// Start a thread to inject the KVs.
 					go func() {
-						log.Info("Input injector thread started")
+						logrus.Info("Input injector thread started")
 						lastState := empty
 						for _, state := range test {
-							log.WithField("state", state).Info("Injecting next state")
+							logrus.WithField("state", state).Info("Injecting next state")
 							_, _ = fmt.Fprintf(GinkgoWriter, "       -> Injecting state (single update): %v\n", state)
 							kvDeltas := state.KVDeltas(lastState)
 							for _, kv := range kvDeltas {
@@ -668,11 +774,11 @@ var _ = Describe("Async calculation graph state sequencing tests:", func() {
 					for {
 						select {
 						case <-done:
-							log.Info("Got done message, stopping.")
+							logrus.Info("Got done message, stopping.")
 							Expect(inSyncReceived).To(BeTrue(), "Timed out before we got an in-sync message")
 							break readLoop
 						case update := <-outputChan:
-							log.WithField("update", update).Info("Update from channel")
+							logrus.WithField("update", update).Info("Update from channel")
 							Expect(inSyncReceived).To(BeFalse(), "Unexpected update after in-sync")
 							mockDataplane.OnEvent(update)
 							if _, ok := update.(*proto.InSync); ok {
@@ -696,7 +802,7 @@ var _ = Describe("Async calculation graph state sequencing tests:", func() {
 })
 
 func expectCorrectDataplaneState(mockDataplane *mock.MockDataplane, state State) {
-	log.WithField("state", state.Name).Info("Doing assertions on state")
+	logrus.WithField("state", state.Name).Info("Doing assertions on state")
 	Expect(mockDataplane.IPSets()).To(Equal(state.ExpectedIPSets),
 		"IP sets didn't match expected state after moving to state: %v",
 		state.Name)
@@ -715,7 +821,12 @@ func expectCorrectDataplaneState(mockDataplane *mock.MockDataplane, state State)
 	Expect(mockDataplane.ActiveWireguardV6Endpoints()).To(Equal(state.ExpectedWireguardV6Endpoints),
 		"Active IPv6 Wireguard Endpoints were incorrect after moving to state: %v",
 		state.Name)
-	Expect(mockDataplane.ActiveHostMetadataV4V6()).To(Equal(state.ExpectedHostMetadataV4V6),
+	for key, protoHostMetadata := range mockDataplane.ActiveHostMetadata() {
+		Expect(googleproto.Equal(protoHostMetadata, state.ExpectedHostMetadata[key])).To(BeTrue(),
+			"Active Host MetadataV4V6 were incorrect after moving to state: %v",
+			state.Name)
+	}
+	Expect(mockDataplane.ActiveHostMetadata()).To(Equal(state.ExpectedHostMetadata),
 		"Active Host MetadataV4V6 were incorrect after moving to state: %v",
 		state.Name)
 	// Comparing stringified versions of the routes here so that, on failure, we get much more readable output.
@@ -737,17 +848,19 @@ func expectCorrectDataplaneState(mockDataplane *mock.MockDataplane, state State)
 	Expect(mockDataplane.ActivePreDNATPolicies()).To(Equal(state.ExpectedPreDNATPolicyIDs),
 		"PreDNAT policies incorrect after moving to state: %v",
 		state.Name)
-	Expect(mockDataplane.Encapsulation()).To(Equal(state.ExpectedEncapsulation),
+	Expect(googleproto.Equal(mockDataplane.Encapsulation(), state.ExpectedEncapsulation)).To(BeTrue(),
 		"Encapsulation incorrect after moving to state: %v",
+		state.Name)
+	Expect(mockDataplane.EndpointToLiveMigrationRole()).To(Equal(state.ExpectedLiveMigrationRoles),
+		"Live migration roles incorrect after moving to state: %v",
 		state.Name)
 }
 
-func stringifyRoutes(routes set.Set[proto.RouteUpdate]) []string {
+func stringifyRoutes(routes set.Set[types.RouteUpdate]) []string {
 	out := make([]string, 0, routes.Len())
-	routes.Iter(func(item proto.RouteUpdate) error {
+	for item := range routes.All() {
 		out = append(out, fmt.Sprintf("%+v", item))
-		return nil
-	})
+	}
 	sort.Strings(out)
 	return out
 }
@@ -763,6 +876,7 @@ const (
 
 func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 	var validationFilter *ValidationFilter
+	var lookupsCache *LookupsCache
 	var calcGraph *CalcGraph
 	var mockDataplane *mock.MockDataplane
 	var eventBuf *EventSequencer
@@ -775,15 +889,16 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 		conf := config.New()
 		conf.FelixHostname = localHostname
 		conf.BPFEnabled = true
-		conf.SetUseNodeResourceUpdates(expandedTest.UsesNodeResources())
+		conf.IstioAmbientMode = "Enabled"
 		conf.RouteSource = expandedTest.RouteSource()
 		mockDataplane = mock.NewMockDataplane()
+		lookupsCache = NewLookupsCache()
 		eventBuf = NewEventSequencer(mockDataplane)
 		eventBuf.Callback = mockDataplane.OnEvent
 		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
-		calcGraph = NewCalculationGraph(eventBuf, conf, func() {})
+		calcGraph = NewCalculationGraph(eventBuf, lookupsCache, conf, func() {})
 		statsCollector := NewStatsCollector(func(stats StatsUpdate) error {
-			log.WithField("stats", stats).Info("Stats update")
+			logrus.WithField("stats", stats).Info("Stats update")
 			lastStats = stats
 			return nil
 		})
@@ -854,10 +969,13 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 		expectCorrectDataplaneState(mockDataplane, state)
 
 		// We only track stats in the sync tests.
+		Expect(lastStats.NumTiers).To(Equal(state.NumTiers()),
+			"number of tiers stat incorrect after moving to state: %v\n%+v",
+			state.Name, spew.Sdump(state.DatastoreState))
 		Expect(lastStats.NumPolicies).To(Equal(state.NumPolicies()),
 			"number of policies stat incorrect after moving to state: %v\n%+v",
 			state.Name, spew.Sdump(state.DatastoreState))
-		Expect(lastStats.NumProfiles).To(Equal(state.NumProfileRules()),
+		Expect(lastStats.NumProfiles).To(Equal(state.NumProfiles()),
 			"number of profiles stat incorrect after moving to state: %v\n%+v",
 			state.Name, spew.Sdump(state.DatastoreState))
 		Expect(lastStats.NumALPPolicies).To(Equal(state.NumALPPolicies()),
@@ -871,10 +989,11 @@ var _ = Describe("calc graph with health state", func() {
 		// Create the calculation graph.
 		conf := config.New()
 		conf.FelixHostname = localHostname
-		outputChan := make(chan interface{})
+		outputChan := make(chan any)
 		healthAggregator := health.NewHealthAggregator()
+		lookupsCache := NewLookupsCache()
 		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
-		asyncGraph := NewAsyncCalcGraph(conf, []chan<- interface{}{outputChan}, healthAggregator)
+		asyncGraph := NewAsyncCalcGraph(conf, []chan<- any{outputChan}, healthAggregator, lookupsCache)
 		Expect(asyncGraph).NotTo(BeNil())
 	})
 })

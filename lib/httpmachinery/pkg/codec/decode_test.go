@@ -1,0 +1,138 @@
+package codec_test
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"testing"
+
+	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/lib/httpmachinery/pkg/codec"
+	apicontext "github.com/projectcalico/calico/lib/httpmachinery/pkg/context"
+	"github.com/projectcalico/calico/lib/httpmachinery/pkg/testutil"
+)
+
+func TestRegisterCustomDecodeTypeFunc(t *testing.T) {
+	setupTest(t)
+	type stringType string
+
+	type foo struct {
+		URL    stringType `urlPath:"url"`
+		Query  stringType `urlQuery:"query"`
+		Header stringType `header:"X-Header"`
+	}
+
+	codec.RegisterCustomDecodeTypeFunc(func(vals []string) (stringType, error) {
+		return stringType(vals[0] + "-decoded"), nil
+	})
+
+	req, err := http.NewRequest("GET", "http://example.com?query=query-value", nil)
+	Expect(err).NotTo(HaveOccurred())
+
+	req.Header.Set("X-Header", "header-value")
+
+	param, err := codec.DecodeAndValidateRequestParams[foo](apicontext.NewRequestContext(req), func(r *http.Request) map[string]string {
+		return map[string]string{"url": "url-value"}
+	}, req)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(param.URL).To(Equal(stringType("url-value-decoded")))
+	Expect(param.Query).To(Equal(stringType("query-value-decoded")))
+	Expect(param.Header).To(Equal(stringType("header-value-decoded")))
+}
+
+func TestURLEncodedJSONDecoding(t *testing.T) {
+	setupTest(t)
+
+	type filter struct {
+		Name string `json:"name"`
+	}
+
+	type params struct {
+		Filter filter `urlQuery:"filter"`
+	}
+
+	codec.RegisterURLQueryJSONType[filter]()
+
+	filterEncoded := url.QueryEscape(testutil.MustMarshal(t, filter{Name: "foo"}))
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", filterEncoded), nil)
+	Expect(err).NotTo(HaveOccurred())
+
+	param, err := codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).Should(Not(HaveOccurred()))
+	Expect(param).Should(Equal(&params{Filter: filter{Name: "foo"}}))
+
+	special := url.QueryEscape(testutil.MustMarshal(t, filter{Name: "100% a+b"}))
+	req, err = http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", special), nil)
+	Expect(err).NotTo(HaveOccurred())
+	param, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).Should(Not(HaveOccurred()))
+	Expect(param).Should(Equal(&params{Filter: filter{Name: "100% a+b"}}))
+}
+
+func TestStrictURLEncodedJSONDecoding(t *testing.T) {
+	setupTest(t)
+
+	type strictFilter struct {
+		Name string `json:"name"`
+	}
+
+	type params struct {
+		Filter strictFilter `urlQuery:"filter"`
+	}
+
+	codec.RegisterStrictURLQueryJSONType[strictFilter]()
+
+	known := url.QueryEscape(`{"name":"foo"}`)
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", known), nil)
+	Expect(err).NotTo(HaveOccurred())
+	param, err := codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(param).Should(Equal(&params{Filter: strictFilter{Name: "foo"}}))
+
+	percent := url.QueryEscape(`{"name":"100%"}`)
+	req, err = http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", percent), nil)
+	Expect(err).NotTo(HaveOccurred())
+	param, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(param).Should(Equal(&params{Filter: strictFilter{Name: "100%"}}))
+
+	unknown := url.QueryEscape(`{"nmae":"foo"}`)
+	req, err = http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", unknown), nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).Should(HaveOccurred())
+
+	trailing := url.QueryEscape(`{"name":"foo"}{"name":"bar"}`)
+	req, err = http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s", trailing), nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).Should(HaveOccurred())
+
+	req, err = http.NewRequest("GET", "http://example.com?filter=", nil)
+	Expect(err).NotTo(HaveOccurred())
+	param, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(param).Should(Equal(&params{}))
+}
+
+func TestStrictURLEncodedJSONErrorNamesTheTrailingData(t *testing.T) {
+	setupTest(t)
+
+	type trailingFilter struct {
+		Name string `json:"name"`
+	}
+	type params struct {
+		Filter trailingFilter `urlQuery:"filter"`
+	}
+	codec.RegisterStrictURLQueryJSONType[trailingFilter]()
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://example.com?filter=%s",
+		url.QueryEscape(`{"name":"foo"} tail`)), nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = codec.DecodeAndValidateRequestParams[params](apicontext.NewRequestContext(req), NoopURLVarsFunc, req)
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("unexpected data after the JSON value"))
+	Expect(err.Error()).NotTo(Equal("unexpected data after the JSON value"))
+}

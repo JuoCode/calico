@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,13 @@ package model
 import (
 	"fmt"
 	"math/big"
+	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -29,33 +31,58 @@ import (
 
 const (
 	// Common attributes which may be set on allocations by clients.
-	IPAMBlockAttributePod             = "pod"
-	IPAMBlockAttributeNamespace       = "namespace"
-	IPAMBlockAttributeNode            = "node"
-	IPAMBlockAttributeType            = "type"
+	IPAMBlockAttributePod       = "pod"
+	IPAMBlockAttributeNamespace = "namespace"
+	IPAMBlockAttributeNode      = "node"
+	IPAMBlockAttributeType      = "type"
+	IPAMBlockAttributeService   = "service"
+
+	// A new type needs a case in accounting.Allocation.Kind, or IPAM reports count it as Unknown and never report it leaked.
 	IPAMBlockAttributeTypeIPIP        = "ipipTunnelAddress"
 	IPAMBlockAttributeTypeVXLAN       = "vxlanTunnelAddress"
 	IPAMBlockAttributeTypeVXLANV6     = "vxlanV6TunnelAddress"
 	IPAMBlockAttributeTypeWireguard   = "wireguardTunnelAddress"
 	IPAMBlockAttributeTypeWireguardV6 = "wireguardV6TunnelAddress"
 	IPAMBlockAttributeTimestamp       = "timestamp"
+
+	// KubeVirt VM pod attributes
+
+	// Name of the VMI object (also the name of the VM object if VM is present, as they share the same name)
+	IPAMBlockAttributeVMIName = "vmi-name"
+
+	// UID of the VMI object
+	IPAMBlockAttributeVMIUID = "vmi-uid"
+
+	// UID of the VM object (only present if VMI is owned by a VM)
+	IPAMBlockAttributeVMUID = "vm-uid"
+
+	// UID of the VirtualMachineInstanceMigration object (only present on migration target pods)
+	IPAMBlockAttributeVMIMUID = "vmim-uid"
+
+	IPAMAffinityTypeHost    = "host"
+	IPAMAffinityTypeVirtual = "virtual"
+
+	// IPAMAffinityLoadBalancer is the affinity used for blocks that back Service
+	// LoadBalancer addresses. It is a virtual affinity: no node owns the block.
+	IPAMAffinityLoadBalancer = IPAMAffinityTypeVirtual + ":load-balancer"
 )
 
 var (
 	matchBlock = regexp.MustCompile("^/?calico/ipam/v2/assignment/ipv./block/([^/]+)$")
-	typeBlock  = reflect.TypeOf(AllocationBlock{})
+	typeBlock  = reflect.TypeFor[AllocationBlock]()
 )
 
 type BlockKey struct {
-	CIDR net.IPNet `json:"-" validate:"required,name"`
+	CIDR netip.Prefix `json:"-" validate:"required,name"`
 }
 
 func (key BlockKey) defaultPath() (string, error) {
-	if key.CIDR.IP == nil {
+	if !key.CIDR.IsValid() {
 		return "", errors.ErrorInsufficientIdentifiers{}
 	}
-	c := strings.Replace(key.CIDR.String(), "/", "-", 1)
-	e := fmt.Sprintf("/calico/ipam/v2/assignment/ipv%d/block/%s", key.CIDR.Version(), c)
+	cidr := key.CIDR.Masked()
+	c := strings.Replace(cidr.String(), "/", "-", 1)
+	e := fmt.Sprintf("/calico/ipam/v2/assignment/ipv%d/block/%s", prefixVersion(cidr), c)
 	return e, nil
 }
 
@@ -69,6 +96,10 @@ func (key BlockKey) defaultDeleteParentPaths() ([]string, error) {
 
 func (key BlockKey) valueType() (reflect.Type, error) {
 	return typeBlock, nil
+}
+
+func (key BlockKey) parseValue(rawData []byte) (any, error) {
+	return parseJSONPointer[AllocationBlock](key, rawData)
 }
 
 func (key BlockKey) String() string {
@@ -95,14 +126,15 @@ func (options BlockListOptions) KeyFromDefaultPath(path string) Key {
 		return nil
 	}
 	cidrStr := strings.Replace(r[0][1], "-", "/", 1)
-	_, cidr, err := net.ParseCIDR(cidrStr)
+	prefix, err := netip.ParsePrefix(cidrStr)
 	if err != nil {
 		log.Debugf("find an invalid cidr %s for path=%v , info=%v ", r[0][1], path, err)
 		return nil
 	}
-	return BlockKey{CIDR: *cidr}
+	return BlockKey{CIDR: prefix.Masked()}
 }
 
+// +k8s:deepcopy-gen=true
 type AllocationBlock struct {
 	// The block's CIDR.
 	CIDR net.IPNet `json:"cidr"`
@@ -110,6 +142,10 @@ type AllocationBlock struct {
 	// Affinity of the block, if this block has one. If set, it will be of the form
 	// "host:<hostname>". If not set, this block is not affine to a host.
 	Affinity *string `json:"affinity"`
+
+	// Time the affinity was claimed; may be zero for old blocks that predate
+	// this field.
+	AffinityClaimTime *metav1.Time `json:"affinity_claim_time,omitempty"`
 
 	// Array of allocations in-use within this block. nil entries mean the allocation is free.
 	// For non-nil entries at index i, the index is the ordinal of the allocation within this block
@@ -169,9 +205,29 @@ func (b *AllocationBlock) IsDeleted() bool {
 	return b.Deleted
 }
 
+// Clone returns a copy of this block that can be modified without affecting
+// the original. It delegates to the generated DeepCopy so new fields are
+// handled automatically rather than silently dropped.
+func (b *AllocationBlock) Clone() *AllocationBlock {
+	return b.DeepCopy()
+}
+
 func (b *AllocationBlock) Host() string {
-	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, "host:") {
-		return strings.TrimPrefix(*b.Affinity, "host:")
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost)) {
+		return strings.TrimPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost))
+	}
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual)) {
+		return strings.TrimPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual))
+	}
+	return ""
+}
+
+func (b *AllocationBlock) AffinityType() string {
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeHost)) {
+		return IPAMAffinityTypeHost
+	}
+	if b.Affinity != nil && strings.HasPrefix(*b.Affinity, fmt.Sprintf("%s:", IPAMAffinityTypeVirtual)) {
+		return IPAMAffinityTypeVirtual
 	}
 	return ""
 }
@@ -193,7 +249,7 @@ func (b *AllocationBlock) NonAffineAllocations() []Allocation {
 			continue
 		}
 		attrs := b.Attributes[*attrIdx]
-		host := attrs.AttrSecondary[IPAMBlockAttributeNode]
+		host := attrs.ActiveOwnerAttrs[IPAMBlockAttributeNode]
 		if myHost != "" && host == myHost {
 			continue // Skip allocations that are affine to this block.
 		}
@@ -216,7 +272,7 @@ func (b *AllocationBlock) NumAddresses() int {
 // Find the ordinal (i.e. how far into the block) a given IP lies.  Returns an error if the IP is outside the block.
 func (b *AllocationBlock) IPToOrdinal(ip net.IP) (int, error) {
 	ipAsInt := net.IPToBigInt(ip)
-	baseInt := net.IPToBigInt(net.IP{b.CIDR.IP})
+	baseInt := net.IPToBigInt(net.IP{IP: b.CIDR.IP})
 	ord := big.NewInt(0).Sub(ipAsInt, baseInt).Int64()
 	if ord < 0 || ord >= int64(b.NumAddresses()) {
 		return 0, fmt.Errorf("IP %s not in block %s", ip, b.CIDR)
@@ -229,7 +285,21 @@ func (b *AllocationBlock) OrdinalToIP(ord int) net.IP {
 	return b.CIDR.NthIP(ord)
 }
 
+// +k8s:deepcopy-gen=true
 type AllocationAttribute struct {
-	AttrPrimary   *string           `json:"handle_id"`
-	AttrSecondary map[string]string `json:"secondary"`
+	// HandleID is the primary identifier for the allocation.
+	HandleID *string `json:"handle_id,omitempty"`
+	// ActiveOwnerAttrs contains attributes of the active owner (the pod currently using the IP).
+	ActiveOwnerAttrs map[string]string `json:"secondary,omitempty"`
+	// AlternateOwnerAttrs contains attributes of the previous or potential owner
+	// (used during live migration to track the source or target pod).
+	AlternateOwnerAttrs map[string]string `json:"alternateOwnerAttrs,omitempty"`
+	// ReleasedAt is the time this allocation was released, and is set during the allocation's
+	// "cooldown" phase. After `IPCooldownSeconds` have elapsed, the IP is deallocated (moved
+	// from `Allocated` to `Unallocated`).
+	ReleasedAt *metav1.Time `json:"releasedAt,omitempty"`
+}
+
+func (a AllocationAttribute) Clone() AllocationAttribute {
+	return *a.DeepCopy()
 }

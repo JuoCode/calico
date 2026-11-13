@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,20 +21,20 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/google/uuid"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	validator "github.com/projectcalico/calico/libcalico-go/lib/validator/v3"
 )
 
 // client implements the client.Interface.
@@ -56,16 +56,29 @@ func New(config apiconfig.CalicoAPIConfig) (Interface, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Only etcd mode runs CRD validation (CEL rules, OpenAPI constraints,
+	// schema defaulting) in-process. In KDD mode the kube-apiserver handles
+	// it on admission.
+	validator.SetCRDValidationEnabled(config.Spec.DatastoreType == apiconfig.EtcdV3)
+
+	return NewFromBackend(config, be), nil
+}
+
+// NewFromBackend wraps an existing backend client (e.g. one backed by fakes
+// in tests) in a clientv3 Interface. config drives behavior that depends on
+// the datastore type (e.g. ensureClusterInformation tagging clusters with a
+// "kdd"/"k8s" suffix); pass the same CalicoAPIConfig that produced be.
+func NewFromBackend(config apiconfig.CalicoAPIConfig, be bapi.Client) Interface {
 	return client{
 		config:    config,
 		backend:   be,
 		resources: &resources{backend: be},
-	}, nil
+	}
 }
 
 // NewFromEnv loads the config from ENV variables and returns a connected client.
 func NewFromEnv() (Interface, error) {
-
 	config, err := apiconfig.LoadClientConfigFromEnvironment()
 	if err != nil {
 		return nil, err
@@ -87,6 +100,21 @@ func (c client) NetworkPolicies() NetworkPolicyInterface {
 // GlobalNetworkPolicies returns an interface for managing policy resources.
 func (c client) GlobalNetworkPolicies() GlobalNetworkPolicyInterface {
 	return globalNetworkPolicies{client: c}
+}
+
+// StagedNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedNetworkPolicies() StagedNetworkPolicyInterface {
+	return stagedNetworkPolicies{client: c}
+}
+
+// StagedGlobalNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedGlobalNetworkPolicies() StagedGlobalNetworkPolicyInterface {
+	return stagedGlobalNetworkPolicies{client: c}
+}
+
+// StagedKubernetesNetworkPolicies returns an interface for managing policy resources.
+func (c client) StagedKubernetesNetworkPolicies() StagedKubernetesNetworkPolicyInterface {
+	return stagedKubernetesNetworkPolicies{client: c}
 }
 
 // IPPools returns an interface for managing IP pool resources.
@@ -129,6 +157,11 @@ func (c client) BGPPeers() BGPPeerInterface {
 	return bgpPeers{client: c}
 }
 
+// Tiers returns an interface for managing tier resources.
+func (c client) Tiers() TierInterface {
+	return tiers{client: c}
+}
+
 // IPAM returns an interface for managing IP address assignment and releasing.
 func (c client) IPAM() ipam.Interface {
 	return ipam.NewIPAMClient(c.backend, poolAccessor{client: &c}, c.IPReservations())
@@ -161,13 +194,18 @@ func (c client) CalicoNodeStatus() CalicoNodeStatusInterface {
 }
 
 // IPAMConfig returns an interface for managing the IPAMConfig resource.
-func (c client) IPAMConfig() IPAMConfigInterface {
-	return IPAMConfigs{client: c}
+func (c client) IPAMConfiguration() IPAMConfigurationInterface {
+	return IPAMConfigurations{client: c}
 }
 
 // BlockAffinity returns an interface for viewing the IPAM block affinity resources.
 func (c client) BlockAffinities() BlockAffinityInterface {
 	return blockAffinities{client: c}
+}
+
+// LiveMigrations returns an interface for managing LiveMigration resources.
+func (c client) LiveMigrations() LiveMigrationInterface {
+	return liveMigrations{client: c}
 }
 
 // BGPFilter returns an interface for managing the BGPFilter resource.
@@ -179,26 +217,16 @@ type poolAccessor struct {
 	client *client
 }
 
-func (p poolAccessor) GetEnabledPools(ipVersion int) ([]v3.IPPool, error) {
-	return p.getPools(func(pool *v3.IPPool) bool {
-		if pool.Spec.Disabled {
-			log.Debugf("Skipping disabled IP pool (%s)", pool.Name)
-			return false
-		}
-		if _, cidr, err := net.ParseCIDR(pool.Spec.CIDR); err == nil && cidr.Version() == ipVersion {
-			log.Debugf("Adding pool (%s) to the IPPool list", cidr.String())
-			return true
-		} else if err != nil {
-			log.Warnf("Failed to parse the IPPool: %s. Ignoring that IPPool", pool.Spec.CIDR)
-		} else {
-			log.Debugf("Ignoring IPPool: %s. IP version is different.", pool.Spec.CIDR)
-		}
-		return false
-	})
+func (p poolAccessor) GetEnabledPools(ctx context.Context, ipVersion int) ([]v3.IPPool, error) {
+	pools, err := p.client.IPPools().List(ctx, options.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return selectAllocatablePools(pools.Items, ipVersion), nil
 }
 
-func (p poolAccessor) getPools(filter func(pool *v3.IPPool) bool) ([]v3.IPPool, error) {
-	pools, err := p.client.IPPools().List(context.Background(), options.ListOptions{})
+func (p poolAccessor) getPools(ctx context.Context, filter func(pool *v3.IPPool) bool) ([]v3.IPPool, error) {
+	pools, err := p.client.IPPools().List(ctx, options.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -212,30 +240,66 @@ func (p poolAccessor) getPools(filter func(pool *v3.IPPool) bool) ([]v3.IPPool, 
 	return filtered, nil
 }
 
-func (p poolAccessor) GetAllPools() ([]v3.IPPool, error) {
-	return p.getPools(func(pool *v3.IPPool) bool {
+func (p poolAccessor) GetAllPools(ctx context.Context) ([]v3.IPPool, error) {
+	return p.getPools(ctx, func(pool *v3.IPPool) bool {
 		return true
 	})
 }
 
 // EnsureInitialized is used to ensure the backend datastore is correctly
 // initialized for use by Calico.  This method may be called multiple times, and
-// will have no effect if the datastore is already correctly initialized.
+// will have no effect if the datastore is already correctly initialized. This method
+// is fail-slow in that it does as much initialization as it can, only returning error
+// after attempting all initialization steps - this allows partial initialization for
+// components that have restricted access to the Calico resources (mainly a KDD thing).
 //
 // Most Calico deployment scenarios will automatically implicitly invoke this
 // method and so a general consumer of this API can assume that the datastore
 // is already initialized.
 func (c client) EnsureInitialized(ctx context.Context, calicoVersion, clusterType string) error {
+	var errs []error
+
 	// Perform datastore specific initialization first.
 	if err := c.backend.EnsureInitialized(); err != nil {
-		return err
+		log.WithError(err).Info("Unable to initialize backend datastore")
+		errs = append(errs, err)
 	}
 
 	if err := c.ensureClusterInformation(ctx, calicoVersion, clusterType); err != nil {
-		return err
+		log.WithError(err).Info("Unable to initialize ClusterInformation")
+		errs = append(errs, err)
+	}
+
+	err := c.ensureTierExists(ctx, names.DefaultTierName, v3.Deny, v3.DefaultTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize default Tier")
+		errs = append(errs, err)
+	}
+
+	err = c.ensureTierExists(ctx, names.KubeAdminTierName, v3.Pass, v3.KubeAdminTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize kube-admin Tier")
+		errs = append(errs, err)
+	}
+
+	err = c.ensureTierExists(ctx, names.KubeBaselineTierName, v3.Pass, v3.KubeBaselineTierOrder)
+	if err != nil {
+		log.WithError(err).Info("Unable to initialize kube-baseline Tier")
+		errs = append(errs, err)
+	}
+
+	// If there are any errors return the first error. We could combine the error text here and return
+	// a generic error, but an application may be expecting a certain error code, so best just return
+	// the original error.
+	if len(errs) > 0 {
+		return errs[0]
 	}
 
 	return nil
+}
+
+func (c client) Close() error {
+	return c.backend.Close()
 }
 
 const globalClusterInfoName = "default"
@@ -361,6 +425,49 @@ func (c client) ensureClusterInformation(ctx context.Context, calicoVersion, clu
 		break
 	}
 
+	return nil
+}
+
+// ensureTierExists ensures that a desired Tier exits in the datastore.
+// This is done by first trying to get the tier. If it doesn't exist, it
+// is created. A error is returned if there is any error other than when the
+// tier resource already exists, or when creating tiers is not allowed.
+func (c client) ensureTierExists(ctx context.Context, name string, defaultAction v3.Action, order float64) error {
+	// Get first so that the repeated calls from health checks don't write to the datastore
+	// on every pass.
+	_, err := c.Tiers().Get(ctx, name, options.GetOptions{})
+	switch err.(type) {
+	case nil:
+		log.Debugf("Tier %v already exists.", name)
+		return nil
+	case cerrors.ErrorResourceDoesNotExist:
+		// Fall through and create it.
+	case cerrors.ErrorConnectionUnauthorized:
+		log.WithError(err).Warnf("Unauthorized to read tier %v.", name)
+		return nil
+	default:
+		return err
+	}
+
+	tier := v3.NewTier()
+	tier.ObjectMeta = metav1.ObjectMeta{Name: name}
+	tier.Spec = v3.TierSpec{
+		Order:         &order,
+		DefaultAction: &defaultAction,
+	}
+	if _, err := c.Tiers().Create(ctx, tier, options.SetOptions{}); err != nil {
+		switch err.(type) {
+		case cerrors.ErrorResourceAlreadyExists:
+			log.Debugf("Tier %v already exists.", name)
+			return nil
+		case cerrors.ErrorConnectionUnauthorized:
+			log.WithError(err).Warnf("Unauthorized to create tier %v.", name)
+			return nil
+		default:
+			return err
+		}
+	}
+	log.Infof("Tier %v is now available.", name)
 	return nil
 }
 

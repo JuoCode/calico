@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/typha/pkg/tlsutils"
-
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/utils"
+	"github.com/projectcalico/calico/typha/pkg/tlsutils"
 )
 
 type Typha struct {
@@ -69,18 +68,18 @@ func RunTypha(infra DatastoreInfra, options TopologyOptions) *Typha {
 		options.ExtraVolumes[CertDir] = CertDir
 	}
 
-	args = append(args,
-		utils.Config.TyphaImage,
-	)
+	args = append(args, utils.Config.TyphaImage)
+	args = append(args, utils.TyphaCmd...)
 
 	c := containers.Run("typha",
 		containers.RunOpts{AutoRemove: true},
 		args...,
 	)
 
-	return &Typha{
-		Container: c,
-	}
+	t := &Typha{Container: c}
+	// Register Typha teardown with infra.
+	infra.AddCleanup(t.Stop)
+	return t
 }
 
 var CertDir = ""

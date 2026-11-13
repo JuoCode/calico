@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2015-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,35 +28,33 @@ import (
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
-	"github.com/containernetworking/plugins/pkg/ipam"
-
-	libipam "github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
-
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	k8sconversion "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	k8sresources "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/resources"
-	calicoclient "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
 
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils/cri"
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane"
 	"github.com/projectcalico/calico/cni-plugin/pkg/types"
 	"github.com/projectcalico/calico/cni-plugin/pkg/wait"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	k8sconversion "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	k8sresources "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/resources"
+	calicoclient "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/kubevirt"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
 // Having kubernetes code in its own file avoids polluting the mainline code. It's expected that the kubernetes case will
 // more special casing than the mainline code.
-func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epIDs utils.WEPIdentifiers, calicoClient calicoclient.Interface, endpoint *libapi.WorkloadEndpoint) (*cniv1.Result, error) {
+func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epIDs utils.WEPIdentifiers, calicoClient calicoclient.Interface, endpoint *internalapi.WorkloadEndpoint) (*cniv1.Result, error) {
 	var err error
 	var result *cniv1.Result
 
@@ -105,7 +103,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		//
 		// We unpack the JSON data as an untyped map rather than using a typed struct because we want to
 		// round-trip any fields that we don't know about.
-		var stdinData map[string]interface{}
+		var stdinData map[string]any
 		if err := json.Unmarshal(args.StdinData, &stdinData); err != nil {
 			return nil, err
 		}
@@ -141,15 +139,15 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		logger.Debug("Updated stdin data")
 
 		// Extract any custom routes from the IPAM configuration.
-		ipamData := stdinData["ipam"].(map[string]interface{})
+		ipamData := stdinData["ipam"].(map[string]any)
 		untypedRoutes := ipamData["routes"]
-		hlRoutes, ok := untypedRoutes.([]interface{})
+		hlRoutes, ok := untypedRoutes.([]any)
 		if untypedRoutes != nil && !ok {
 			return nil, fmt.Errorf(
 				"failed to parse host-local IPAM routes section; expecting list, not: %v", stdinData["ipam"])
 		}
 		for _, route := range hlRoutes {
-			route := route.(map[string]interface{})
+			route := route.(map[string]any)
 			untypedDst, ok := route["dst"]
 			if !ok {
 				logger.Debug("Ignoring host-ipam route with no dst")
@@ -187,7 +185,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	labels := make(map[string]string)
 	annot := make(map[string]string)
 
-	var ports []libapi.WorkloadEndpointPort
+	var ports []internalapi.WorkloadEndpointPort
 	var profiles []string
 	var generateName string
 	var serviceAccount string
@@ -196,14 +194,21 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// if the policy type has been set to "k8s". This allows users to
 	// run the plugin under Kubernetes without needing it to access the
 	// Kubernetes API
+	var pod *corev1.Pod
+	var namespace *corev1.Namespace
 	if conf.Policy.PolicyType == "k8s" {
-		annotNS, err := getK8sNSInfo(client, epIDs.Namespace)
+		namespace, err = getK8sNamespace(ctx, client, epIDs.Namespace)
 		if err != nil {
 			return nil, err
 		}
+		annotNS := namespace.Annotations
 		logger.WithField("NS Annotations", annotNS).Debug("Fetched K8s namespace annotations")
 
-		labels, annot, ports, profiles, generateName, serviceAccount, err = getK8sPodInfo(client, epIDs.Pod, epIDs.Namespace)
+		pod, err = getK8sPod(ctx, client, epIDs.Pod, epIDs.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		labels, annot, ports, profiles, generateName, serviceAccount, err = k8sPodInfo(pod)
 		if err != nil {
 			return nil, err
 		}
@@ -215,11 +220,12 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		// Check for calico IPAM specific annotations and set them if needed.
 		if conf.IPAM.Type == "calico-ipam" {
 
-			var v4pools, v6pools string
+			var v4pools, v6pools, ipFamilies string
 
 			// Sets  the Namespace annotation for IP pools as default
 			v4pools = annotNS["cni.projectcalico.org/ipv4pools"]
 			v6pools = annotNS["cni.projectcalico.org/ipv6pools"]
+			ipFamilies = annotNS["cni.projectcalico.org/ipFamilies"]
 
 			// Gets the POD annotation for IP Pools and overwrites Namespace annotation if it exists
 			v4poolpod := annot["cni.projectcalico.org/ipv4pools"]
@@ -230,13 +236,17 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 			if len(v6poolpod) != 0 {
 				v6pools = v6poolpod
 			}
+			ipFamiliesPod := annot["cni.projectcalico.org/ipFamilies"]
+			if len(ipFamiliesPod) != 0 {
+				ipFamilies = ipFamiliesPod
+			}
 
-			if len(v4pools) != 0 || len(v6pools) != 0 {
-				var stdinData map[string]interface{}
+			if len(v4pools) != 0 || len(v6pools) != 0 || len(ipFamilies) != 0 {
+				var stdinData map[string]any
 				if err := json.Unmarshal(args.StdinData, &stdinData); err != nil {
 					return nil, err
 				}
-				var v4PoolSlice, v6PoolSlice []string
+				var v4PoolSlice, v6PoolSlice, ipFamilieSlice []string
 
 				if len(v4pools) > 0 {
 					if err := json.Unmarshal([]byte(v4pools), &v4PoolSlice); err != nil {
@@ -244,10 +254,10 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 						return nil, err
 					}
 
-					if _, ok := stdinData["ipam"].(map[string]interface{}); !ok {
+					if _, ok := stdinData["ipam"].(map[string]any); !ok {
 						return nil, errors.New("data on stdin was of unexpected type")
 					}
-					stdinData["ipam"].(map[string]interface{})["ipv4_pools"] = v4PoolSlice
+					stdinData["ipam"].(map[string]any)["ipv4_pools"] = v4PoolSlice
 					logger.WithField("ipv4_pools", v4pools).Debug("Setting IPv4 Pools")
 				}
 				if len(v6pools) > 0 {
@@ -256,16 +266,48 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 						return nil, err
 					}
 
-					if _, ok := stdinData["ipam"].(map[string]interface{}); !ok {
+					if _, ok := stdinData["ipam"].(map[string]any); !ok {
 						return nil, errors.New("data on stdin was of unexpected type")
 					}
-					stdinData["ipam"].(map[string]interface{})["ipv6_pools"] = v6PoolSlice
+					stdinData["ipam"].(map[string]any)["ipv6_pools"] = v6PoolSlice
 					logger.WithField("ipv6_pools", v6pools).Debug("Setting IPv6 Pools")
+				}
+
+				if len(ipFamilies) > 0 {
+					if err := json.Unmarshal([]byte(ipFamilies), &ipFamilieSlice); err != nil {
+						logger.WithField("IPFamilies", ipFamilies).Error("Error parsing IPFamilies")
+						return nil, err
+					}
+
+					assignV4 := "false"
+					assignV6 := "false"
+					for _, ipFamily := range ipFamilieSlice {
+						switch ipFamily {
+						case "IPv4":
+							assignV4 = "true"
+						case "IPv6":
+							assignV6 = "true"
+						default:
+							logger.WithField("IPFamilies", ipFamilies).Error("Error parsing ipFamilies")
+							return nil, fmt.Errorf("error parsing ipFamilies: %s", ipFamilies)
+						}
+					}
+
+					if _, ok := stdinData["ipam"].(map[string]any); !ok {
+						return nil, errors.New("data on stdin was of unexpected type")
+					}
+
+					stdinData["ipam"].(map[string]any)["assign_ipv4"] = &assignV4
+					stdinData["ipam"].(map[string]any)["assign_ipv6"] = &assignV6
+					logger.WithField("assign_ipv4", assignV4).Debug("Setting assignV4")
+					logger.WithField("assign_ipv6", assignV6).Debug("Setting assignV6")
 				}
 
 				newData, err := json.Marshal(stdinData)
 				if err != nil {
-					logger.WithField("stdinData", stdinData).Error("Error Marshaling data")
+					// Do not log the stdinData map — it may contain K8sAuthToken,
+					// K8sClientKey, K8sCertificateAuthority.
+					logger.WithError(err).Error("Error marshaling CNI stdin data")
 					return nil, err
 				}
 				args.StdinData = newData
@@ -274,14 +316,24 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		}
 	}
 
+	ctx = utils.WithSandboxLookups(ctx, utils.SandboxLookups{
+		CalicoClient: calicoClient,
+		K8sClient:    client,
+		Pod:          pod,
+		Namespace:    namespace,
+	})
+
 	ipAddrsNoIpam := annot["cni.projectcalico.org/ipAddrsNoIpam"]
 	ipAddrs := annot["cni.projectcalico.org/ipAddrs"]
+
+	// Whether result holds addresses carried over from an earlier sandbox of this pod
+	// rather than newly assigned ones. See releaseIPAM below.
+	var reusedIPs bool
 
 	// Switch based on which annotations are passed or not passed.
 	switch {
 	case ipAddrs == "" && ipAddrsNoIpam == "":
-		// Call the IPAM plugin.
-		result, err = utils.AddIPAM(conf, args, logger)
+		result, reusedIPs, err = assignPodIPs(ctx, conf, args, epIDs, endpoint, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -331,20 +383,9 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 			return nil, e
 		}
 
-		// If the endpoint already exists, we need to attempt to release the previous IP addresses here
-		// since the ADD call will fail when it tries to reallocate the same IPs. releaseIPAddrs assumes
-		// that Calico IPAM is in use, which is OK here since only Calico IPAM supports the ipAddrs
-		// annotation.
-		if endpoint != nil {
-			logger.Info("Endpoint already exists and ipAddrs is set. Release any old IPs")
-			if err := releaseIPAddrs(endpoint.Spec.IPNetworks, calicoClient, logger); err != nil {
-				return nil, fmt.Errorf("failed to release ipAddrs: %s", err)
-			}
-		}
-
 		// When ipAddrs annotation is set, we call out to the configured IPAM plugin
 		// requesting the specific IP addresses included in the annotation.
-		result, err = ipAddrsResult(ipAddrs, conf, args, logger)
+		result, err = ipAddrsResult(ctx, ipAddrs, conf, args, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +395,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// Configure the endpoint (creating if required).
 	if endpoint == nil {
 		logger.Debug("Initializing new WorkloadEndpoint resource")
-		endpoint = libapi.NewWorkloadEndpoint()
+		endpoint = internalapi.NewWorkloadEndpoint()
 	}
 	endpoint.Name = epIDs.WEPName
 	endpoint.Namespace = epIDs.Namespace
@@ -380,7 +421,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// Populate the endpoint with the output from the IPAM plugin.
 	if err = utils.PopulateEndpointNets(endpoint, result); err != nil {
 		// Cleanup IP allocation and return the error.
-		utils.ReleaseIPAllocation(logger, conf, args)
+		utils.ReleaseIPAllocation(ctx, logger, conf, args)
 		return nil, err
 	}
 	logger.WithField("endpoint", endpoint).Info("Populated endpoint")
@@ -388,14 +429,29 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 
 	// releaseIPAM cleans up any IPAM allocations on failure.
 	releaseIPAM := func() {
+		if reusedIPs {
+			// The pod's endpoint still records these addresses, so the next ADD claims
+			// them again; releasing them would cost a running pod its IP.
+			logger.WithField("endpointIPs", endpoint.Spec.IPNetworks).Info("Leaving reused IPAM allocation(s) in place after failure")
+			return
+		}
+
 		logger.WithField("endpointIPs", endpoint.Spec.IPNetworks).Info("Releasing IPAM allocation(s) after failure")
-		utils.ReleaseIPAllocation(logger, conf, args)
+		utils.ReleaseIPAllocation(ctx, logger, conf, args)
+	}
+
+	// Check if IPAM returned empty routes (migration target pod case)
+	// calico-ipam returns empty routes for migration target pods to skip host-side route programming
+	skipHostSideRoutes := false
+	if conf.IPAM.Type == "calico-ipam" && len(result.Routes) == 0 {
+		skipHostSideRoutes = true
+		logger.Info("IPAM returned empty routes - skipping host-side route programming")
 	}
 
 	// Whether the endpoint existed or not, the veth needs (re)creating.
 	desiredVethName := k8sconversion.NewConverter().VethNameForWorkload(epIDs.Namespace, epIDs.Pod)
 	hostVethName, contVethMac, err := d.DoNetworking(
-		ctx, calicoClient, args, result, desiredVethName, routes, endpoint, annot)
+		ctx, calicoClient, args, result, desiredVethName, routes, endpoint, annot, skipHostSideRoutes)
 	if err != nil {
 		logger.WithError(err).Error("Error setting up networking")
 		releaseIPAM()
@@ -472,12 +528,12 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 
 		for _, ip := range ips {
 			if strings.Contains(ip, ":") {
-				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, libapi.IPNAT{
+				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, internalapi.IPNAT{
 					InternalIP: podnetV6.IP.String(),
 					ExternalIP: ip,
 				})
 			} else {
-				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, libapi.IPNAT{
+				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, internalapi.IPNAT{
 					InternalIP: podnetV4.IP.String(),
 					ExternalIP: ip,
 				})
@@ -491,7 +547,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// Pod resource. (In Enterprise) Felix also modifies the pod through a patch and setting this avoids patching the
 	// same fields as Felix so that we can't clobber Felix's updates.
 	ctxPatchCNI := k8sresources.ContextWithPatchMode(ctx, k8sresources.PatchModeCNI)
-	var endpointOut *libapi.WorkloadEndpoint
+	var endpointOut *internalapi.WorkloadEndpoint
 	if endpointOut, err = utils.CreateOrUpdate(ctxPatchCNI, calicoClient, endpoint); err != nil {
 		logger.WithError(err).Error("Error creating/updating endpoint in datastore.")
 		releaseIPAM()
@@ -500,9 +556,21 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	logger.Info("Wrote updated endpoint to datastore")
 
 	// Add the interface created above to the CNI result.
-	result.Interfaces = append(result.Interfaces, &cniv1.Interface{
-		Name: endpoint.Spec.InterfaceName},
-	)
+	hostInterface := &cniv1.Interface{
+		Name: hostVethName,
+	}
+	contInterface := &cniv1.Interface{
+		Name:    args.IfName,
+		Mac:     contVethMac,
+		Mtu:     conf.MTU,
+		Sandbox: args.Netns,
+	}
+
+	result.Interfaces = append(result.Interfaces, hostInterface, contInterface)
+
+	for _, ip := range result.IPs {
+		ip.Interface = cniv1.Int(1)
+	}
 
 	// Conditionally wait for host-local Felix to program the policy for this WEP.
 	// Error if negative, ignore if 0.
@@ -613,7 +681,7 @@ func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIde
 
 	// Release the IP address for this container by calling the configured IPAM plugin.
 	logger.Info("Releasing IP address(es)")
-	err = utils.DeleteIPAM(conf, args, logger)
+	err = utils.DeleteIPAM(ctx, conf, args, logger)
 	if err != nil {
 		return err
 	}
@@ -622,35 +690,10 @@ func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIde
 	return nil
 }
 
-// releaseIPAddrs calls directly into Calico IPAM to release the specified IP addresses.
-// NOTE: This function assumes Calico IPAM is in use, and calls into it directly rather than calling the IPAM plugin.
-func releaseIPAddrs(ipAddrs []string, calico calicoclient.Interface, logger *logrus.Entry) error {
-	// For each IP, call out to Calico IPAM to release it.
-	for _, ip := range ipAddrs {
-		log := logger.WithField("IP", ip)
-		log.Info("Releasing explicitly requested address")
-		cip, _, err := cnet.ParseCIDR(ip)
-		if err != nil {
-			return err
-		}
-		unallocated, err := calico.IPAM().ReleaseIPs(context.Background(), libipam.ReleaseOptions{Address: cip.String()})
-		if err != nil {
-			log.WithError(err).Error("Failed to release explicit IP")
-			return err
-		}
-		if len(unallocated) > 0 {
-			log.Warn("Asked to release address but it doesn't exist.")
-		} else {
-			log.Infof("Released explicit address: %s", ip)
-		}
-	}
-	return nil
-}
-
 // ipAddrsResult parses the ipAddrs annotation and calls the configured IPAM plugin for
 // each IP passed to it by setting the IP field in CNI_ARGS, and returns the result of calling the IPAM plugin.
 // Example annotation value string: "[\"10.0.0.1\", \"2001:db8::1\"]"
-func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cniv1.Result, error) {
+func ipAddrsResult(ctx context.Context, ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cniv1.Result, error) {
 	logger.Infof("Parsing annotation \"cni.projectcalico.org/ipAddrs\":%s", ipAddrs)
 
 	// We need to make sure there is only one IPv4 and/or one IPv6
@@ -660,21 +703,86 @@ func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logge
 		return nil, err
 	}
 
+	return assignRequestedIPs(ctx, ipList, conf, args, logger)
+}
+
+// assignPodIPs allocates this pod's addresses, preferring the ones its existing endpoint
+// already holds. Reuse lets an in-place sandbox rebuild succeed in a pool that has no
+// spare capacity for a second allocation.
+func assignPodIPs(
+	ctx context.Context,
+	conf types.NetConf,
+	args *skel.CmdArgs,
+	epIDs utils.WEPIdentifiers,
+	endpoint *internalapi.WorkloadEndpoint,
+	logger *logrus.Entry,
+) (*cniv1.Result, bool, error) {
+	priorIPs := priorSandboxIPs(conf, epIDs, endpoint, logger)
+	if len(priorIPs) != 0 {
+		logger.WithField("ips", priorIPs).Info("Reassigning existing IP to new sandbox")
+		result, err := assignRequestedIPs(ctx, priorIPs, conf, args, logger)
+		if err == nil {
+			return result, true, nil
+		}
+
+		// IPAM can return a partial success. Release any IPs that we just assigned to this
+		// sandbox before attempting to allocate a fresh one.
+		utils.ReleaseIPAllocation(ctx, logger, conf, args)
+
+		// A newer sandbox owns the pod's network. Networking this one, even with a fresh
+		// address, would replace the live sandbox's host interface.
+		var cniErr *cnitypes.Error
+		if errors.As(err, &cniErr) && cniErr.Code == types.ErrCodeSandboxSuperseded {
+			return nil, false, err
+		}
+		logger.WithError(err).Warn("Could not reuse the endpoint's addresses, assigning new ones")
+	}
+
+	// Assign a fresh IP address via the IPAM plugin.
+	result, err := utils.AddIPAM(ctx, conf, args, logger)
+	return result, false, err
+}
+
+// priorSandboxIPs returns the addresses recorded on an existing endpoint, which a new
+// sandbox for the same pod should request by address rather than auto-assign.
+func priorSandboxIPs(conf types.NetConf, epIDs utils.WEPIdentifiers, endpoint *internalapi.WorkloadEndpoint, logger *logrus.Entry) []net.IP {
+	if endpoint == nil || conf.IPAM.Type != "calico-ipam" {
+		return nil
+	}
+
+	// KubeVirt pods key their allocations on the VM rather than the sandbox, and the IPAM
+	// plugin has its own reuse path for them.
+	if kubevirt.MaybeVirtLauncherPod(epIDs.Pod) {
+		return nil
+	}
+
+	var ips []net.IP
+	for _, ipNetwork := range endpoint.Spec.IPNetworks {
+		ip, _, err := net.ParseCIDR(ipNetwork)
+		if err != nil {
+			logger.WithError(err).WithField("ipNetwork", ipNetwork).Warn("Endpoint records an address we cannot parse, not reusing any of them")
+			return nil
+		}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+// assignRequestedIPs calls the configured IPAM plugin once per address, asking for that
+// specific address instead of letting IPAM choose.
+func assignRequestedIPs(ctx context.Context, ips []net.IP, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cniv1.Result, error) {
 	result := cniv1.Result{
 		CNIVersion: cniv1.ImplementedSpecVersion,
 	}
 
-	// Go through all the IPs passed in as annotation value and call IPAM plugin
-	// for each, and populate the result variable with IP4 and/or IP6 IPs returned
-	// from the IPAM plugin.
-	for _, ip := range ipList {
-		// Call callIPAMWithIP with the ip address.
-		r, err := callIPAMWithIP(ip, conf, args, logger)
+	for _, ip := range ips {
+		r, err := callIPAMWithIP(ctx, ip, conf, args, logger)
 		if err != nil {
-			return nil, fmt.Errorf("error getting IP from IPAM: %s", err)
+			return nil, fmt.Errorf("error getting IP from IPAM: %w", err)
 		}
 
 		result.IPs = append(result.IPs, r.IPs[0])
+		result.Routes = append(result.Routes, r.Routes...)
 		version := "6"
 		if r.IPs[0].Address.IP.To4() != nil {
 			version = "4"
@@ -688,8 +796,7 @@ func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logge
 // callIPAMWithIP sets CNI_ARGS with the IP and calls the IPAM plugin with it
 // to get current.Result and then it unsets the IP field from CNI_ARGS ENV var,
 // so it doesn't pollute the subsequent requests.
-func callIPAMWithIP(ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cniv1.Result, error) {
-
+func callIPAMWithIP(ctx context.Context, ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cniv1.Result, error) {
 	// Save the original value of the CNI_ARGS ENV var for backup.
 	originalArgs := os.Getenv("CNI_ARGS")
 	logger.Debugf("Original CNI_ARGS=%s", originalArgs)
@@ -720,7 +827,7 @@ func callIPAMWithIP(ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *l
 
 	// Run the IPAM plugin.
 	logger.Debugf("Calling IPAM plugin %s", conf.IPAM.Type)
-	r, err := ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
+	rawResult, err := utils.ExecIPAMAdd(ctx, conf.IPAM.Type, args.StdinData)
 	if err != nil {
 		// Restore the CNI_ARGS ENV var to it's original value,
 		// so the subsequent calls don't get polluted by the old IP value.
@@ -729,13 +836,13 @@ func callIPAMWithIP(ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *l
 		}
 		return nil, err
 	}
-	logger.Debugf("IPAM plugin returned: %+v", r)
+	logger.Debugf("IPAM plugin returned: %+v", rawResult)
 
 	// Restore the CNI_ARGS ENV var to it's original value,
 	// so the subsequent calls don't get polluted by the old IP value.
 	if err := os.Setenv("CNI_ARGS", originalArgs); err != nil {
 		// Need to clean up IP allocation if this step doesn't succeed.
-		utils.ReleaseIPAllocation(logger, conf, args)
+		utils.ReleaseIPAllocation(ctx, logger, conf, args)
 		logger.Errorf("Error setting CNI_ARGS environment variable: %v", err)
 		return nil, err
 	}
@@ -744,7 +851,7 @@ func callIPAMWithIP(ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *l
 	// IPAM result has a bunch of fields that are optional for an IPAM plugin
 	// but required for a CNI plugin, so this is to populate those fields.
 	// See CNI Spec doc for more details.
-	ipamResult, err := cniv1.NewResultFromResult(r)
+	ipamResult, err := cniv1.NewResultFromResult(rawResult)
 	if err != nil {
 		return nil, err
 	}
@@ -864,7 +971,9 @@ func parseIPAddrs(ipAddrsStr string, logger *logrus.Entry) ([]string, error) {
 	return ips, nil
 }
 
-func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clientset, error) {
+// getK8sRestConfig creates a Kubernetes REST config from the CNI network configuration.
+// This helper function builds the config with kubeconfig file and overrides from the network config.
+func getK8sRestConfig(conf types.NetConf) (*rest.Config, error) {
 	// Some config can be passed in a kubeconfig file
 	kubeconfig := conf.Kubernetes.Kubeconfig
 
@@ -900,9 +1009,14 @@ func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clients
 	}
 
 	// Use the kubernetes client code to load the kubeconfig file and combine it with the overrides.
-	config, err := winutils.NewNonInteractiveDeferredLoadingClientConfig(
+	return winutils.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
 		configOverrides)
+}
+
+func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clientset, error) {
+	// Get the Kubernetes REST config
+	config, err := getK8sRestConfig(conf)
 	if err != nil {
 		return nil, err
 	}
@@ -911,22 +1025,43 @@ func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clients
 	return kubernetes.NewForConfig(config)
 }
 
-func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotations map[string]string, err error) {
-	ns, err := client.CoreV1().Namespaces().Get(context.Background(), podNamespace, metav1.GetOptions{})
-	logrus.Debugf("namespace info %+v", ns)
+// NewKubeVirtClient creates a KubeVirt client from the CNI network configuration.
+// Note: This will return an error if KubeVirt is not installed in the cluster.
+func NewKubeVirtClient(conf types.NetConf, logger *logrus.Entry) (kubevirt.VirtClientInterface, error) {
+	// Get the Kubernetes REST config
+	config, err := getK8sRestConfig(conf)
 	if err != nil {
 		return nil, err
 	}
-	return ns.Annotations, nil
+
+	// Create KubeVirt client
+	return kubevirt.NewVirtClient(config)
 }
 
-func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (labels map[string]string, annotations map[string]string, ports []libapi.WorkloadEndpointPort, profiles []string, generateName, serviceAccount string, err error) {
-	pod, err := client.CoreV1().Pods(string(podNamespace)).Get(context.Background(), podName, metav1.GetOptions{})
-	logrus.Debugf("pod info %+v", pod)
-	if err != nil {
-		return nil, nil, nil, nil, "", "", err
-	}
+func getK8sNamespace(ctx context.Context, client *kubernetes.Clientset, podNamespace string) (*corev1.Namespace, error) {
+	ns, err := client.CoreV1().Namespaces().Get(ctx, podNamespace, metav1.GetOptions{})
+	// Do not log the full Namespace object — annotations may carry operator tokens or sensitive state.
+	logrus.WithField("namespace", podNamespace).Debug("Pod namespace")
+	return ns, err
+}
 
+func getK8sPod(ctx context.Context, client *kubernetes.Clientset, podName, podNamespace string) (*corev1.Pod, error) {
+	pod, err := client.CoreV1().Pods(podNamespace).Get(ctx, podName, metav1.GetOptions{})
+	// Do not log the full Pod object — env vars may contain literal credentials.
+	logrus.WithFields(logrus.Fields{"name": podName, "namespace": podNamespace}).Debug("Pod info")
+	return pod, err
+}
+
+// k8sPodInfo derives the workload endpoint fields that come from the pod.
+func k8sPodInfo(pod *corev1.Pod) (
+	labels map[string]string,
+	annotations map[string]string,
+	ports []internalapi.WorkloadEndpointPort,
+	profiles []string,
+	generateName string,
+	serviceAccount string,
+	err error,
+) {
 	c := k8sconversion.NewConverter()
 	kvps, err := c.PodToWorkloadEndpoints(pod)
 	if err != nil {
@@ -934,11 +1069,11 @@ func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (
 	}
 
 	kvp := kvps[0]
-	ports = kvp.Value.(*libapi.WorkloadEndpoint).Spec.Ports
-	labels = kvp.Value.(*libapi.WorkloadEndpoint).Labels
-	profiles = kvp.Value.(*libapi.WorkloadEndpoint).Spec.Profiles
-	generateName = kvp.Value.(*libapi.WorkloadEndpoint).GenerateName
-	serviceAccount = kvp.Value.(*libapi.WorkloadEndpoint).Spec.ServiceAccountName
+	ports = kvp.Value.(*internalapi.WorkloadEndpoint).Spec.Ports
+	labels = kvp.Value.(*internalapi.WorkloadEndpoint).Labels
+	profiles = kvp.Value.(*internalapi.WorkloadEndpoint).Spec.Profiles
+	generateName = kvp.Value.(*internalapi.WorkloadEndpoint).GenerateName
+	serviceAccount = kvp.Value.(*internalapi.WorkloadEndpoint).Spec.ServiceAccountName
 
 	return labels, pod.Annotations, ports, profiles, generateName, serviceAccount, nil
 }

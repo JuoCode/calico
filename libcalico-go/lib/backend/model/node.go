@@ -15,46 +15,23 @@
 package model
 
 import (
-	goerrors "errors"
 	"fmt"
+	"reflect"
 	"regexp"
 
-	"reflect"
-
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/api/pkg/lib/numorstring"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 var (
-	typeNode          = reflect.TypeOf(Node{})
-	typeHostMetadata  = reflect.TypeOf(HostMetadata{})
-	typeOrchRefs      = reflect.TypeOf([]OrchRef{})
-	typeHostIp        = rawIPType
-	typeWireguard     = reflect.TypeOf(Wireguard{})
+	typeHostMetadata  = reflect.TypeFor[HostMetadata]()
+	typeOrchRefs      = reflect.TypeFor[[]OrchRef]()
+	typeWireguard     = reflect.TypeFor[Wireguard]()
 	matchHostMetadata = regexp.MustCompile(`^/?calico/v1/host/([^/]+)/metadata$`)
-	matchHostIp       = regexp.MustCompile(`^/?calico/v1/host/([^/]+)/bird_ip$`)
 	matchWireguard    = regexp.MustCompile(`^/?calico/v1/host/([^/]+)/wireguard$`)
 )
-
-type Node struct {
-	// Felix specific configuration
-	FelixIPv4 *net.IP
-
-	// Node specific labels
-	Labels map[string]string `json:"labels,omitempty"`
-
-	// BGP specific configuration
-	BGPIPv4Addr *net.IP
-	BGPIPv6Addr *net.IP
-	BGPIPv4Net  *net.IPNet
-	BGPIPv6Net  *net.IPNet
-	BGPASNumber *numorstring.ASNumber
-	OrchRefs    []OrchRef `json:"orchRefs,omitempty"`
-}
 
 type OrchRef struct {
 	Orchestrator string `json:"orchestrator,omitempty"`
@@ -68,50 +45,10 @@ type Wireguard struct {
 	PublicKeyV6       string  `json:"publicKeyV6,omitempty"`
 }
 
-type NodeKey struct {
-	Hostname string
-}
-
-func (key NodeKey) defaultPath() (string, error) {
-	return "", goerrors.New("Node is a composite type, so not handled with a single path")
-}
-
-func (key NodeKey) defaultDeletePath() (string, error) {
-	return "", goerrors.New("Node is a composite type, so not handled with a single path")
-}
-
-func (key NodeKey) defaultDeleteParentPaths() ([]string, error) {
-	return nil, goerrors.New("Node is composite type, so not handled with a single path")
-}
-
-func (key NodeKey) valueType() (reflect.Type, error) {
-	return typeNode, nil
-}
-
-func (key NodeKey) String() string {
-	return fmt.Sprintf("Node(name=%s)", key.Hostname)
-}
-
-type NodeListOptions struct {
-	Hostname string
-}
-
-func (options NodeListOptions) defaultPathRoot() string {
-	return ""
-}
-
-func (options NodeListOptions) KeyFromDefaultPath(path string) Key {
-	return nil
-}
-
-// The node is a composite of the following subcomponents:
-// -  The host metadata.  This is the primary subcomponent and is used to enumerate
-//    hosts.  However, for backwards compatibility, the etcd driver needs to handle
-//    that this may not exist, and instead need to enumerate based on directory.
-// -  The host IPv4 address used by Calico to lock down IPIP traffic.
-// -  The BGP IPv4 and IPv6 addresses
-// -  The BGP ASN.
-
+// HostMetadata is the primary v1 host enumeration entry — its presence in the
+// datastore signals "this host exists". Tunnel addresses, BGP config, etc. are
+// derived from the v3 Node resource and projected onto separate v1 keys by the
+// felix node update processor.
 type HostMetadata struct {
 }
 
@@ -141,6 +78,10 @@ func (key HostMetadataKey) valueType() (reflect.Type, error) {
 	return typeHostMetadata, nil
 }
 
+func (key HostMetadataKey) parseValue(rawData []byte) (any, error) {
+	return parseJSONPointer[HostMetadata](key, rawData)
+}
+
 func (key HostMetadataKey) String() string {
 	return fmt.Sprintf("Node(name=%s)", key.Hostname)
 }
@@ -167,32 +108,6 @@ func (options HostMetadataListOptions) KeyFromDefaultPath(path string) Key {
 	}
 }
 
-// The Felix Host IP Key.
-type HostIPKey struct {
-	Hostname string
-}
-
-func (key HostIPKey) defaultPath() (string, error) {
-	return fmt.Sprintf("/calico/v1/host/%s/bird_ip",
-		key.Hostname), nil
-}
-
-func (key HostIPKey) defaultDeletePath() (string, error) {
-	return key.defaultPath()
-}
-
-func (key HostIPKey) defaultDeleteParentPaths() ([]string, error) {
-	return nil, nil
-}
-
-func (key HostIPKey) valueType() (reflect.Type, error) {
-	return typeHostIp, nil
-}
-
-func (key HostIPKey) String() string {
-	return fmt.Sprintf("Node(name=%s)", key.Hostname)
-}
-
 type OrchRefKey struct {
 	Hostname string
 }
@@ -212,6 +127,10 @@ func (key OrchRefKey) defaultDeleteParentPaths() ([]string, error) {
 
 func (key OrchRefKey) valueType() (reflect.Type, error) {
 	return typeOrchRefs, nil
+}
+
+func (key OrchRefKey) parseValue(rawData []byte) (any, error) {
+	return parseJSONValue[[]OrchRef](key, rawData)
 }
 
 func (key OrchRefKey) String() string {
@@ -253,6 +172,10 @@ func (key WireguardKey) defaultDeleteParentPaths() ([]string, error) {
 
 func (key WireguardKey) valueType() (reflect.Type, error) {
 	return typeWireguard, nil
+}
+
+func (key WireguardKey) parseValue(rawData []byte) (any, error) {
+	return parseJSONPointer[Wireguard](key, rawData)
 }
 
 func (key WireguardKey) String() string {

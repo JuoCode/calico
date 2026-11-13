@@ -5,15 +5,21 @@
 #ifndef __CALI_NAT6_H__
 #define __CALI_NAT6_H__
 
-#include <stddef.h>
-
 #include <linux/if_ether.h>
+#include <linux/in.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/udp.h>
 
-#include "bpf.h"
-#include "skb.h"
-#include "routes.h"
+#include "cali_bpf.h"
+#include "counters.h"
+#include "globals.h"
+#include "ip_addr.h"
+#include "log.h"
 #include "nat_types.h"
+#include "reasons.h"
+#include "skb.h"
+#include "types.h"
 
 /* Number of bytes we add to a packet when we do encap. */
 #define VXLAN_ENCAP_SIZE	(sizeof(struct ethhdr) + sizeof(struct iphdr) + \
@@ -24,16 +30,21 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx, ipv6_addr_t *ip_
 	__u32 new_hdrsz = sizeof(struct ethhdr) + sizeof(struct ipv6hdr) +
 			sizeof(struct udphdr) + sizeof(struct vxlanhdr);
 
-	if (bpf_skb_adjust_room(ctx->skb, new_hdrsz, BPF_ADJ_ROOM_MAC,
-						  BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
-						  BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 |
-						  BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr)))) {
+	__u64 flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
+			BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 |
+			BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr));
+
+	if (ctx->state->ip_proto == IPPROTO_UDP) {
+		flags |= BPF_F_ADJ_ROOM_FIXED_GSO;
+	}
+
+	if (bpf_skb_adjust_room(ctx->skb, new_hdrsz, BPF_ADJ_ROOM_MAC, flags)) {
 		return -1;
 	}
 
 	if (skb_refresh_validate_ptrs(ctx, new_hdrsz)) {
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short VXLAN encap\n");
+		CALI_DEBUG("Too short VXLAN encap");
 		return -1;
 	}
 
@@ -58,7 +69,8 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx, ipv6_addr_t *ip_
 
 	udp->source = bpf_htons(src_port);
 	udp->dest = bpf_htons(VXLAN_PORT);
-	udp->len = bpf_htons(bpf_ntohs(ip_hdr(ctx)->payload_len) - sizeof(struct iphdr));
+	/* payload_len already excludes the IPv6 base header, unlike IPv4 tot_len. */
+	udp->len = ip_hdr(ctx)->payload_len;
 	/* XXX we leave udp->check == 0 which is not legal in IPv6, but we are
 	 * the only ones parsing that packet!
 	 */
@@ -69,7 +81,7 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx, ipv6_addr_t *ip_
 	/* keep eth_inner MACs zeroed, it is useless after decap */
 	eth_inner->h_proto = eth_hdr(ctx)->h_proto;
 
-	CALI_DEBUG("vxlan encap %x : %x\n",
+	CALI_DEBUG("vxlan encap %x : %x",
 		bpf_ntohl(ip_hdr(ctx)->saddr.in6_u.u6_addr32[3]), bpf_ntohl(ip_hdr(ctx)->daddr.in6_u.u6_addr32[3]));
 
 	return 0;
@@ -83,7 +95,7 @@ static CALI_BPF_INLINE int vxlan_decap(struct __sk_buff *skb)
 	extra_hdrsz = sizeof(struct ethhdr) + sizeof(struct ipv6hdr) +
 		sizeof(struct udphdr) + sizeof(struct vxlanhdr);
 
-	ret = bpf_skb_adjust_room(skb, -extra_hdrsz, BPF_ADJ_ROOM_MAC | BPF_F_ADJ_ROOM_FIXED_GSO, 0);
+	ret = bpf_skb_adjust_room(skb, -extra_hdrsz, BPF_ADJ_ROOM_MAC, BPF_F_ADJ_ROOM_FIXED_GSO);
 
 	return ret;
 }

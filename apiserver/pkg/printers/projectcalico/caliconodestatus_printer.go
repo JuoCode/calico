@@ -17,13 +17,13 @@ package projectcalico
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/printers"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 func CalicoNodeStatusAddHandlers(h printers.PrintHandler) {
@@ -63,19 +63,14 @@ func printCalicoNodeStatus(status *calico.CalicoNodeStatus, options printers.Gen
 
 	// Define a function return true if the status contains information about a class.
 	hasClass := func(c calico.NodeStatusClassType) bool {
-		for _, class := range status.Spec.Classes {
-			if class == c {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(status.Spec.Classes, c)
 	}
 
-	var classes string
+	var classes strings.Builder
 	for _, class := range status.Spec.Classes {
-		classes += fmt.Sprintf("%s,", class)
+		fmt.Fprintf(&classes, "%s,", class)
 	}
-	classesStr := strings.TrimSuffix(classes, ",")
+	classesStr := strings.TrimSuffix(classes.String(), ",")
 
 	var lastUpdatedStr string
 	lastUpdatedDate := status.Status.LastUpdated

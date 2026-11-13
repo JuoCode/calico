@@ -19,8 +19,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/failsafes"
@@ -253,6 +253,9 @@ func TestFailsafes(t *testing.T) {
 			result := "TC_ACT_SHOT"
 			if test.Allowed {
 				result = "TC_ACT_UNSPEC"
+				if prog == "calico_from_host_ep" {
+					result = "TC_ACT_REDIRECT"
+				}
 			}
 
 			runBpfTest(t, prog, test.Rules, func(bpfrun bpfProgRunFn) {

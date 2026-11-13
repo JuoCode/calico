@@ -15,15 +15,33 @@
 package net
 
 import (
+	"encoding/json"
 	"math/big"
 	"net"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/json"
+	"slices"
 )
 
 // Sub class net.IPNet so that we can add JSON marshalling and unmarshalling.
 type IPNet struct {
 	net.IPNet
+}
+
+// DeepCopyInto copies the receiver into out, cloning the underlying IP and Mask
+// byte slices so the two do not alias. deepcopy-gen detects this method and uses
+// it for any generated type with an IPNet field.
+func (i *IPNet) DeepCopyInto(out *IPNet) {
+	out.IP = slices.Clone(i.IP)
+	out.Mask = slices.Clone(i.Mask)
+}
+
+// DeepCopy returns a deep copy of the IPNet.
+func (i *IPNet) DeepCopy() *IPNet {
+	if i == nil {
+		return nil
+	}
+	out := new(IPNet)
+	i.DeepCopyInto(out)
+	return out
 }
 
 // MarshalJSON interface for an IPNet
@@ -74,6 +92,10 @@ func (i IPNet) Covers(n net.IPNet) bool {
 }
 
 func (i IPNet) NthIP(n int) IP {
+	return i.nthIP(int64(n))
+}
+
+func (i IPNet) nthIP(n int64) IP {
 	bigN := big.NewInt(int64(n))
 	return IncrementIP(IP{i.IP}, bigN)
 }

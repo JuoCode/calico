@@ -18,12 +18,11 @@ import (
 	"fmt"
 
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 )
 
 type namespaceConverter struct {
@@ -33,7 +32,7 @@ type namespaceConverter struct {
 func NewNamespaceConverter() Converter {
 	return &namespaceConverter{}
 }
-func (nc *namespaceConverter) Convert(k8sObj interface{}) (interface{}, error) {
+func (nc *namespaceConverter) Convert(k8sObj any) (any, error) {
 	c := conversion.NewConverter()
 	namespace, ok := k8sObj.(*v1.Namespace)
 	if !ok {
@@ -62,7 +61,7 @@ func (nc *namespaceConverter) Convert(k8sObj interface{}) (interface{}, error) {
 // GetKey returns name of the Profile as its key.  For Profiles
 // backed by Kubernetes namespaces and managed by this controller, the name
 // is of format `kns.name`.
-func (nc *namespaceConverter) GetKey(obj interface{}) string {
+func (nc *namespaceConverter) GetKey(obj any) string {
 	profile := obj.(api.Profile)
 	return profile.Name
 }

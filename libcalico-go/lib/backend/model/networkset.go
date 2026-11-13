@@ -16,20 +16,20 @@ package model
 
 import (
 	"fmt"
-
-	"regexp"
-
 	"reflect"
+	"regexp"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 var (
 	matchNetworkSet = regexp.MustCompile("^/?calico/v1/netset/([^/]+)$")
-	typeNetworkSet  = reflect.TypeOf(NetworkSet{})
+	typeNetworkSet  = reflect.TypeFor[NetworkSet]()
 )
 
 type NetworkSetKey struct {
@@ -56,8 +56,23 @@ func (key NetworkSetKey) valueType() (reflect.Type, error) {
 	return typeNetworkSet, nil
 }
 
+func (key NetworkSetKey) parseValue(rawData []byte) (any, error) {
+	return parseJSONPointer[NetworkSet](key, rawData)
+}
+
 func (key NetworkSetKey) String() string {
 	return fmt.Sprintf("NetworkSet(name=%s)", key.Name)
+}
+
+// GetNamespace extracts the namespace from a namespaced NetworkSetKey.
+// NetworkSets with names in the format "namespace/name" are namespaced.
+// Returns empty string for global (non-namespaced) NetworkSets.
+func (key NetworkSetKey) GetNamespace() string {
+	if strings.Contains(key.Name, "/") {
+		parts := strings.SplitN(key.Name, "/", 2)
+		return parts[0]
+	}
+	return ""
 }
 
 type NetworkSetListOptions struct {
@@ -89,7 +104,7 @@ func (options NetworkSetListOptions) KeyFromDefaultPath(path string) Key {
 }
 
 type NetworkSet struct {
-	Nets       []net.IPNet       `json:"nets,omitempty" validate:"omitempty,dive,cidr"`
-	Labels     map[string]string `json:"labels,omitempty" validate:"omitempty,labels"`
-	ProfileIDs []string          `json:"profile_ids,omitempty" validate:"omitempty,dive,name"`
+	Nets       []net.IPNet      `json:"nets,omitempty" validate:"omitempty,dive,cidr"`
+	Labels     uniquelabels.Map `json:"labels" validate:"omitempty,labels"`
+	ProfileIDs []string         `json:"profile_ids,omitempty" validate:"omitempty,dive,name"`
 }

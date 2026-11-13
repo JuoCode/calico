@@ -1,0 +1,10 @@
+.istio-cni.created-*
+.istio-pilot.created-*
+.istio-proxyv2.created-*
+.istio-ztunnel.created-*
+.istio.fetched
+.istio.downloaded
+.release-*
+.ztunnel.downloaded
+istio/
+ztunnel/

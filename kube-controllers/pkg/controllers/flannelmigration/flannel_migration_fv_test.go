@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,17 +18,16 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"regexp"
 	"time"
 
+	gocidr "github.com/apparentlymart/go-cidr/cidr"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	gocidr "github.com/apparentlymart/go-cidr/cidr"
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/kube-controllers/tests/testutils"
@@ -39,9 +38,6 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 )
 
 const (
@@ -57,7 +53,7 @@ const (
 
 var emptyLabel = map[string]string{}
 
-var _ = Describe("flannel-migration-controller FV test", func() {
+var _ = Describe("flannel-migration-controller FV test", Ordered, ContinueOnFailure, func() {
 	var (
 		etcd                *containers.Container
 		migrationController *containers.Container
@@ -66,9 +62,10 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 		bc                  backend.Client
 		k8sClient           *kubernetes.Clientset
 		controllerManager   *containers.Container
-		kconfigfile         *os.File
+		kconfigfile         string
 		err                 error
 		flannelCluster      *testutils.FlannelCluster
+		removeKubeconfig    func()
 	)
 
 	logKubectl := func(args ...string) {
@@ -79,36 +76,27 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 
 	startController := func() {
 		// Add 3 seconds delay before main thread starts, this is to make sure FV can add watch channels
-		// before controller logs out to stderr.
+		// before controller logs out to stdout.
 		// (container.Run returns after 'docker ps' shows the container, the polling interval is 1 second.)
 		// Add 60 seconds delay before main thread exits, this is to make sure controller is still running
 		// after test case completed and stopped by AfterEach.
-		migrationController = testutils.RunFlannelMigrationController(kconfigfile.Name(), controllerNodeName, flannelSubnetEnv, 3, 60)
+		migrationController = testutils.RunFlannelMigrationController(kconfigfile, controllerNodeName, flannelSubnetEnv, 3, 60)
 	}
 
 	stopController := func() {
 		migrationController.Stop()
 	}
 
-	BeforeEach(func() {
+	BeforeAll(func() {
 		// Run etcd.
 		etcd = testutils.RunEtcd()
 
 		// Run apiserver.
 		apiserver = testutils.RunK8sApiserver(etcd.IP)
 
-		// Write out a kubeconfig file
-		kconfigfile, err = os.CreateTemp("", "ginkgo-migrationcontroller")
-		Expect(err).NotTo(HaveOccurred())
+		kconfigfile, removeKubeconfig = testutils.BuildKubeconfig(apiserver.IP)
 
-		data := testutils.BuildKubeconfig(apiserver.IP)
-		_, err = kconfigfile.Write([]byte(data))
-		Expect(err).NotTo(HaveOccurred())
-
-		// Make the kubeconfig readable by the container.
-		Expect(kconfigfile.Chmod(os.ModePerm)).NotTo(HaveOccurred())
-
-		k8sClient, err = testutils.GetK8sClient(kconfigfile.Name())
+		k8sClient, err = testutils.GetK8sClient(kconfigfile)
 		Expect(err).NotTo(HaveOccurred())
 
 		// Wait for the apiserver to be available.
@@ -119,25 +107,25 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 
 		// Apply the necessary CRDs. There can sometimes be a delay between starting
 		// the API server and when CRDs are apply-able, so retry here.
-		apply := func() error {
-			out, err := apiserver.ExecOutput("kubectl", "apply", "-f", "/crds/")
-			if err != nil {
-				return fmt.Errorf("%s: %s", err, out)
-			}
-			return nil
-		}
-		Eventually(apply, 10*time.Second).ShouldNot(HaveOccurred())
+		testutils.ApplyCRDs(apiserver)
 
 		// Make a Calico client and backend client.
-		type accessor interface {
-			Backend() backend.Client
-		}
-		calicoClient = testutils.GetCalicoClient(apiconfig.Kubernetes, "", kconfigfile.Name())
-		bc = calicoClient.(accessor).Backend()
+		calicoClient = testutils.GetCalicoClient(apiconfig.Kubernetes, "", kconfigfile)
+		bc = calicoClient.(backend.BackendAccessor).Backend()
 
 		// Run controller manager.
 		controllerManager = testutils.RunK8sControllerManager(apiserver.IP)
+	})
 
+	AfterAll(func() {
+		_ = calicoClient.Close()
+		controllerManager.Stop()
+		apiserver.Stop()
+		etcd.Stop()
+		removeKubeconfig()
+	})
+
+	BeforeEach(func() {
 		// Initialise a new Flannel cluster
 		flannelCluster = testutils.NewFlannelCluster(k8sClient, "192.168.0.0/16")
 
@@ -153,11 +141,7 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 	})
 
 	AfterEach(func() {
-		flannelCluster.Reset()
-		os.Remove(kconfigfile.Name())
-		controllerManager.Stop()
-		apiserver.Stop()
-		etcd.Stop()
+		testutils.CleanupAllResources(context.Background(), k8sClient, calicoClient, bc, testutils.CleanupOptions{})
 	})
 
 	Context("Should migrate FV tests", func() {
@@ -172,7 +156,7 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 
 			startController()
 
-			w := migrationController.WatchStderrFor(regexp.MustCompile(`.*no migration process is needed.*`))
+			w := migrationController.WatchStdoutFor(regexp.MustCompile(`.*no migration process is needed.*`))
 			Eventually(w, "10s").Should(BeClosed(),
 				"Timed out waiting for migration controller report 'no migration process is needed'")
 		})
@@ -184,7 +168,7 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 
 			startController()
 
-			w := migrationController.WatchStderrFor(regexp.MustCompile(`.*abort migration process.*`))
+			w := migrationController.WatchStdoutFor(regexp.MustCompile(`.*abort migration process.*`))
 			Eventually(w, "10s").Should(BeClosed(),
 				"Timed out waiting for migration controller report 'abort migration process'")
 		})
@@ -193,7 +177,7 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 	Context("IPAM migrate FV tests", func() {
 		checkCalicoIPAM := func() {
 			// Wait for ipam migration is done.
-			w := migrationController.WatchStderrFor(regexp.MustCompile(`.*nodes completed IPAM migration process.*`))
+			w := migrationController.WatchStdoutFor(regexp.MustCompile(`.*nodes completed IPAM migration process.*`))
 			Eventually(w, "10s").Should(BeClosed(),
 				"Timed out waiting for migration controller report 'nodes completed IPAM migration process'")
 
@@ -244,13 +228,13 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 	Context("Node ordering FV tests", func() {
 		checkNodeOrdering := func() {
 			// Set watch for node index.
-			w0 := migrationController.WatchStderrFor(regexp.MustCompile(`.*node-2\[index 0\].*`))
-			w1 := migrationController.WatchStderrFor(regexp.MustCompile(`.*node-3\[index 1\].*`))
-			w2 := migrationController.WatchStderrFor(regexp.MustCompile(`.*node-1\[index 2\].*`))
-			w3 := migrationController.WatchStderrFor(regexp.MustCompile(`.*node-0\[index 3\].*`))
+			w0 := migrationController.WatchStdoutFor(regexp.MustCompile(`.*node-2\[index 0\].*`))
+			w1 := migrationController.WatchStdoutFor(regexp.MustCompile(`.*node-3\[index 1\].*`))
+			w2 := migrationController.WatchStdoutFor(regexp.MustCompile(`.*node-1\[index 2\].*`))
+			w3 := migrationController.WatchStdoutFor(regexp.MustCompile(`.*node-0\[index 3\].*`))
 
 			// Wait for ipam migration is done.
-			w := migrationController.WatchStderrFor(regexp.MustCompile(`.*nodes completed IPAM migration process.*`))
+			w := migrationController.WatchStdoutFor(regexp.MustCompile(`.*nodes completed IPAM migration process.*`))
 			Eventually(w, "10s").Should(BeClosed(),
 				"Timed out waiting for migration controller report 'nodes completed IPAM migration process'")
 
@@ -336,20 +320,21 @@ func validateCalicoIPAM(fc *testutils.FlannelCluster, client client.Interface, b
 		Expect(node.Spec.VXLANTunnelMACAddr).To(Equal(fn.VtepMac))
 
 		// Check tunnel ip been correctly assigned.
-		attr, _, err := client.IPAM().GetAssignmentAttributes(ctx, vtepIP)
+		allocAttr, err := client.IPAM().GetAssignmentAttributes(ctx, vtepIP)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(attr[ipam.AttributeNode]).To(Equal(nodeName))
-		Expect(attr[ipam.AttributeType]).To(Equal(ipam.AttributeTypeVXLAN))
+		Expect(allocAttr.ActiveOwnerAttrs[ipam.AttributeNode]).To(Equal(nodeName))
+		Expect(allocAttr.ActiveOwnerAttrs[ipam.AttributeType]).To(Equal(ipam.AttributeTypeVXLAN))
 
 		// Check block affinities been correctly claimed.
-		opts := model.BlockAffinityListOptions{Host: nodeName, IPVersion: 4}
+		opts := model.BlockAffinityListOptions{Host: nodeName, AffinityType: string(ipam.AffinityTypeHost), IPVersion: 4}
 		datastoreObjs, err := bc.List(context.Background(), opts, "")
 		Expect(err).ShouldNot(HaveOccurred())
 		// Iterate through and extract the block CIDRs.
 		var blocks []*net.IPNet
 		for _, o := range datastoreObjs.KVPairs {
 			k := o.Key.(model.BlockAffinityKey)
-			cidr := net.IPNet{IP: k.CIDR.IP, Mask: k.CIDR.Mask}
+			kCIDR := model.IPNetFromPrefix(k.CIDR)
+			cidr := net.IPNet(kCIDR.IPNet)
 			blocks = append(blocks, &cidr)
 		}
 		Expect(len(blocks)).To(Equal(4))

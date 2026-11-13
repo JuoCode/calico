@@ -18,14 +18,12 @@ import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	k8sv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	k8sv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -49,6 +47,8 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 	ipCidr2 := "172.217.3.0/24"
 	clusterCIDR := "10.155.0.0/16"
 	restartTime := metav1.Duration{Duration: 200 * time.Second}
+	enabled := apiv3.ServiceLoadBalancerAggregationEnabled
+	noEncapOnly := apiv3.EnabledNoEncapOnly
 	specDefault1 := apiv3.BGPConfigurationSpec{
 		LogSeverityScreen:      "Info",
 		NodeToNodeMeshEnabled:  &ptrTrue,
@@ -61,6 +61,8 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 		ServiceClusterIPs: []apiv3.ServiceClusterIPBlock{
 			{CIDR: clusterCIDR},
 		},
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
 		NodeMeshPassword: &apiv3.BGPPassword{
 			SecretKeyRef: &k8sv1.SecretKeySelector{
 				LocalObjectReference: k8sv1.LocalObjectReference{
@@ -78,6 +80,8 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 		ServiceExternalIPs: []apiv3.ServiceExternalIPBlock{
 			{CIDR: ipCidr1},
 		},
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
 	}
 	specDefault3 := apiv3.BGPConfigurationSpec{
 		LogSeverityScreen:     "Info",
@@ -87,6 +91,8 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 			{CIDR: ipCidr1},
 			{CIDR: ipCidr2},
 		},
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
 		NodeMeshPassword: &apiv3.BGPPassword{
 			SecretKeyRef: &k8sv1.SecretKeySelector{
 				LocalObjectReference: k8sv1.LocalObjectReference{
@@ -104,13 +110,20 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 			{CIDR: ipCidr1},
 			{CIDR: ipCidr2},
 		},
-		NodeMeshMaxRestartTime: &restartTime,
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
+		NodeMeshMaxRestartTime:         &restartTime,
 	}
+
 	specInfo := apiv3.BGPConfigurationSpec{
-		LogSeverityScreen: "Info",
+		LogSeverityScreen:              "Info",
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
 	}
 	specDebug := apiv3.BGPConfigurationSpec{
-		LogSeverityScreen: "Debug",
+		LogSeverityScreen:              "Debug",
+		ServiceLoadBalancerAggregation: &enabled,
+		ProgramClusterRoutes:           &noEncapOnly,
 	}
 
 	DescribeTable("BGPConfiguration e2e CRUD tests",
@@ -136,7 +149,7 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 				Spec:       specInfo,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("error with field Metadata.ResourceVersion = '12345' (field must not be set for a Create request)"))
+			Expect(outError.Error()).To(Equal("error with field Metadata.ResourceVersion = '12345' (field must not be set for a Create request)"), outError.Error())
 
 			By("Creating a new BGPConfiguration with name1/specInfo")
 			res1, outError := c.BGPConfigurations().Create(ctx, &apiv3.BGPConfiguration{
@@ -155,7 +168,7 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 				Spec:       specDebug,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("resource already exists: BGPConfiguration(" + name1 + ")"))
+			Expect(outError.Error()).To(ContainSubstring("resource already exists: BGPConfiguration(" + name1 + ") with error:"))
 
 			By("Getting BGPConfiguration (name1) and comparing the output against specInfo")
 			res, outError := c.BGPConfigurations().Get(ctx, name1, options.GetOptions{})
@@ -285,13 +298,13 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 				By("Updating BGPConfiguration name2 with a 2s TTL and waiting for the entry to be deleted")
 				_, outError = c.BGPConfigurations().Update(ctx, res2, options.SetOptions{TTL: 2 * time.Second})
 				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(1 * time.Second)
-				_, outError = c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(2 * time.Second)
-				_, outError = c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).To(HaveOccurred())
-				Expect(outError.Error()).To(ContainSubstring("resource does not exist: BGPConfiguration(" + name2 + ") with error:"))
+				Eventually(func() string {
+					_, err := c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("resource does not exist: BGPConfiguration(" + name2 + ") with error:"))
 
 				By("Creating BGPConfiguration name2 with a 2s TTL and waiting for the entry to be deleted")
 				_, outError = c.BGPConfigurations().Create(ctx, &apiv3.BGPConfiguration{
@@ -299,13 +312,13 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 					Spec:       specDebug,
 				}, options.SetOptions{TTL: 2 * time.Second})
 				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(1 * time.Second)
-				_, outError = c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(2 * time.Second)
-				_, outError = c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).To(HaveOccurred())
-				Expect(outError.Error()).To(ContainSubstring("resource does not exist: BGPConfiguration(" + name2 + ") with error:"))
+				Eventually(func() string {
+					_, err := c.BGPConfigurations().Get(ctx, name2, options.GetOptions{})
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("resource does not exist: BGPConfiguration(" + name2 + ") with error:"))
 			}
 
 			if config.Spec.DatastoreType == apiconfig.Kubernetes {
@@ -549,7 +562,7 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 
 			By("Cleaning the datastore and expecting deletion events for each configured resource (tests prefix deletes results in individual events for each key)")
 			be.Clean()
-			testWatcher4.ExpectEvents(apiv3.KindBGPConfiguration, []watch.Event{
+			testWatcher4.ExpectEventsAnyOrder(apiv3.KindBGPConfiguration, []watch.Event{
 				{
 					Type:     watch.Deleted,
 					Previous: outRes1,

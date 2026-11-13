@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,12 +21,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/config"
+	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
-
-	"github.com/projectcalico/calico/felix/config"
-	"github.com/projectcalico/calico/felix/proto"
 )
 
 const (
@@ -71,14 +70,14 @@ func init() {
 }
 
 type AsyncCalcGraph struct {
-	CalcGraph        *CalcGraph
-	inputEvents      chan interface{}
-	outputChannels   []chan<- interface{}
-	eventSequencer   *EventSequencer
-	beenInSync       bool
-	needToSendInSync bool
-	syncStatusNow    api.SyncStatus
-	healthAggregator *health.HealthAggregator
+	CalcGraph            *CalcGraph
+	inputEvents          chan any
+	outputChannels       []chan<- any
+	eventSequencer       *EventSequencer
+	initialSyncCompleted bool
+	needToSendInSync     bool
+	syncStatusNow        api.SyncStatus
+	healthAggregator     *health.HealthAggregator
 
 	flushTicks       <-chan time.Time
 	healthTicks      <-chan time.Time
@@ -96,17 +95,18 @@ const (
 
 func NewAsyncCalcGraph(
 	conf *config.Config,
-	outputChannels []chan<- interface{},
+	outputChannels []chan<- any,
 	healthAggregator *health.HealthAggregator,
+	lookupCache *LookupsCache,
 ) *AsyncCalcGraph {
 	eventSequencer := NewEventSequencer(conf)
 	g := &AsyncCalcGraph{
-		inputEvents:      make(chan interface{}, 10),
+		inputEvents:      make(chan any, 10),
 		outputChannels:   outputChannels,
 		eventSequencer:   eventSequencer,
 		healthAggregator: healthAggregator,
 	}
-	g.CalcGraph = NewCalculationGraph(eventSequencer, conf, g.reportHealth)
+	g.CalcGraph = NewCalculationGraph(eventSequencer, lookupCache, conf, g.reportHealth)
 	if conf.DebugSimulateCalcGraphHangAfter != 0 {
 		log.WithField("delay", conf.DebugSimulateCalcGraphHangAfter).Warn(
 			"Simulating a calculation graph hang.")
@@ -162,9 +162,9 @@ func (acg *AsyncCalcGraph) loop() {
 					"Pulled status update off channel")
 				acg.syncStatusNow = update
 				acg.CalcGraph.OnStatusUpdated(update)
-				if update == api.InSync && !acg.beenInSync {
+				if update == api.InSync && !acg.initialSyncCompleted {
 					log.Info("First time we've been in sync")
-					acg.beenInSync = true
+					acg.initialSyncCompleted = true
 					acg.needToSendInSync = true
 					acg.dirty = true
 					if acg.flushLeakyBucket == 0 {
@@ -228,7 +228,7 @@ func (acg *AsyncCalcGraph) maybeFlush() {
 	}
 }
 
-func (acg *AsyncCalcGraph) onEvent(event interface{}) {
+func (acg *AsyncCalcGraph) onEvent(event any) {
 	log.Debug("Sending output event on channel(s)")
 	healthTickCount := 0
 	startTime := time.Now()

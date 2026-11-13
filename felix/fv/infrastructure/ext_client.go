@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,23 +17,48 @@ package infrastructure
 import (
 	"os"
 
-	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/utils"
 )
 
-func RunExtClient(namePrefix string) *containers.Container {
+type ExtClientOpts struct {
+	IPv6Enabled bool
+	Image       string
+}
+
+func RunExtClient(infra CleanupProvider, namePrefix string) *containers.Container {
+	return RunExtClientWithOpts(infra, namePrefix, ExtClientOpts{})
+}
+
+func RunExtClientWithOpts(infra CleanupProvider, namePrefix string, opts ExtClientOpts) *containers.Container {
 	wd, err := os.Getwd()
-	Expect(err).NotTo(HaveOccurred(), "failed to get working directory")
-	externalClient := containers.Run(
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "failed to get working directory")
+
+	image := utils.Config.BusyboxImage
+	if opts.Image != "" {
+		image = opts.Image
+	}
+	logrus.Infof("Running external client container with options %#v", opts)
+	c := containers.Run(
 		namePrefix,
 		containers.RunOpts{
 			AutoRemove: true,
 		},
 		"--privileged",                    // So that we can add routes inside the container.
 		"-v", wd+"/../bin:/usr/local/bin", // Map in the test-connectivity binary etc.
-		utils.Config.BusyboxImage,
+		image,
 		"/bin/sh", "-c", "sleep 1000")
-	return externalClient
+	infra.AddCleanup(c.Stop)
+
+	if opts.IPv6Enabled {
+		c.Exec("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0")
+		c.Exec("sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=0")
+		c.Exec("sysctl", "-w", "net.ipv6.conf.lo.disable_ipv6=0")
+		c.Exec("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
+	}
+
+	return c
 }

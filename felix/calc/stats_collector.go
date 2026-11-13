@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -37,6 +38,10 @@ var (
 		Name: "felix_cluster_num_workload_endpoints",
 		Help: "Total number of workload endpoints cluster-wide.",
 	})
+	gaugeClusNumTiers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "felix_cluster_num_tiers",
+		Help: "Total number of tiers cluster-wide.",
+	})
 	gaugeClusNumPolicies = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "felix_cluster_num_policies",
 		Help: "Total number of policies cluster-wide.",
@@ -51,6 +56,7 @@ func init() {
 	prometheus.MustRegister(gaugeClusNumHosts)
 	prometheus.MustRegister(gaugeClusNumHostEndpoints)
 	prometheus.MustRegister(gaugeClusNumWorkloadEndpoints)
+	prometheus.MustRegister(gaugeClusNumTiers)
 	prometheus.MustRegister(gaugeClusNumPolicies)
 	prometheus.MustRegister(gaugeClusNumProfiles)
 }
@@ -59,12 +65,13 @@ type StatsCollector struct {
 	keyCountByHost       map[string]int
 	numWorkloadEndpoints int
 	numHostEndpoints     int
+	numTiers             int
 	numPolicies          int
 	numProfiles          int
 	numALPPolicies       int
 
-	lastUpdate StatsUpdate
-	inSync     bool
+	lastUpdate           StatsUpdate
+	initialSyncCompleted bool
 
 	Callback func(StatsUpdate) error
 }
@@ -73,6 +80,7 @@ type StatsUpdate struct {
 	NumHosts             int
 	NumWorkloadEndpoints int
 	NumHostEndpoints     int
+	NumTiers             int
 	NumPolicies          int
 	NumProfiles          int
 	NumALPPolicies       int
@@ -91,7 +99,7 @@ func NewStatsCollector(callback func(StatsUpdate) error) *StatsCollector {
 }
 
 func (s *StatsCollector) RegisterWith(calcGraph *CalcGraph) {
-	calcGraph.AllUpdDispatcher.Register(model.HostIPKey{}, s.OnUpdate)
+	calcGraph.AllUpdDispatcher.Register(model.ResourceKey{}, s.OnUpdate)
 	calcGraph.AllUpdDispatcher.Register(model.WorkloadEndpointKey{}, s.OnUpdate)
 	calcGraph.AllUpdDispatcher.Register(model.HostEndpointKey{}, s.OnUpdate)
 	calcGraph.AllUpdDispatcher.Register(model.HostConfigKey{}, s.OnUpdate)
@@ -101,8 +109,8 @@ func (s *StatsCollector) RegisterWith(calcGraph *CalcGraph) {
 
 func (s *StatsCollector) OnStatusUpdate(status api.SyncStatus) {
 	log.WithField("status", status).Debug("Datastore status updated")
-	if status == api.InSync {
-		s.inSync = true
+	if status == api.InSync && !s.initialSyncCompleted {
+		s.initialSyncCompleted = true
 		s.sendUpdate()
 	}
 }
@@ -111,8 +119,12 @@ func (s *StatsCollector) OnUpdate(update api.Update) (filterOut bool) {
 	hostname := ""
 	var counter *int
 	switch key := update.Key.(type) {
-	case model.HostIPKey:
-		hostname = key.Hostname
+	case model.ResourceKey:
+		// Only count v3 Node resources towards host counts; ignore other v3 kinds.
+		if key.Kind != internalapi.KindNode {
+			return
+		}
+		hostname = key.Name
 	case model.WorkloadEndpointKey:
 		hostname = key.Hostname
 		counter = &s.numWorkloadEndpoints
@@ -126,25 +138,32 @@ func (s *StatsCollector) OnUpdate(update api.Update) (filterOut bool) {
 		log.WithField("key", update.Key).Warn("Failed to get hostname")
 		return
 	}
-	if update.UpdateType == api.UpdateTypeKVNew {
+	switch update.UpdateType {
+	case api.UpdateTypeKVNew:
 		s.keyCountByHost[hostname] += 1
-		log.WithFields(log.Fields{
-			"key":      update.Key,
-			"host":     hostname,
-			"newCount": s.keyCountByHost[hostname],
-		}).Debug("Host-specific key added")
+		if log.IsLevelEnabled(log.DebugLevel) {
+			log.WithFields(log.Fields{
+				"key":      update.Key,
+				"host":     hostname,
+				"newCount": s.keyCountByHost[hostname],
+			}).Debug("Host-specific key added")
+		}
 		if counter != nil {
 			*counter += 1
 		}
-	} else if update.UpdateType == api.UpdateTypeKVDeleted {
+	case api.UpdateTypeKVDeleted:
 		s.keyCountByHost[hostname] -= 1
-		log.WithFields(log.Fields{
-			"key":      update.Key,
-			"host":     hostname,
-			"newCount": s.keyCountByHost[hostname],
-		}).Debug("Host-specific key deleted")
+		if log.IsLevelEnabled(log.DebugLevel) {
+			log.WithFields(log.Fields{
+				"key":      update.Key,
+				"host":     hostname,
+				"newCount": s.keyCountByHost[hostname],
+			}).Debug("Host-specific key deleted")
+		}
 		if s.keyCountByHost[hostname] <= 0 {
-			log.WithField("host", hostname).Debug("Host no longer has any keys")
+			if log.IsLevelEnabled(log.DebugLevel) {
+				log.WithField("host", hostname).Debug("Host no longer has any keys")
+			}
 			delete(s.keyCountByHost, hostname)
 		}
 		if counter != nil {
@@ -155,16 +174,19 @@ func (s *StatsCollector) OnUpdate(update api.Update) (filterOut bool) {
 	return
 }
 
-func (s *StatsCollector) UpdatePolicyCounts(numPolicies, numProfiles, numALPPolicies int) {
-	if numPolicies == s.numPolicies && numProfiles == s.numProfiles && numALPPolicies == s.numALPPolicies {
+func (s *StatsCollector) UpdatePolicyCounts(numTiers, numPolicies, numProfiles, numALPPolicies int) {
+	if numTiers == s.numTiers && numPolicies == s.numPolicies && numProfiles == s.numProfiles && numALPPolicies == s.numALPPolicies {
 		return
 	}
-
-	log.WithFields(log.Fields{
-		"numPolicies":    numPolicies,
-		"numProfiles":    numProfiles,
-		"numALPPolicies": numALPPolicies,
-	}).Debug("Number of policies/profiles changed")
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"numTiers":       numTiers,
+			"numPolicies":    numPolicies,
+			"numProfiles":    numProfiles,
+			"numALPPolicies": numALPPolicies,
+		}).Debug("Number of tiers/policies/profiles changed")
+	}
+	s.numTiers = numTiers
 	s.numPolicies = numPolicies
 	s.numProfiles = numProfiles
 	s.numALPPolicies = numALPPolicies
@@ -172,11 +194,14 @@ func (s *StatsCollector) UpdatePolicyCounts(numPolicies, numProfiles, numALPPoli
 }
 
 func (s *StatsCollector) sendUpdate() {
-	log.Debug("Checking whether we should send an update")
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.Debug("Checking whether we should send an update")
+	}
 	update := StatsUpdate{
 		NumHosts:             len(s.keyCountByHost),
 		NumHostEndpoints:     s.numHostEndpoints,
 		NumWorkloadEndpoints: s.numWorkloadEndpoints,
+		NumTiers:             s.numTiers,
 		NumPolicies:          s.numPolicies,
 		NumProfiles:          s.numProfiles,
 		NumALPPolicies:       s.numALPPolicies,
@@ -184,9 +209,10 @@ func (s *StatsCollector) sendUpdate() {
 	gaugeClusNumHosts.Set(float64(len(s.keyCountByHost)))
 	gaugeClusNumWorkloadEndpoints.Set(float64(s.numWorkloadEndpoints))
 	gaugeClusNumHostEndpoints.Set(float64(s.numHostEndpoints))
+	gaugeClusNumTiers.Set(float64(s.numTiers))
 	gaugeClusNumPolicies.Set(float64(s.numPolicies))
 	gaugeClusNumProfiles.Set(float64(s.numProfiles))
-	if s.inSync && s.lastUpdate != update {
+	if s.initialSyncCompleted && s.lastUpdate != update {
 		if err := s.Callback(update); err != nil {
 			log.WithError(err).Warn("Failed to report stats")
 		} else {

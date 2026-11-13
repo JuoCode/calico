@@ -1,4 +1,4 @@
-// Copyright (c) 2017,2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017,2020-2021,2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,9 @@
 package v3
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	k8sv1 "k8s.io/api/core/v1"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	k8sv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -34,32 +32,48 @@ const (
 type BGPPeerList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
-
-	Items []BGPPeer `json:"items" protobuf:"bytes,2,rep,name=items"`
+	Items           []BGPPeer `json:"items" protobuf:"bytes,2,rep,name=items"`
 }
 
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Node Selector",type="string",JSONPath=".spec.nodeSelector",description="Selector for the nodes that should have this peering"
+// +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".spec.node",description="The node name identifying the Calico node instance that is targeted by this peer"
+// +kubebuilder:printcolumn:name="Local ASN",type="string",JSONPath=".spec.localASNumber",description="The optional Local AS Number to use when peering with this remote peer"
+// +kubebuilder:printcolumn:name="Peer Selector",type="string",JSONPath=".spec.peerSelector",description="Selector for the remote nodes to peer with"
+// +kubebuilder:printcolumn:name="Peer IP",type="string",JSONPath=".spec.peerIP",description="The IP address of the peer followed by an optional port number to peer with"
+// +kubebuilder:printcolumn:name="Peer ASN",type="string",JSONPath=".spec.asNumber",description="The AS Number of the peer"
 
 type BGPPeer struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+	metav1.ObjectMeta `json:"metadata" protobuf:"bytes,1,opt,name=metadata"`
 
-	Spec BGPPeerSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+	Spec BGPPeerSpec `json:"spec" protobuf:"bytes,2,opt,name=spec"`
 }
 
 // BGPPeerSpec contains the specification for a BGPPeer resource.
+// +kubebuilder:validation:XValidation:rule="(!has(self.node) || size(self.node) == 0) || (!has(self.nodeSelector) || size(self.nodeSelector) == 0)",message="node and nodeSelector cannot both be set",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="(!has(self.peerIP) || size(self.peerIP) == 0) || (!has(self.peerSelector) || size(self.peerSelector) == 0)",message="peerIP and peerSelector cannot both be set",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="(!has(self.peerSelector) || size(self.peerSelector) == 0) || !has(self.asNumber) || self.asNumber == 0",message="asNumber must be empty when peerSelector is set",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="(!has(self.localWorkloadSelector) || size(self.localWorkloadSelector) == 0) || (!has(self.peerIP) || size(self.peerIP) == 0)",message="peerIP must be empty when localWorkloadSelector is set",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="(!has(self.localWorkloadSelector) || size(self.localWorkloadSelector) == 0) || (!has(self.peerSelector) || size(self.peerSelector) == 0)",message="peerSelector must be empty when localWorkloadSelector is set",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="(!has(self.localWorkloadSelector) || size(self.localWorkloadSelector) == 0) || (has(self.asNumber) && self.asNumber != 0)",message="asNumber is required when localWorkloadSelector is set",reason=FieldValueInvalid
+// +kubebuilder:validation:XValidation:rule="!has(self.reachableBy) || size(self.reachableBy) == 0 || (has(self.peerIP) && size(self.peerIP) > 0)",message="reachableBy must be empty when peerIP is empty",reason=FieldValueForbidden
+// +kubebuilder:validation:XValidation:rule="!has(self.keepOriginalNextHop) || !self.keepOriginalNextHop || !has(self.nextHopMode)",message="keepOriginalNextHop and nextHopMode cannot both be set; keepOriginalNextHop is deprecated, use nextHopMode instead",reason=FieldValueForbidden
 type BGPPeerSpec struct {
 	// The node name identifying the Calico node instance that is targeted by this peer.
 	// If this is not set, and no nodeSelector is specified, then this BGP peer selects all
 	// nodes in the cluster.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	Node string `json:"node,omitempty" validate:"omitempty,name"`
 
 	// Selector for the nodes that should have this peering.  When this is set, the Node
 	// field must be empty.
 	// +optional
+	// +kubebuilder:validation:MaxLength=1024
 	NodeSelector string `json:"nodeSelector,omitempty" validate:"omitempty,selector"`
 
 	// The IP address of the peer followed by an optional port number to peer with.
@@ -67,11 +81,18 @@ type BGPPeerSpec struct {
 	// If optional port number is not set, and this peer IP and ASNumber belongs to a calico/node
 	// with ListenPort set in BGPConfiguration, then we use that port to peer.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:XValidation:rule="self == '' || isIP(self) || (self.startsWith('[') && self.matches('[]]:[0-9]{1,5}$') && isIP(self.substring(1, self.lastIndexOf(']:'))) && int(self.substring(self.lastIndexOf(']:') + 2)) >= 1 && int(self.substring(self.lastIndexOf(']:') + 2)) <= 65535) || (self.matches('^[0-9.]+:[0-9]{1,5}$') && isIP(self.substring(0, self.lastIndexOf(':'))) && int(self.substring(self.lastIndexOf(':') + 1)) >= 1 && int(self.substring(self.lastIndexOf(':') + 1)) <= 65535)",message="peerIP must be an IP address, optionally with a port as <IPv4>:<port> or [<IPv6>]:<port>",reason=FieldValueInvalid
 	PeerIP string `json:"peerIP,omitempty" validate:"omitempty,IP:port"`
 
 	// The AS Number of the peer.
 	// +optional
 	ASNumber numorstring.ASNumber `json:"asNumber,omitempty"`
+
+	// The optional Local AS Number to use when peering with this remote peer.
+	// If not specified, the AS Number defined in default BGPConfiguration will be used.
+	// +optional
+	LocalASNumber *numorstring.ASNumber `json:"localASNumber,omitempty"`
 
 	// Selector for the remote nodes to peer with.  When this is set, the PeerIP and
 	// ASNumber fields must be empty.  For each peering between the local node and
@@ -80,26 +101,49 @@ type BGPPeerSpec struct {
 	// NodeBGPSpec.IPv6Address specified.  The remote AS number comes from the remote
 	// node's NodeBGPSpec.ASNumber, or the global default if that is not set.
 	// +optional
+	// +kubebuilder:validation:MaxLength=1024
 	PeerSelector string `json:"peerSelector,omitempty" validate:"omitempty,selector"`
 
 	// Option to keep the original nexthop field when routes are sent to a BGP Peer.
 	// Setting "true" configures the selected BGP Peers node to use the "next hop keep;"
 	// instead of "next hop self;"(default) in the specific branch of the Node on "bird.cfg".
+	// Note: that this field is deprecated. Users should use the NextHopMode field to control
+	// the next hop attribute for a BGP peer.
 	KeepOriginalNextHop bool `json:"keepOriginalNextHop,omitempty"`
+
+	// NextHopMode defines the method of calculating the next hop attribute for received routes.
+	// This replaces and expands the deprecated KeepOriginalNextHop field.
+	// Users should use this setting to control the next hop attribute for a BGP peer.
+	// When this is set, the value of the KeepOriginalNextHop field is ignored.
+	// if neither keepOriginalNextHop or nextHopMode is specified, BGP's default behaviour is used.
+	// Set it to “Auto” to apply BGP’s default behaviour.
+	// Set it to "Self" to configure "next hop self;" in "bird.cfg".
+	// Set it to "Keep" to configure "next hop keep;" in "bird.cfg".
+	// +optional
+	NextHopMode *NextHopMode `json:"nextHopMode,omitempty"`
 
 	// Optional BGP password for the peerings generated by this BGPPeer resource.
 	Password *BGPPassword `json:"password,omitempty" validate:"omitempty"`
+
 	// Specifies whether and how to configure a source address for the peerings generated by
 	// this BGPPeer resource.  Default value "UseNodeIP" means to configure the node IP as the
 	// source address.  "None" means not to configure a source address.
-	SourceAddress SourceAddress `json:"sourceAddress,omitempty" validate:"omitempty,sourceAddress"`
+	SourceAddress SourceAddress `json:"sourceAddress,omitempty"`
+
 	// Time to allow for software restart.  When specified, this is configured as the graceful
 	// restart timeout.  When not specified, the BIRD default of 120s is used.
 	MaxRestartTime *metav1.Duration `json:"maxRestartTime,omitempty"`
+
+	// KeepaliveTime specifies the delay in seconds between sending consecutive Keepalive messages.
+	// When specified, this configures the BGP keepalive timer for the peerings generated by this BGPPeer resource.
+	// If not specified, BIRD uses its default keepalive time (one third of the hold time).
+	KeepaliveTime *metav1.Duration `json:"keepaliveTime,omitempty"`
+
 	// Maximum number of local AS numbers that are allowed in the AS path for received routes.
 	// This removes BGP loop prevention and should only be used if absolutely necessary.
 	// +optional
 	NumAllowedLocalASNumbers *int32 `json:"numAllowedLocalASNumbers,omitempty"`
+
 	// TTLSecurity enables the generalized TTL security mechanism (GTSM) which protects against spoofed packets by
 	// ignoring received packets with a smaller than expected TTL value. The provided value is the number of hops
 	// (edges) between the peers.
@@ -109,13 +153,29 @@ type BGPPeerSpec struct {
 	// Add an exact, i.e. /32, static route toward peer IP in order to prevent route flapping.
 	// ReachableBy contains the address of the gateway which peer can be reached by.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
 	ReachableBy string `json:"reachableBy,omitempty" validate:"omitempty,reachableBy"`
 
 	// The ordered set of BGPFilters applied on this BGP peer.
 	// +optional
+	// +listType=atomic
 	Filters []string `json:"filters,omitempty" validate:"omitempty,dive,name"`
+
+	// Selector for the local workload that the node should peer with. When this is set, the peerSelector and peerIP fields must be empty,
+	// and the ASNumber must not be empty.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	LocalWorkloadSelector string `json:"localWorkloadSelector,omitempty" validate:"omitempty,selector"`
+
+	// ReversePeering, for peerings between Calico nodes controls whether
+	// the reverse peering from nodes selected by peerSelector is generated
+	// automatically. If set to Manual, a separate BGPPeer must be created
+	// for the reverse peering. [Default: Auto]
+	// +kubebuilder:validation:Enum=Auto;Manual;
+	ReversePeering *ReversePeering `json:"reversePeering,omitempty"`
 }
 
+// +kubebuilder:validation:Enum=UseNodeIP;None
 type SourceAddress string
 
 const (
@@ -128,6 +188,23 @@ type BGPPassword struct {
 	// Selects a key of a secret in the node pod's namespace.
 	SecretKeyRef *k8sv1.SecretKeySelector `json:"secretKeyRef,omitempty"`
 }
+
+// +kubebuilder:validation:Enum=Auto;Self;Keep
+type NextHopMode string
+
+const (
+	NextHopModeAuto BindMode = "Auto"
+	NextHopModeSelf BindMode = "Self"
+	NextHopModeKeep BindMode = "Keep"
+)
+
+// +kubebuilder:validation:Enum=Auto;Manual
+type ReversePeering string
+
+const (
+	ReversePeeringAuto   ReversePeering = "Auto"
+	ReversePeeringManual ReversePeering = "Manual"
+)
 
 // NewBGPPeer creates a new (zeroed) BGPPeer struct with the TypeMetadata initialised to the current
 // version.

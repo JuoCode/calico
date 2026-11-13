@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,28 +15,58 @@
 package intdataplane_test
 
 import (
+	"errors"
 	"net"
 	"regexp"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/knftables"
 
+	"github.com/projectcalico/calico/felix/collector"
+	"github.com/projectcalico/calico/felix/collector/types"
 	"github.com/projectcalico/calico/felix/config"
 	intdataplane "github.com/projectcalico/calico/felix/dataplane/linux"
 	"github.com/projectcalico/calico/felix/ifacemonitor"
 	"github.com/projectcalico/calico/felix/ipsets"
+	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/felix/wireguard"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 )
 
+type mockCollector struct{}
+
+func (*mockCollector) ReportingChannel() chan<- *proto.DataplaneStats { return nil }
+
+func (*mockCollector) Start() error { return nil }
+
+func (*mockCollector) RegisterMetricsReporter(types.Reporter) {}
+
+func (*mockCollector) SetDataplaneInfoReader(types.DataplaneInfoReader) {}
+
+func (*mockCollector) SetPacketInfoReader(types.PacketInfoReader) {}
+
+func (*mockCollector) SetConntrackInfoReader(types.ConntrackInfoReader) {}
+
 var _ = Describe("Constructor test", func() {
 	var configParams *config.Config
 	var dpConfig intdataplane.Config
 	var healthAggregator *health.HealthAggregator
+	var col collector.Collector
 	kubernetesProvider := config.ProviderNone
 	routeSource := "CalicoIPAM"
 	var wireguardEncryptHostTraffic bool
+	var nftablesDataplane func(knftables.Family, string, ...knftables.Option) (knftables.Interface, error)
+
+	BeforeEach(func() {
+		// For most tests here, mock out the creation of the nftables interface in a way
+		// that simulates "nft" being available.  We don't want these tests to depend on the
+		// actual kernel version or presence of nftables.
+		nftablesDataplane = func(knftables.Family, string, ...knftables.Option) (knftables.Interface, error) {
+			return nil, nil
+		}
+	})
 
 	JustBeforeEach(func() {
 		configParams = config.New()
@@ -68,22 +98,24 @@ var _ = Describe("Constructor test", func() {
 				OpenStackMetadataIP:          net.ParseIP(configParams.MetadataAddr),
 				OpenStackMetadataPort:        uint16(configParams.MetadataPort),
 
-				IptablesMarkAccept:   0x1000000,
-				IptablesMarkPass:     0x2000000,
-				IptablesMarkScratch0: 0x4000000,
-				IptablesMarkScratch1: 0x8000000,
-				IptablesMarkEndpoint: 0x000ff00,
+				MarkAccept:   0x1000000,
+				MarkPass:     0x2000000,
+				MarkScratch0: 0x4000000,
+				MarkScratch1: 0x8000000,
+				MarkDrop:     0x0800000,
+				MarkEndpoint: 0x000ff00,
 
 				IPIPEnabled:       configParams.Encapsulation.IPIPEnabled,
 				IPIPTunnelAddress: configParams.IpInIpTunnelAddr,
 
-				EndpointToHostAction:      configParams.DefaultEndpointToHostAction,
-				IptablesFilterAllowAction: configParams.IptablesFilterAllowAction,
-				IptablesMangleAllowAction: configParams.IptablesMangleAllowAction,
-				IptablesFilterDenyAction:  configParams.IptablesFilterDenyAction,
+				EndpointToHostAction: configParams.DefaultEndpointToHostAction,
+				FilterAllowAction:    configParams.IptablesFilterAllowAction,
+				MangleAllowAction:    configParams.IptablesMangleAllowAction,
+				FilterDenyAction:     configParams.IptablesFilterDenyAction,
 			},
 			IPIPMTU:          configParams.IpInIpMtu,
 			HealthAggregator: healthAggregator,
+			Collector:        col,
 
 			MTUIfacePattern: regexp.MustCompile(".*"),
 
@@ -96,6 +128,8 @@ var _ = Describe("Constructor test", func() {
 			Wireguard: wireguard.Config{
 				EncryptHostTraffic: wireguardEncryptHostTraffic,
 			},
+
+			NewNftablesDataplane: nftablesDataplane,
 		}
 	})
 
@@ -104,9 +138,75 @@ var _ = Describe("Constructor test", func() {
 		Expect(dp).ToNot(BeNil())
 	})
 
+	// The live migration monitor drives per-workload route suppression and priority
+	// elevation through the endpoint managers, of which there is one per IP version.
+	// Each manager tracks its own live migration state, so all of them must be
+	// registered as listeners; registering only the IPv4 one leaves IPv6 workload
+	// routes unsuppressed on a migration target and unelevated after cutover
+	// (CORE-12806).
+	It("should register an endpoint manager per IP version with the live migration monitor", func() {
+		dpConfig.IPv6Enabled = true
+
+		dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+		Expect(dp.LiveMigrationListenerCount()).To(Equal(2),
+			"both endpoint managers should listen for live migration state changes")
+	})
+
+	It("should register only the IPv4 endpoint manager when IPv6 is disabled", func() {
+		dpConfig.IPv6Enabled = false
+
+		dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+		Expect(dp.LiveMigrationListenerCount()).To(Equal(1))
+	})
+
+	Context("when nft is not available", func() {
+		BeforeEach(func() {
+			nftablesDataplane = func(knftables.Family, string, ...knftables.Option) (knftables.Interface, error) {
+				return nil, errors.New("could not find nftables binary: file not found")
+			}
+		})
+
+		It("should still be constructable", func() {
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp).ToNot(BeNil())
+		})
+	})
+
+	Context("when NFTablesSupported feature is disabled", func() {
+		var requestedFamilies []knftables.Family
+
+		BeforeEach(func() {
+			requestedFamilies = nil
+			nftablesDataplane = func(family knftables.Family, name string, opts ...knftables.Option) (knftables.Interface, error) {
+				requestedFamilies = append(requestedFamilies, family)
+				return nil, nil
+			}
+		})
+
+		It("should not attempt to create an ARP family nftables table", func() {
+			dpConfig.FeatureDetectOverrides = map[string]string{
+				"NFTablesSupported": "false",
+			}
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp).ToNot(BeNil())
+			Expect(requestedFamilies).NotTo(ContainElement(knftables.ARPFamily))
+		})
+	})
+
 	Context("with health aggregator", func() {
 		BeforeEach(func() {
 			healthAggregator = health.NewHealthAggregator()
+		})
+
+		It("should be constructable", func() {
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp).ToNot(BeNil())
+		})
+	})
+
+	Context("with collector", func() {
+		BeforeEach(func() {
+			col = &mockCollector{}
 		})
 
 		It("should be constructable", func() {
@@ -137,6 +237,49 @@ var _ = Describe("Constructor test", func() {
 		It("should set the correct MTU", func() {
 			intdataplane.ConfigureDefaultMTUs(1500, &dpConfig)
 			Expect(dpConfig.Wireguard.MTU).To(Equal(1440))
+		})
+	})
+
+	Context("on a cluster node with encapsulation configured", func() {
+		// Baseline: with encapsulation configured and this host as a cluster
+		// node, the route-programming managers are registered. This is the
+		// counterpoint that makes the non-cluster-host assertions below
+		// meaningful (they must be suppressed by NonClusterHost, not by a
+		// missing config).
+		It("should register the VXLAN and IPIP route managers", func() {
+			dpConfig.IPv6Enabled = true
+			dpConfig.RulesConfig.VXLANEnabled = true
+			dpConfig.RulesConfig.VXLANEnabledV6 = true
+			dpConfig.RulesConfig.IPIPEnabled = true
+
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp.VXLANManagerActive()).To(BeTrue())
+			Expect(dp.VXLANManagerV6Active()).To(BeTrue())
+			Expect(dp.IPIPManagerActive()).To(BeTrue())
+		})
+
+		It("should register the no-encap route manager", func() {
+			dpConfig.IPv6Enabled = true
+			dpConfig.ProgramNoEncapClusterRoutes = true
+			dpConfig.NoEncapNeeded = true
+
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp.NoEncapManagerActive()).To(BeTrue())
+			Expect(dp.NoEncapManagerV6Active()).To(BeTrue())
+		})
+
+		It("should leave WireGuard enabled when configured", func() {
+			dpConfig.IPv6Enabled = true
+			dpConfig.Wireguard.Enabled = true
+			dpConfig.Wireguard.EnabledV6 = true
+			// A routing table index is required whenever WireGuard is enabled;
+			// the real driver always allocates one.
+			dpConfig.Wireguard.RoutingTableIndex = 1
+			dpConfig.Wireguard.RoutingTableIndexV6 = 2
+
+			dp := intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp.WireguardEnabled()).To(BeTrue())
+			Expect(dp.WireguardEnabledV6()).To(BeTrue())
 		})
 	})
 })

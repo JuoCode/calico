@@ -17,15 +17,13 @@ package resourcemgr_test
 import (
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var _ = Describe("KubeControllersConfig tests", func() {
-
 	It("Should return full spec as is", func() {
 		text := `apiVersion: projectcalico.org/v3
 kind: KubeControllersConfiguration
@@ -49,6 +47,8 @@ spec:
       reconcilerPeriod: 4m
     namespace:
       reconcilerPeriod: 5m
+    loadbalancer:
+      assignIPs: AllServices
 `
 		resources, err := createResources(text)
 		Expect(err).NotTo(HaveOccurred())
@@ -71,17 +71,11 @@ spec:
 			To(Equal(&api.ServiceAccountControllerConfig{ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 4}}))
 		Expect(kcc.Spec.Controllers.Namespace).
 			To(Equal(&api.NamespaceControllerConfig{ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5}}))
+		Expect(kcc.Spec.Controllers.LoadBalancer).
+			To(Equal(&api.LoadBalancerControllerConfig{AssignIPs: api.AllServices}))
 
 		// Status
 		Expect(kcc.Status.EnvironmentVars).To(BeNil())
-		Expect(kcc.Status.RunningConfig.Controllers.Node).To(BeNil())
-		Expect(kcc.Status.RunningConfig.Controllers.Policy).To(BeNil())
-		Expect(kcc.Status.RunningConfig.Controllers.WorkloadEndpoint).To(BeNil())
-		Expect(kcc.Status.RunningConfig.Controllers.ServiceAccount).To(BeNil())
-		Expect(kcc.Status.RunningConfig.Controllers.Namespace).To(BeNil())
-		Expect(kcc.Status.RunningConfig.LogSeverityScreen).To(Equal(""))
-		Expect(kcc.Status.RunningConfig.HealthChecks).To(Equal(""))
-		Expect(kcc.Status.RunningConfig.EtcdV3CompactionPeriod).To(BeNil())
+		Expect(kcc.Status.RunningConfig).To(BeNil())
 	})
-
 })

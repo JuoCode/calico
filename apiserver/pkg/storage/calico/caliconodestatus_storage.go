@@ -3,27 +3,34 @@
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 // NewCalicoNodeStatusStorage creates a new libcalico-based storage.Interface implementation for CalicoNodeStatus
 func NewCalicoNodeStatusStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc) {
 	c := CreateClientFromConfig()
+	return newCalicoNodeStatusStorage(opts, c, false)
+}
+
+// NewCalicoNodeStatusStatusStorage creates a storage that uses the UpdateStatus
+// method for writes, ensuring the status subresource is used when persisting changes.
+func NewCalicoNodeStatusStatusStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc) {
+	c := CreateClientFromConfig()
+	return newCalicoNodeStatusStorage(opts, c, true)
+}
+
+func newCalicoNodeStatusStorage(opts Options, c clientv3.Interface, forStatus bool) (registry.DryRunnableStorage, factory.DestroyFunc) {
 	createFn := func(ctx context.Context, c clientv3.Interface, obj resourceObject, opts clientOpts) (resourceObject, error) {
 		oso := opts.(options.SetOptions)
 		res := obj.(*api.CalicoNodeStatus)
@@ -32,6 +39,9 @@ func NewCalicoNodeStatusStorage(opts Options) (registry.DryRunnableStorage, fact
 	updateFn := func(ctx context.Context, c clientv3.Interface, obj resourceObject, opts clientOpts) (resourceObject, error) {
 		oso := opts.(options.SetOptions)
 		res := obj.(*api.CalicoNodeStatus)
+		if forStatus {
+			return c.CalicoNodeStatus().UpdateStatus(ctx, res, oso)
+		}
 		return c.CalicoNodeStatus().Update(ctx, res, oso)
 	}
 	getFn := func(ctx context.Context, c clientv3.Interface, ns string, name string, opts clientOpts) (resourceObject, error) {
@@ -54,10 +64,10 @@ func NewCalicoNodeStatusStorage(opts Options) (registry.DryRunnableStorage, fact
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.CalicoNodeStatus{}),
-		aapiListType:      reflect.TypeOf(aapi.CalicoNodeStatusList{}),
-		libCalicoType:     reflect.TypeOf(api.CalicoNodeStatus{}),
-		libCalicoListType: reflect.TypeOf(api.CalicoNodeStatusList{}),
+		aapiType:          reflect.TypeFor[api.CalicoNodeStatus](),
+		aapiListType:      reflect.TypeFor[api.CalicoNodeStatusList](),
+		libCalicoType:     reflect.TypeFor[api.CalicoNodeStatus](),
+		libCalicoListType: reflect.TypeFor[api.CalicoNodeStatusList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -75,19 +85,20 @@ type CalicoNodeStatusConverter struct {
 }
 
 func (gc CalicoNodeStatusConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiCalicoNodeStatus := aapiObj.(*aapi.CalicoNodeStatus)
+	aapiCalicoNodeStatus := aapiObj.(*api.CalicoNodeStatus)
 	lcgCalicoNodeStatus := &api.CalicoNodeStatus{}
 	lcgCalicoNodeStatus.TypeMeta = aapiCalicoNodeStatus.TypeMeta
 	lcgCalicoNodeStatus.ObjectMeta = aapiCalicoNodeStatus.ObjectMeta
 	lcgCalicoNodeStatus.Kind = api.KindCalicoNodeStatus
 	lcgCalicoNodeStatus.APIVersion = api.GroupVersionCurrent
 	lcgCalicoNodeStatus.Spec = aapiCalicoNodeStatus.Spec
+	lcgCalicoNodeStatus.Status = aapiCalicoNodeStatus.Status
 	return lcgCalicoNodeStatus
 }
 
 func (gc CalicoNodeStatusConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgCalicoNodeStatus := libcalicoObject.(*api.CalicoNodeStatus)
-	aapiCalicoNodeStatus := aapiObj.(*aapi.CalicoNodeStatus)
+	aapiCalicoNodeStatus := aapiObj.(*api.CalicoNodeStatus)
 	aapiCalicoNodeStatus.Spec = lcgCalicoNodeStatus.Spec
 	aapiCalicoNodeStatus.Status = lcgCalicoNodeStatus.Status
 	aapiCalicoNodeStatus.TypeMeta = lcgCalicoNodeStatus.TypeMeta
@@ -96,15 +107,15 @@ func (gc CalicoNodeStatusConverter) convertToAAPI(libcalicoObject resourceObject
 
 func (gc CalicoNodeStatusConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgCalicoNodeStatusList := libcalicoListObject.(*api.CalicoNodeStatusList)
-	aapiCalicoNodeStatusList := aapiListObj.(*aapi.CalicoNodeStatusList)
+	aapiCalicoNodeStatusList := aapiListObj.(*api.CalicoNodeStatusList)
 	if libcalicoListObject == nil {
-		aapiCalicoNodeStatusList.Items = []aapi.CalicoNodeStatus{}
+		aapiCalicoNodeStatusList.Items = []api.CalicoNodeStatus{}
 		return
 	}
 	aapiCalicoNodeStatusList.TypeMeta = lcgCalicoNodeStatusList.TypeMeta
 	aapiCalicoNodeStatusList.ListMeta = lcgCalicoNodeStatusList.ListMeta
 	for _, item := range lcgCalicoNodeStatusList.Items {
-		aapiCalicoNodeStatus := aapi.CalicoNodeStatus{}
+		aapiCalicoNodeStatus := api.CalicoNodeStatus{}
 		gc.convertToAAPI(&item, &aapiCalicoNodeStatus)
 		if matched, err := pred.Matches(&aapiCalicoNodeStatus); err == nil && matched {
 			aapiCalicoNodeStatusList.Items = append(aapiCalicoNodeStatusList.Items, aapiCalicoNodeStatus)

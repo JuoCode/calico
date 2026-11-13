@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	uruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
@@ -74,9 +75,10 @@ var (
 type flannelMigrationController struct {
 	ctx          context.Context
 	informer     cache.Controller
-	indexer      cache.Indexer
+	indexer      cache.Store
 	calicoClient client.Interface
 	k8sClientset *kubernetes.Clientset
+	k8sConfig    *rest.Config
 
 	// ipamMigrator runs ipam migration process.
 	ipamMigrator ipamMigrator
@@ -92,11 +94,12 @@ type flannelMigrationController struct {
 }
 
 // NewFlannelMigrationController Constructor for Flannel migration controller
-func NewFlannelMigrationController(ctx context.Context, k8sClientset *kubernetes.Clientset, calicoClient client.Interface, cfg *Config) controller.Controller {
+func NewFlannelMigrationController(ctx context.Context, k8sClientset *kubernetes.Clientset, k8sConfig *rest.Config, calicoClient client.Interface, cfg *Config) controller.Controller {
 	mc := &flannelMigrationController{
 		ctx:             ctx,
 		calicoClient:    calicoClient,
 		k8sClientset:    k8sClientset,
+		k8sConfig:       k8sConfig,
 		ipamMigrator:    NewIPAMMigrator(ctx, k8sClientset, calicoClient, cfg),
 		networkMigrator: NewNetworkMigrator(ctx, k8sClientset, calicoClient, cfg),
 		config:          cfg,
@@ -107,13 +110,19 @@ func NewFlannelMigrationController(ctx context.Context, k8sClientset *kubernetes
 
 	// Setup event handlers
 	handlers := cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			mc.processNewNode(obj.(*v1.Node))
 		},
 	}
 
 	// Informer handles managing the watch and signals us when nodes are added.
-	mc.indexer, mc.informer = cache.NewIndexerInformer(listWatcher, &v1.Node{}, 0, handlers, cache.Indexers{})
+	mc.indexer, mc.informer = cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: listWatcher,
+		ObjectType:    &v1.Node{},
+		ResyncPeriod:  0,
+		Handler:       handlers,
+		Indexers:      cache.Indexers{},
+	})
 
 	return mc
 }
@@ -281,7 +290,7 @@ func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 	}
 
 	n := k8snode(c.config.PodNodeName)
-	data, err := n.execCommandInPod(c.k8sClientset, c.config.FlannelDaemonsetNamespace, flannelContainerName,
+	data, err := n.execCommandInPod(c.k8sClientset, c.k8sConfig, c.config.FlannelDaemonsetNamespace, flannelContainerName,
 		podLabel, "cat", flannelConfigFile)
 	if err != nil {
 		return err
@@ -297,7 +306,7 @@ func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 
 	// Convert subnet.env content to json string and update flannel-migration-config ConfigMap.
 	// So that it could be populated into migration controller pod next time it starts.
-	val := strings.Replace(data, "\n", ";", -1)
+	val := strings.ReplaceAll(data, "\n", ";")
 	err = updateConfigMapValue(c.k8sClientset, c.config.CalicoDaemonsetNamespace, migrationConfigMapName, migrationConfigMapEnvKey, val)
 	if err != nil {
 		return err
@@ -534,7 +543,7 @@ func (c *flannelMigrationController) completeMigration() error {
 	}
 
 	// Remove node labels
-	err = removeLabelForAllNodes(migrationNodeSelectorKey)
+	err = removeLabelForAllNodes(c.k8sClientset, migrationNodeSelectorKey)
 	if err != nil {
 		log.WithError(err).Errorf("Failed to remove node label %s.", migrationNodeSelectorKey)
 		return err

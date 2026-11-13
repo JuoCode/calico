@@ -21,22 +21,21 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
-	"github.com/projectcalico/calico/felix/logutils"
-	. "github.com/projectcalico/calico/felix/routerule"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+	"k8s.io/utils/ptr"
 
+	. "github.com/projectcalico/calico/felix/routerule"
+	"github.com/projectcalico/calico/lib/logrusr"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 var (
-	simulatedError = errors.New("dummy error")
-	alreadyExists  = errors.New("already exists")
+	errSimulated     = errors.New("dummy error")
+	errAlreadyExists = errors.New("already exists")
 )
 
 var _ = Describe("RouteRules Construct", func() {
@@ -58,7 +57,7 @@ var _ = Describe("RouteRules Construct", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).To(HaveOccurred())
 	})
@@ -72,7 +71,7 @@ var _ = Describe("RouteRules Construct", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).To(HaveOccurred())
 
@@ -85,7 +84,7 @@ var _ = Describe("RouteRules Construct", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).To(HaveOccurred())
 
@@ -98,7 +97,7 @@ var _ = Describe("RouteRules Construct", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).To(HaveOccurred())
 	})
@@ -112,7 +111,7 @@ var _ = Describe("RouteRules Construct", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).NotTo(HaveOccurred())
 	})
@@ -139,7 +138,7 @@ var _ = Describe("RouteRules", func() {
 			RulesMatchSrcFWMark,
 			10*time.Second,
 			dataplane.NewNetlinkHandle,
-			logutils.NewSummarizer("test loop"),
+			logrusr.NewSummarizer("test loop"),
 		)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(rrs).ToNot(BeNil())
@@ -154,7 +153,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.1/32"),
 				Mark:              0x100,
-				Mask:              0x100,
+				Mask:              ptr.To[uint32](0x100),
 				Table:             1,
 				Invert:            true,
 				Goto:              -1,
@@ -174,7 +173,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.2/32"),
 				Mark:              0x200,
-				Mask:              0x200,
+				Mask:              ptr.To[uint32](0x200),
 				Table:             10,
 				Invert:            false,
 				Goto:              -1,
@@ -190,7 +189,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.1/32"),
 				Mark:              0x800,
-				Mask:              0x800,
+				Mask:              ptr.To[uint32](0x800),
 				Table:             90,
 				Invert:            true,
 				Goto:              -1,
@@ -222,7 +221,7 @@ var _ = Describe("RouteRules", func() {
 					Family:            unix.AF_INET,
 					Src:               mustParseCIDR("10.0.0.3/32"),
 					Mark:              0x400,
-					Mask:              0x400,
+					Mask:              ptr.To[uint32](0x400),
 					Table:             250,
 					Goto:              -1,
 					Flow:              -1,
@@ -267,7 +266,7 @@ var _ = Describe("RouteRules", func() {
 				Family:            unix.AF_INET,
 				Src:               mustParseCIDR("10.0.0.2/32"),
 				Mark:              0x200,
-				Mask:              0x200,
+				Mask:              ptr.To[uint32](0x200),
 				Table:             250,
 				Goto:              -1,
 				Flow:              -1,
@@ -305,8 +304,8 @@ var _ = Describe("RouteRules", func() {
 			})
 
 			It("should panic after all its retries are exhausted", func() {
-				for i := 0; i < 3; i++ {
-					Expect(rrs.Apply()).To(Equal(ConnectFailed))
+				for range 3 {
+					Expect(rrs.Apply()).To(Equal(ErrConnectFailed))
 				}
 				Expect(func() { _ = rrs.Apply() }).To(Panic())
 			})
@@ -316,7 +315,6 @@ var _ = Describe("RouteRules", func() {
 		// each case, we make the failure transient so that only the first Apply() should
 		// fail.  Then, at most, the second call to Apply() should succeed.
 		for _, failFlags := range failureScenarios {
-			failFlags := failFlags
 			desc := fmt.Sprintf("with some rules added and failures: %v", failFlags)
 			Context(desc, func() {
 				BeforeEach(func() {
@@ -354,7 +352,7 @@ var _ = Describe("RouteRules", func() {
 						Family:            unix.AF_INET,
 						Src:               mustParseCIDR("10.0.0.3/32"),
 						Mark:              0x400,
-						Mask:              0x400,
+						Mask:              ptr.To[uint32](0x400),
 						Table:             250,
 						Goto:              -1,
 						Flow:              -1,
@@ -468,7 +466,7 @@ func (d *mockDataplane) shouldFail(flag failFlags) bool {
 func (d *mockDataplane) NewNetlinkHandle() (HandleIface, error) {
 	d.NumNewNetlinkCalls++
 	if d.PersistentlyFailToConnect || d.shouldFail(failNextNewNetlinkHandle) {
-		return nil, simulatedError
+		return nil, errSimulated
 	}
 	Expect(d.NetlinkOpen).To(BeFalse())
 	d.NetlinkOpen = true
@@ -483,7 +481,7 @@ func (d *mockDataplane) Delete() {
 func (d *mockDataplane) SetSocketTimeout(to time.Duration) error {
 	Expect(d.NetlinkOpen).To(BeTrue())
 	if d.shouldFail(failNextSetSocketTimeout) {
-		return simulatedError
+		return errSimulated
 	}
 	return nil
 }
@@ -491,7 +489,7 @@ func (d *mockDataplane) SetSocketTimeout(to time.Duration) error {
 func (d *mockDataplane) RuleList(family int) ([]netlink.Rule, error) {
 	Expect(d.NetlinkOpen).To(BeTrue())
 	if d.shouldFail(failNextRuleList) {
-		return nil, simulatedError
+		return nil, errSimulated
 	}
 	var rules []netlink.Rule
 	for _, rule := range d.ruleKeyToRule {
@@ -515,13 +513,13 @@ func (d *mockDataplane) removeMockRule(rule *netlink.Rule) {
 func (d *mockDataplane) RuleAdd(rule *netlink.Rule) error {
 	Expect(d.NetlinkOpen).To(BeTrue())
 	if d.shouldFail(failNextRuleAdd) {
-		return simulatedError
+		return errSimulated
 	}
 	key := keyForRule(rule)
 	log.WithField("ruleKey", key).Info("Mock dataplane: RuleAdd called")
 	d.addedRuleKeys.Add(key)
 	if _, ok := d.ruleKeyToRule[key]; ok {
-		return alreadyExists
+		return errAlreadyExists
 	} else {
 		d.ruleKeyToRule[key] = *rule
 		return nil
@@ -531,7 +529,7 @@ func (d *mockDataplane) RuleAdd(rule *netlink.Rule) error {
 func (d *mockDataplane) RuleDel(rule *netlink.Rule) error {
 	Expect(d.NetlinkOpen).To(BeTrue())
 	if d.shouldFail(failNextRuleDel) {
-		return simulatedError
+		return errSimulated
 	}
 	key := keyForRule(rule)
 	log.WithField("ruleKey", key).Info("Mock dataplane: RuleDel called")

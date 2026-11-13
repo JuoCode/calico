@@ -1,6 +1,6 @@
 syntax = "proto3";
 package felix;
-option go_package = "proto";
+option go_package = "./proto";
 
 service PolicySync {
   // On this API, only the following payloads will be sent:
@@ -23,6 +23,9 @@ service PolicySync {
   //  - VXLANTunnelEndpointUpdate
   //  - VXLANTunnelEndpointRemove
   rpc Sync(SyncRequest) returns (stream ToDataplane);
+
+  // Report dataplane statistics to Felix.
+  rpc Report(DataplaneStats) returns (ReportResult);
 }
 
 message SyncRequest {
@@ -81,16 +84,10 @@ message ToDataplane {
     // ConfigUpdate is sent at start of day or when the config changes.
     ConfigUpdate config_update = 13;
 
-    // HostMetadataUpdate is sent when a host IP is added or updated.  I.e. the
-    // IP used for BGP peering/IPIP.
+    // HostMetadataUpdate is sent when a host is added or updated.
     HostMetadataUpdate host_metadata_update = 14;
-    // HostIPRemove is sent when a host IP is removed.
+    // HostMetadataRemove is sent when a host is removed.
     HostMetadataRemove host_metadata_remove = 18;
-
-    // HostMetadataV4V6Update is sent when a host is added or updated.
-    HostMetadataV4V6Update host_metadata_v4v6_update = 37;
-    // HostIPRemove is sent when a host is removed.
-    HostMetadataV4V6Remove host_metadata_v4v6_remove = 38; 
 
     // IPAMPoolUpdate is sent when an IPAM pool is added/updated.
     IPAMPoolUpdate ipam_pool_update = 16;
@@ -134,12 +131,10 @@ message ToDataplane {
     WireguardEndpointV6Update wireguard_endpoint_v6_update = 33;
     // WireguardEndpointV6Remove is sent to undo IPv6 wireguard on the host.
     WireguardEndpointV6Remove wireguard_endpoint_v6_remove = 34;
-
-    // HostMetadataV6Update is sent when a host IPv6 address is added or updated.
-    HostMetadataV6Update host_metadata_v6_update = 35;
-    // HostMetadataV6Remove is sent when a host IPv6 address is removed.
-    HostMetadataV6Remove host_metadata_v6_remove = 36;
   }
+  // Deprecated fields related to host information. Replaced by HostMetadataUpdate and HostMetadataRemove.
+  reserved "HostMetadataV6Update", "HostMetadataV6Remove", "HostMetadataV4V6Update", "HostMetadataV4V6Remove";
+  reserved 35, 36, 37, 38;
 }
 
 message FromDataplane {
@@ -233,8 +228,13 @@ message ActivePolicyRemove {
 }
 
 message PolicyID {
-  string tier = 1;
+  // The "tier" field has been deprecated and removed.
+  reserved 1;
+  reserved "tier";
+
   string name = 2;
+  string namespace = 3;
+  string kind = 4;
 }
 
 message Policy {
@@ -248,6 +248,10 @@ message Policy {
   bool pre_dnat = 4;
 
   string original_selector = 6;
+
+  repeated string perf_hints = 7;
+
+  string tier = 8;
 }
 
 enum IPVersion {
@@ -327,7 +331,7 @@ message Rule {
 
   RuleMetadata metadata = 123;
 
-  // Changed to config option.
+  // Changed to FelixConfig option.
   reserved 200;
   reserved "log_prefix";
 
@@ -388,6 +392,17 @@ message WorkloadEndpointUpdate {
   WorkloadEndpoint endpoint = 5;
 }
 
+message WorkloadBpfSkipRedir {
+  bool Egress = 1;
+  bool Ingress = 2;
+}
+
+enum LiveMigrationRole {
+  NO_ROLE = 0;
+  SOURCE = 1;
+  TARGET = 2;
+}
+
 message WorkloadEndpoint {
   string state = 1;
   string name = 2;
@@ -400,6 +415,40 @@ message WorkloadEndpoint {
   repeated NatInfo ipv6_nat = 9;
   repeated string allow_spoofed_source_prefixes = 10;
   map<string, string> annotations = 11;
+  QoSControls qos_controls = 12;
+  LocalBGPPeer local_bgp_peer = 13;
+  WorkloadBpfSkipRedir skip_redir = 14;
+  repeated QoSPolicy qos_policies = 15;
+  bool is_istio_ambient = 16;
+  LiveMigrationRole live_migration_role = 17;
+  string live_migration_uid = 18;
+  string live_migration_vmi_name = 19;
+}
+
+message QoSControls {
+  int64 IngressBandwidth      = 1;
+  int64 EgressBandwidth       = 2;
+  int64 IngressBurst          = 3;
+  int64 EgressBurst           = 4;
+  int64 IngressPacketRate     = 5;
+  int64 EgressPacketRate      = 6;
+  int64 IngressMaxConnections = 7;
+  int64 EgressMaxConnections  = 8;
+  int64 IngressPeakrate       = 9;
+  int64 EgressPeakrate        = 10;
+  int64 IngressMinburst       = 11;
+  int64 EgressMinburst        = 12;
+  int64 IngressPacketBurst    = 13;
+  int64 EgressPacketBurst     = 14;
+}
+
+message QoSPolicy {
+  string destination = 1;
+  int32 dscp = 2;
+}
+
+message LocalBGPPeer {
+  string bgp_peer_name = 1;
 }
 
 message WorkloadEndpointRemove {
@@ -427,6 +476,7 @@ message HostEndpoint {
   repeated TierInfo forward_tiers = 8;
   repeated string expected_ipv4_addrs = 4;
   repeated string expected_ipv6_addrs = 5;
+  repeated QoSPolicy qos_policies = 9;
 }
 
 message HostEndpointRemove {
@@ -435,8 +485,9 @@ message HostEndpointRemove {
 
 message TierInfo {
   string name = 1;
-  repeated string ingress_policies = 2;
-  repeated string egress_policies = 3;
+  repeated PolicyID ingress_policies = 2;
+  repeated PolicyID egress_policies = 3;
+  string default_action = 4;
 }
 
 message NatInfo {
@@ -465,6 +516,7 @@ message HostEndpointStatusRemove {
 message WorkloadEndpointStatusUpdate {
   WorkloadEndpointID id = 1;
   EndpointStatus status = 2;
+  WorkloadEndpoint endpoint = 3;
 }
 message WorkloadEndpointStatusRemove {
   WorkloadEndpointID id = 1;
@@ -481,7 +533,7 @@ message WireguardStatusUpdate {
 message DataplaneInSync {
 }
 
-message HostMetadataV4V6Update {
+message HostMetadataUpdate {
   string hostname = 1;
   string ipv4_addr = 2;
   string ipv6_addr = 3;
@@ -489,29 +541,9 @@ message HostMetadataV4V6Update {
   map<string, string> labels = 5;
 }
 
-message HostMetadataV4V6Remove {
-  string hostname = 1;
-  string ipv4_addr = 2;
-}
-
-message HostMetadataUpdate {
-  string hostname = 1;
-  string ipv4_addr = 2;
-}
-
 message HostMetadataRemove {
   string hostname = 1;
   string ipv4_addr = 2;
-}
-
-message HostMetadataV6Update {
-  string hostname = 1;
-  string ipv6_addr = 2;
-}
-
-message HostMetadataV6Remove {
-  string hostname = 1;
-  string ipv6_addr = 2;
 }
 
 message IPAMPoolUpdate {
@@ -528,12 +560,14 @@ message IPAMPool {
   bool masquerade = 2;
   string ipip_mode = 3;
   string vxlan_mode = 4;
+  repeated string allowed_uses = 5;
 }
 
 message Encapsulation {
   bool ipip_enabled = 1;
   bool vxlan_enabled = 2;
   bool vxlan_enabled_v6 = 3;
+  bool no_encap_enabled = 4;
 }
 
 message ServiceAccountUpdate {
@@ -563,16 +597,18 @@ message NamespaceID {
   string name = 1;
 }
 
+// RouteTYpe defines a type of route. Each is a power of 2, so that theye can be used as
+// unique bits within a bitmap.
 enum RouteType {
   // CIDR_INFO gives information about a CIDR without establishing a route.  For example,
   // it is emitted for IP pools with no blocks.
   CIDR_INFO = 0;
   REMOTE_WORKLOAD = 1;
   REMOTE_HOST = 2;
-  LOCAL_WORKLOAD = 3;
-  LOCAL_HOST = 4;
-  REMOTE_TUNNEL = 5;
-  LOCAL_TUNNEL = 6;
+  LOCAL_WORKLOAD = 4;
+  LOCAL_HOST = 8;
+  REMOTE_TUNNEL = 16;
+  LOCAL_TUNNEL = 32;
 }
 
 enum IPPoolType {
@@ -589,7 +625,13 @@ message TunnelType {
 }
 
 message RouteUpdate {
-  RouteType type = 1;
+  // The "type" field has been deprecated and removed in favor of "types".
+  reserved 1;
+  reserved "type";
+
+  // Types is a bitmap field indicating which route types apply to this route.
+  RouteType types = 12;
+
   IPPoolType ip_pool_type = 2;
   string dst = 3;
   // The name of the node holding this destination, if this route targets a calico node.
@@ -598,8 +640,11 @@ message RouteUpdate {
   string dst_node_ip = 5;
   bool same_subnet = 7;
   bool nat_outgoing = 8;
+  // Set when a live local WEP holds this IP. Decides locality when types has
+  // both LOCAL_WORKLOAD and REMOTE_WORKLOAD, as a borrowed IP does.
   bool local_workload = 9;
   TunnelType tunnel_type = 10;
+  bool borrowed = 11;
 }
 
 message RouteRemove {
@@ -618,6 +663,101 @@ message VXLANTunnelEndpointUpdate {
 
 message VXLANTunnelEndpointRemove {
   string node = 1;
+}
+
+message ReportResult {
+  // Whether the data was reported successfully.
+  bool successful = 1;
+}
+
+// DataplaneStats reports statistics about a flow from the dataplane.
+message DataplaneStats {
+  // Identity of the flow.
+  // Right now, just 5-tuple
+  string src_ip = 1;
+  string dst_ip = 2;
+  int32 src_port = 3;
+  int32 dst_port = 4;
+  Protocol protocol = 5;
+
+  // Each message can report zero or more statistics about the flow.
+  repeated Statistic stats = 6;
+
+  // RuleTrace is the sequence of rules that matched the flow. The last rule
+  // allows or denies the flow, each rule prior "passed" to the next tier or
+  // to profiles.
+  repeated RuleTrace rules = 7;
+
+  // Whether the flow was allowed or denied
+  Action action = 8;
+}
+
+// Action represents an action taken by a policy or rule.
+enum Action {
+  ALLOWED = 0;
+  DENIED = 1;
+}
+
+// Statistic is a piece of summary information for a flow.
+message Statistic {
+
+  // Whether the statistic is for inbound or outbound data flow, relative to
+  // the dataplane reporting.
+  enum Direction {
+    IN = 0;
+    OUT = 1;
+  }
+  Direction direction = 1;
+
+  // Whether the data is relative. ABSOLUTE data gives the total for the flow
+  // since it started.  DELTA data gives the change since the last report
+  // for this flow.
+  enum Relativity {
+    ABSOLUTE = 0;
+    DELTA = 1;
+  }
+  Relativity relativity = 2;
+
+  // Kind indicates what this statistic is about.
+  enum Kind {
+    PACKETS = 0;
+    BYTES = 1;
+  }
+  Kind kind = 3;
+
+  // Action further qualifies the kind.  For example, an action of ALLOWED with
+  // a kind of PACKETS means this statistic is the number of allowed packets.
+  Action action = 4;
+
+  // The numerical value of the statistic.
+  int64 value = 5;
+}
+
+// RuleTrace indicates a rule that matched the flow as it was being evaluated.
+message RuleTrace {
+  oneof id {
+    // The rule is part of a policy identified in this field.
+    PolicyID policy = 1;
+
+    // The rule is part of a profile identified in this field.
+    ProfileID profile = 2;
+
+    // The flow was neither allowed nor denied by any policy or profile.  By
+    // default this means the flow is denied. If this is set the rule num should
+    // be ignored since no rule matched the flow.
+    bool none = 3;
+  }
+
+  // Whether the rule appears in INBOUND or OUTBOUND rules for the policy /
+  // profile.
+  enum Direction {
+    INBOUND = 0;
+    OUTBOUND = 1;
+  }
+  Direction direction = 4;
+
+  // The numerical index of the rule that matched.
+  int32 rule_num = 5;
 }
 
 message WireguardEndpointUpdate {
@@ -656,6 +796,8 @@ message GlobalBGPConfigUpdate {
   repeated string service_cluster_cidrs = 1;
   repeated string service_external_cidrs = 2;
   repeated string service_loadbalancer_cidrs = 3;
+  string local_workload_peering_ip_v4 = 4;
+  string local_workload_peering_ip_v6 = 5;
 }
 
 message ServicePort {
@@ -668,10 +810,11 @@ message ServiceUpdate {
 	string name = 1;
 	string namespace = 2;
 	string type = 3;
-	string cluster_ip = 4;
+	repeated string cluster_ips = 4;
 	string loadbalancer_ip = 5;
 	repeated string external_ips = 6;
 	repeated ServicePort ports = 7;
+	repeated string loadbalancer_ingress_ips = 8;
 }
 
 message ServiceRemove {

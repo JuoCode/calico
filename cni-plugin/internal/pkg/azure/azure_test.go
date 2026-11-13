@@ -18,7 +18,7 @@ import (
 	"os"
 
 	"github.com/containernetworking/cni/pkg/skel"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -31,7 +31,7 @@ var _ = Describe("Azure Endpoint/Network tests", func() {
 
 	AfterEach(func() {
 		// Delete the test networks directory created by the test.
-		os.RemoveAll("./network")
+		_ = os.RemoveAll("./network")
 	})
 
 	It("should store and load networks and endpoints", func() {

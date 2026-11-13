@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,8 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-
-	"github.com/projectcalico/go-yaml-wrapper"
+	"sigs.k8s.io/yaml"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/argutils"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
@@ -33,6 +32,7 @@ import (
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	calicoErrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	validator "github.com/projectcalico/calico/libcalico-go/lib/validator/v3"
 )
 
 type action int
@@ -44,18 +44,19 @@ const (
 	ActionDelete
 	ActionGetOrList
 	ActionPatch
+	ActionValidate
 )
 
 // Convert loaded resources to a slice of resources for easier processing.
 // The loaded resources may be a slice containing resources and resource lists, or
 // may be a single resource or a single resource list.  This function handles the
 // different possible options to convert to a single slice of resources.
-func convertToSliceOfResources(loaded interface{}) ([]resourcemgr.ResourceObject, error) {
+func convertToSliceOfResources(loaded any) ([]resourcemgr.ResourceObject, error) {
 	res := []resourcemgr.ResourceObject{}
 	log.Infof("Converting resource to slice: %v", loaded)
 	switch r := loaded.(type) {
 	case []runtime.Object:
-		for i := 0; i < len(r); i++ {
+		for i := range r {
 			r, err := convertToSliceOfResources(r[i])
 			if err != nil {
 				return nil, err
@@ -123,16 +124,19 @@ type fileError struct {
 //   - Convert the loaded resources into a list of resources (easier to handle)
 //   - Process each resource individually, fanning out to the appropriate methods on
 //     the client interface, collate results and exit on the first error.
-func ExecuteConfigCommand(args map[string]interface{}, action action) CommandResults {
+func ExecuteConfigCommand(args map[string]any, action action) CommandResults {
 	var resources []resourcemgr.ResourceObject
 
 	singleKind := false
 
 	log.Info("Executing config command")
 
-	err := CheckVersionMismatch(args["--config"], args["--allow-version-mismatch"])
-	if err != nil {
-		return CommandResults{Err: err}
+	// Skip version mismatch checking for validation since we don't need datastore access
+	if action != ActionValidate {
+		err := CheckVersionMismatch(args["--config"], args["--allow-version-mismatch"])
+		if err != nil {
+			return CommandResults{Err: err}
+		}
 	}
 
 	errorOnEmpty := !argutils.ArgBoolOrFalse(args, "--skip-empty")
@@ -141,7 +145,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 		// Filename is specified.  Use the file iterator to handle the fact that this may be a directory rather than a
 		// single file. For each file load the resources from the file and convert to a single slice of resources for
 		// easier handling.
-		err := file.Iter(args, func(modifiedArgs map[string]interface{}) error {
+		err := file.Iter(args, func(modifiedArgs map[string]any) error {
 			modifiedFilename := modifiedArgs["--filename"].(string)
 
 			r, err := resourcemgr.CreateResourcesFromFile(modifiedFilename)
@@ -156,7 +160,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 
 			if len(converted) == 0 && errorOnEmpty {
 				// We should fail on empty files.
-				return fmt.Errorf("No resources specified in file %s", modifiedFilename)
+				return fmt.Errorf("no resources specified in file %s", modifiedFilename)
 			}
 
 			resources = append(resources, converted...)
@@ -172,7 +176,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 				// Empty files are handled above, so the only way to get here is if --filename pointed to a directory.
 				// We can therefore tweak the error message slightly to be more specific.
 				return CommandResults{
-					Err: fmt.Errorf("No resources specified in directory %s", filename),
+					Err: fmt.Errorf("no resources specified in directory %s", filename),
 				}
 			} else {
 				// No data, but not an error case. Return an empty set of results.
@@ -194,7 +198,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 		if len(resources) == 0 {
 			// No resources specified on non-file input is always an error.
 			return CommandResults{
-				Err: fmt.Errorf("No resources specified"),
+				Err: fmt.Errorf("no resources specified"),
 			}
 		}
 	}
@@ -211,14 +215,22 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 		log.Debugf("Data: %s", string(d))
 	}
 
-	// Load the client config and connect.
-	cf := args["--config"].(string)
-	cclient, err := clientmgr.NewClient(cf)
-	if err != nil {
-		fmt.Printf("Failed to create Calico API client: %s\n", err)
-		os.Exit(1)
+	// Load the client config and connect (skip for validation as we don't need datastore access).
+	var cclient client.Interface
+	var err error
+	if action != ActionValidate {
+		cf := args["--config"].(string)
+		cclient, err = clientmgr.NewClient(cf)
+		if err != nil {
+			fmt.Printf("Failed to create Calico API client: %s\n", err)
+			os.Exit(1)
+		}
+		log.Infof("Client: %v", cclient)
+	} else {
+		// Validation runs offline, so there is no apiserver to enforce the CRD
+		// schema and CEL rules. Run them in-process instead.
+		validator.SetCRDValidationEnabled(true)
 	}
-	log.Infof("Client: %v", cclient)
 
 	// Initialise the command results with the number of resources and the name of the
 	// kind of resource (if only dealing with a single resource).
@@ -232,6 +244,12 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 	}
 	if len(count) == 1 || singleKind {
 		results.SingleKind = kind
+	}
+
+	// For commands that modify config, first attempt to initialize the datastore.
+	switch action {
+	case ActionApply, ActionCreate, ActionUpdate:
+		tryEnsureInitialized(context.Background(), cclient)
 	}
 
 	// Now execute the command on each resource in order, exiting as soon as we hit an
@@ -261,7 +279,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 		res, err := ExecuteResourceAction(args, cclient, r, action)
 		if err != nil {
 			switch action {
-			case ActionApply, ActionCreate, ActionDelete, ActionGetOrList:
+			case ActionApply, ActionCreate, ActionDelete, ActionGetOrList, ActionValidate:
 				results.ResErrs = append(results.ResErrs, err)
 				continue
 			default:
@@ -293,7 +311,7 @@ func ExecuteConfigCommand(args map[string]interface{}, action action) CommandRes
 
 // ExecuteResourceAction fans out the specific resource action to the appropriate method
 // on the ResourceManager for the specific resource.
-func ExecuteResourceAction(args map[string]interface{}, client client.Interface, resource resourcemgr.ResourceObject, action action) ([]runtime.Object, error) {
+func ExecuteResourceAction(args map[string]any, client client.Interface, resource resourcemgr.ResourceObject, action action) ([]runtime.Object, error) {
 	rm := resourcemgr.GetResourceManager(resource)
 
 	err := handleNamespace(resource, rm, args)
@@ -318,6 +336,14 @@ func ExecuteResourceAction(args map[string]interface{}, client client.Interface,
 	case ActionPatch:
 		patch := args["--patch"].(string)
 		resOut, err = rm.Patch(ctx, client, resource, patch)
+	case ActionValidate:
+		// For validation, we validate the resource using Calico-specific validators
+		// This validates both resource structure/schema and Calico-specific validation rules
+		err = validator.Validate(resource)
+		if err != nil {
+			return nil, err
+		}
+		resOut = resource
 	}
 
 	// Skip over some errors depending on command line options.
@@ -338,10 +364,20 @@ func ExecuteResourceAction(args map[string]interface{}, client client.Interface,
 	return []runtime.Object{resOut}, err
 }
 
+// tryEnsureInitialized is called from any write action (apply, create, update). This
+// attempts to initialize the datastore. We do not fail the user action if this fails
+// since the users access permissions may be restricted to only allow modification
+// of certain resource types.
+func tryEnsureInitialized(ctx context.Context, client client.Interface) {
+	if err := client.EnsureInitialized(ctx, "", ""); err != nil {
+		log.WithError(err).Info("Unable to initialize datastore")
+	}
+}
+
 // handleNamespace fills in the namespace information in the resource (if required),
 // and validates the namespace depending on whether or not a namespace should be
 // provided based on the resource kind.
-func handleNamespace(resource resourcemgr.ResourceObject, rm resourcemgr.ResourceManager, args map[string]interface{}) error {
+func handleNamespace(resource resourcemgr.ResourceObject, rm resourcemgr.ResourceManager, args map[string]any) error {
 	allNs := argutils.ArgBoolOrFalse(args, "--all-namespaces")
 	cliNs := argutils.ArgStringOrBlank(args, "--namespace")
 	resNs := resource.GetObjectMeta().GetNamespace()
@@ -387,7 +423,7 @@ func CheckLocked(ctx context.Context, c client.Interface) (bool, error) {
 	// Get the cluster information resource
 	clusterinfo, err := c.ClusterInformation().Get(ctx, "default", options.GetOptions{})
 	if err != nil {
-		return false, fmt.Errorf("Error retrieving ClusterInformation: %s", err)
+		return false, fmt.Errorf("error retrieving ClusterInformation: %s", err)
 	}
 
 	return !*clusterinfo.Spec.DatastoreReady, nil

@@ -27,6 +27,7 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+	"net/netip"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -39,7 +40,7 @@ const (
 	IPv6SizeDword = 4
 )
 
-var ErrInvalidIP = errors.New("Failed to parse IP address")
+var ErrInvalidIP = errors.New("failed to parse IP address")
 
 // Addr represents either an IPv4 or IPv6 IP address.
 type Addr interface {
@@ -90,13 +91,14 @@ func (a V4Addr) String() string {
 }
 
 func (a V4Addr) AsBinary() string {
-	ipInBinary := fmt.Sprintf("%04b", 4)
-	for ii := 0; ii < net.IPv4len; ii++ {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 4)
+	for ii := range net.IPv4len {
 		temp := fmt.Sprintf("%08b", a[ii])
-		ipInBinary += temp
+		ipInBinary.WriteString(temp)
 	}
 
-	return ipInBinary
+	return ipInBinary.String()
 }
 
 func (a V4Addr) Add(n int) Addr {
@@ -154,13 +156,14 @@ func (a V6Addr) String() string {
 }
 
 func (a V6Addr) AsBinary() string {
-	ipInBinary := fmt.Sprintf("%04b", 6)
-	for ii := 0; ii < net.IPv6len; ii++ {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 6)
+	for ii := range net.IPv6len {
 		temp := fmt.Sprintf("%08b", a[ii])
-		ipInBinary += temp
+		ipInBinary.WriteString(temp)
 	}
 
-	return ipInBinary
+	return ipInBinary.String()
 }
 
 func (a V6Addr) Add(n int) Addr {
@@ -187,6 +190,9 @@ type CIDR interface {
 	ToIPNet() net.IPNet
 	AsBinary() string
 	Contains(addr Addr) bool
+	// IsSingleAddress returns true if the CIDR represents a single address.
+	// I.e. a /32 for IPv4 or a /128 for IPv6.
+	IsSingleAddress() bool
 }
 
 type V4CIDR struct {
@@ -235,13 +241,18 @@ func (c V4CIDR) String() string {
 }
 
 func (c V4CIDR) AsBinary() string {
-	ipInBinary := fmt.Sprintf("%04b", 4)
-	for ii := 0; ii < net.IPv4len; ii++ {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 4)
+	for ii := range net.IPv4len {
 		temp := fmt.Sprintf("%08b", c.addr[ii])
-		ipInBinary += temp
+		ipInBinary.WriteString(temp)
 	}
 
-	return ipInBinary[0 : c.prefix+4]
+	return ipInBinary.String()[0 : c.prefix+4]
+}
+
+func (c V4CIDR) IsSingleAddress() bool {
+	return c.prefix == 32
 }
 
 type V6CIDR struct {
@@ -296,12 +307,17 @@ func (c V6CIDR) String() string {
 }
 
 func (c V6CIDR) AsBinary() string {
-	ipInBinary := fmt.Sprintf("%04b", 6)
-	for ii := 0; ii < net.IPv6len; ii++ {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 6)
+	for ii := range net.IPv6len {
 		temp := fmt.Sprintf("%08b", c.addr[ii])
-		ipInBinary += temp
+		ipInBinary.WriteString(temp)
 	}
-	return ipInBinary[0 : c.prefix+4]
+	return ipInBinary.String()[0 : c.prefix+4]
+}
+
+func (c V6CIDR) IsSingleAddress() bool {
+	return c.prefix == 128
 }
 
 func FromString(s string) Addr {
@@ -343,6 +359,26 @@ func CIDRFromCalicoNet(ipNet calinet.IPNet) CIDR {
 	return CIDRFromIPNet(&ipNet.IPNet)
 }
 
+// CIDRFromPrefix converts a netip.Prefix to a CIDR.
+// The prefix is masked to ensure canonical representation.
+func CIDRFromPrefix(p netip.Prefix) CIDR {
+	p = p.Masked()
+	addr := p.Addr()
+	bits := p.Bits()
+	if addr.Is4() {
+		raw := addr.As4()
+		return V4CIDR{
+			addr:   V4Addr(raw),
+			prefix: uint8(bits),
+		}
+	}
+	raw := addr.As16()
+	return V6CIDR{
+		addr:   V6Addr(raw),
+		prefix: uint8(bits),
+	}
+}
+
 func CIDRsFromCalicoNets(ipNets []calinet.IPNet) []CIDR {
 	cidrs := make([]CIDR, 0, len(ipNets))
 	for _, ipNet := range ipNets {
@@ -355,7 +391,12 @@ func FromCalicoIP(ip calinet.IP) Addr {
 	return FromNetIP(ip.IP)
 }
 
+// CIDRFromIPNet converts a *net.IPNet to a CIDR; if passed nil,
+// returns nil.
 func CIDRFromIPNet(ipNet *net.IPNet) CIDR {
+	if ipNet == nil {
+		return nil
+	}
 	ones, _ := ipNet.Mask.Size()
 	// Mask the IP before creating the CIDR so that we have it in canonical format.
 	ip := FromNetIP(ipNet.IP.Mask(ipNet.Mask))
@@ -385,6 +426,22 @@ func CIDRFromAddrAndPrefix(addr Addr, prefixLen int) CIDR {
 // CIDRFromNetIP converts the given IP into our CIDR representation as a /32 or /128.
 func CIDRFromNetIP(netIP net.IP) CIDR {
 	return FromNetIP(netIP).AsCIDR()
+}
+
+// CIDRFromIPOrIPNet converts the given net.IP or *net.IPNet to a CIDR
+type IPOrIPNet interface {
+	net.IP | *net.IPNet
+}
+
+func CIDRFromIPOrIPNet[T IPOrIPNet](v T) CIDR {
+	switch v := any(v).(type) {
+	case net.IP:
+		return CIDRFromNetIP(v)
+	case *net.IPNet:
+		return CIDRFromIPNet(v)
+	default:
+		return nil
+	}
 }
 
 // MustParseCIDROrIP parses the given IP address or CIDR, treating IP addresses as "full length"

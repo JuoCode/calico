@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,16 +21,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
-	"reflect"
-
+	"github.com/jedib0t/go-pretty/v6/table"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/olekukonko/tablewriter"
-
 	log "github.com/sirupsen/logrus"
 )
 
@@ -94,7 +91,7 @@ func sessionNameToTypeAndPeerIP(ipSep, name string) (string, string, error) {
 		return "", "", fmt.Errorf("peer type '%s' is not recognized", sm[1])
 	}
 
-	ip := strings.Replace(sm[2], "_", ipSep, -1)
+	ip := strings.ReplaceAll(sm[2], "_", ipSep)
 	return sm[1], ip, nil
 }
 
@@ -358,10 +355,12 @@ func (b BirdBGPPeers) Populate(status *apiv3.CalicoNodeStatus) error {
 		// If it is a connection error, e.g. BGP is not enabled,
 		// set empty status.
 		if _, ok := err.(ErrorSocketConnection); ok {
+			// Clear only this family, since the other family's populator may already have filled its own fields.
+			bgp := &status.Status.BGP
 			if b.ipv == IPFamilyV4 {
-				status.Status.BGP = apiv3.CalicoNodeBGPStatus{}
+				bgp.PeersV4, bgp.NumberEstablishedV4, bgp.NumberNotEstablishedV4 = nil, 0, 0
 			} else {
-				status.Status.BGP = apiv3.CalicoNodeBGPStatus{}
+				bgp.PeersV6, bgp.NumberEstablishedV6, bgp.NumberNotEstablishedV6 = nil, 0, 0
 			}
 			return nil
 		}
@@ -409,19 +408,11 @@ func (b BirdBGPPeers) Show() {
 
 // printPeers prints out the slice of peers in table format.
 func printPeers(peers []*bgpPeer, out io.Writer) {
-	table := tablewriter.NewWriter(out)
-	table.SetHeader([]string{"Peer address", "Peer type", "State", "Since", "BGPState"})
-
+	t := table.NewWriter()
+	t.SetOutputMirror(out)
+	t.AppendHeader(table.Row{"Peer address", "Peer type", "State", "Since", "BGPState"})
 	for _, peer := range peers {
-		row := []string{
-			peer.peerIP,
-			peer.peerType,
-			peer.state,
-			peer.since,
-			peer.bgpState,
-		}
-		table.Append(row)
+		t.AppendRow(table.Row{peer.peerIP, peer.peerType, peer.state, peer.since, peer.bgpState})
 	}
-
-	table.Render()
+	t.Render()
 }

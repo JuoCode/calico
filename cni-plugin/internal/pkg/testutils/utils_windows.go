@@ -25,8 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/windows"
-
 	"github.com/Microsoft/hcsshim"
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
@@ -35,14 +33,14 @@ import (
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/mcuadros/go-version"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/windows/registry"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/windows"
 	"github.com/projectcalico/calico/cni-plugin/pkg/k8s"
 	plugintypes "github.com/projectcalico/calico/cni-plugin/pkg/types"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-
-	"golang.org/x/sys/windows/registry"
 )
 
 const HnsNoneNs = "none"
@@ -134,9 +132,9 @@ func createContainerUsingContainerd(containerId string) (string, string, error) 
 	// Create the container with ctr.exe that is shipped with containerd.
 	// When 'ctr run' is invoked, a running container is started with no
 	// networking.
-	image := "k8s.gcr.io/pause:3.5"
+	image := "k8s.gcr.io/pause:3.9"
 
-	command := fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' images pull %v`, image)
+	command := fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' images pull %v`, image)
 	cmd := exec.Command("powershell.exe", command)
 
 	log.Infof("Running powershell command: %v", command)
@@ -144,7 +142,7 @@ func createContainerUsingContainerd(containerId string) (string, string, error) 
 	if err != nil {
 		return "", "", errors.New(fmt.Sprintf("failed to pull image: %v", err))
 	}
-	command = fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' run --detach %v %v`, image, containerId)
+	command = fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' run --detach %v %v`, image, containerId)
 	cmd = exec.Command("powershell.exe", command)
 
 	log.Infof("Running powershell command: %v", command)
@@ -177,8 +175,8 @@ func DeleteRunningContainer(containerId string) error {
 
 	// Delete the running task and container with ctr.exe that is shipped with containerd.
 	cmds := []string{
-		fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' tasks kill %v`, containerId),
-		fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' containers delete %v`, containerId),
+		fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' tasks kill %v`, containerId),
+		fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' containers delete %v`, containerId),
 	}
 
 	for _, c := range cmds {
@@ -446,7 +444,7 @@ func NetworkPod(
 		"Namespace":   netns,
 	})
 	d := windows.NewWindowsDataplane(conf, logger)
-	_, _, err = d.DoNetworking(ctx, calicoClient, args, result, "", nil, nil, nil)
+	_, _, err = d.DoNetworking(ctx, calicoClient, args, result, "", nil, nil, nil, false)
 	return err
 }
 

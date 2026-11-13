@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package model_test
+package model
 
 import (
+	"net/netip"
 	"reflect"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/sirupsen/logrus"
-
-	. "github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/sirupsen/logrus"
 )
 
 // interestingPaths contains seed data for the KeyFromDefaultPath fuzzer.
@@ -43,27 +38,17 @@ import (
 var interestingPaths = []string{
 	"/calico/v1/config/foobar",
 	"/calico/v1/config/foobar/bazz",
-	"/calico/v1/policy/profile/foo%2fbar/rules",
-	"/calico/v1/policy/profile/foo%2fbar/labels",
-	"/calico/v1/policy/tier/default/policy/biff%2fbop",
-	"/calico/v1/policy/tier",
 	"/calico/v1/host/foobar/workload/open%2fstack/work%2fload/endpoint/end%2fpoint",
 	"/calico/v1/host/foobar/endpoint",
 	"/calico/v1/host/foobar/endpoint/biff",
 	"/calico/v1/host/foobar/metadata",
 	"/calico/v1/host/foobar/wireguard",
 	"/calico/v1/host/foobar/config/biff/bopp",
-	"/calico/v1/host/foobar/bird_ip",
 	"/calico/v1/host/foobar",
 	"/calico/v1/netset",
 	"/calico/v1/netset/foo",
 	"/calico/v1/Ready",
 	"/calico/v1/Ready/garbage",
-	"/calico/v1/policy/tier",
-	"/calico/v1/policy/tier/foo",
-	"/calico/v1/policy/tier/foo/policy",
-	"/calico/v1/policy/tier/foo/policy/bar",
-	"/calico/v1/policy/profile",
 	"/calico/bgp/v1/global",
 	"/calico/bgp/v1/global/peer_v4",
 	"/calico/bgp/v1/global/peer_v4/name",
@@ -128,6 +113,13 @@ func FuzzKeyFromDefaultPath(f *testing.F) {
 			// and consistent in some areas of escaping.
 			return
 		}
+
+		// All Key implementations must be comparable so they can be used as
+		// Go map keys and compared with ==.
+		if !reflect.TypeOf(newKey).Comparable() {
+			t.Fatalf("Key type %T is not comparable", newKey)
+		}
+
 		// If the old can parse it the new should parse it too (and get the same Key).
 		if !safeKeysEqual(oldKey, newKey) {
 			t.Fatalf("%q -> (new output) %v != (old output) %v", path, newKey, oldKey)
@@ -164,15 +156,10 @@ func safeKeysEqual(a, b Key) bool {
 		return false
 	}
 
-	// Due to an unfortunate historical mistake some of our keys embed non-comparable types net.IP and friends.
-	if !reflect.ValueOf(a).Type().Comparable() || !reflect.ValueOf(b).Type().Comparable() {
-		return reflect.DeepEqual(a, b)
-	}
 	return a == b
 }
 
 var _ = Describe("keys with region component", func() {
-
 	It("should not parse workload endpoint status with wrong region", func() {
 		Expect((WorkloadEndpointStatusListOptions{RegionString: "region-Asia"}).KeyFromDefaultPath("/calico/felix/v2/region-Europe/host/h1/workload/o1/w1/endpoint/e1")).To(BeNil())
 	})
@@ -276,24 +263,6 @@ var _ = DescribeTable(
 		}
 	},
 	Entry(
-		"profile rules with a /",
-		"/calico/v1/policy/profile/foo%2fbar/rules",
-		ProfileRulesKey{ProfileKey: ProfileKey{Name: "foo/bar"}},
-		false,
-	),
-	Entry(
-		"profile labels with a /",
-		"/calico/v1/policy/profile/foo%2fbar/labels",
-		ProfileLabelsKey{ProfileKey: ProfileKey{Name: "foo/bar"}},
-		false,
-	),
-	Entry(
-		"policy with a /",
-		"/calico/v1/policy/tier/default/policy/biff%2fbop",
-		PolicyKey{Name: "biff/bop"},
-		false,
-	),
-	Entry(
 		"workload with a /",
 		"/calico/v1/host/foobar/workload/open%2fstack/work%2fload/endpoint/end%2fpoint",
 		WorkloadEndpointKey{
@@ -314,15 +283,9 @@ var _ = DescribeTable(
 		false,
 	),
 	Entry(
-		"host IP",
-		"/calico/v1/host/foobar/bird_ip",
-		HostIPKey{Hostname: "foobar"},
-		false,
-	),
-	Entry(
 		"IP pool",
 		"/calico/v1/ipam/v4/pool/10.0.0.0-8",
-		IPPoolKey{CIDR: mustParseCIDR("10.0.0.0/8")},
+		IPPoolKey{CIDR: netip.MustParsePrefix("10.0.0.0/8")},
 		false,
 	),
 	Entry(
@@ -404,11 +367,154 @@ var _ = DescribeTable(
 		nil,
 		true,
 	),
+	Entry(
+		"NetworkPolicy",
+		"/calico/v1/policy/NetworkPolicy/default/my-policy",
+		PolicyKey{
+			Kind:      "NetworkPolicy",
+			Namespace: "default",
+			Name:      "my-policy",
+		},
+		false,
+	),
+	Entry(
+		"StagedNetworkPolicy",
+		"/calico/v1/policy/StagedNetworkPolicy/default/my-staged-policy",
+		PolicyKey{
+			Kind:      "StagedNetworkPolicy",
+			Namespace: "default",
+			Name:      "my-staged-policy",
+		},
+		false,
+	),
+	Entry(
+		"GlobalNetworkPolicy",
+		"/calico/v1/policy/GlobalNetworkPolicy//my-global-policy",
+		PolicyKey{
+			Kind: "GlobalNetworkPolicy",
+			Name: "my-global-policy",
+		},
+		false,
+	),
+)
+
+// Test parsing of legacy style PolicyKey of form /calico/v1/policy/tier/<Tier>/policy/<Name>
+var _ = DescribeTable(
+	"key parsing (legacy keys)",
+	func(strKey string, expected Key, shouldFail bool) {
+		key := KeyFromDefaultPath(strKey)
+		if shouldFail {
+			Expect(key).To(BeNil())
+		} else {
+			Expect(key).To(Equal(expected))
+			upg := expected.(LegacyPolicyKey).Upgrade()
+			Expect(upg).To(Equal(PolicyKey{
+				Kind:      expected.(LegacyPolicyKey).Kind,
+				Namespace: expected.(LegacyPolicyKey).Namespace,
+				Name:      expected.(LegacyPolicyKey).Name,
+			}))
+
+			val, err := key.parseValue([]byte(`{"spec":{}}`))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(val).To(Equal(&Policy{
+				Tier: expected.(LegacyPolicyKey).Tier,
+			}))
+		}
+	},
+
+	Entry(
+		"Legacy NetworkPolicy",
+		"/calico/v1/policy/tier/mytier/policy/ns%2fname",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind:      "NetworkPolicy",
+				Namespace: "ns",
+				Name:      "name",
+			},
+			Tier: "mytier",
+		},
+		false,
+	),
+	Entry(
+		"Legacy GlobalNetworkPolicy",
+		"/calico/v1/policy/tier/default/policy/name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind: "GlobalNetworkPolicy",
+				Name: "name",
+			},
+			Tier: "default",
+		},
+		false,
+	),
+	Entry(
+		"Legacy StagedNetworkPolicy",
+		"/calico/v1/policy/tier/default/policy/ns%2fstaged:name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind:      "StagedNetworkPolicy",
+				Namespace: "ns",
+				Name:      "name",
+			},
+			Tier: "default",
+		},
+		false,
+	),
+	Entry(
+		"Legacy StagedGlobalNetworkPolicy",
+		"/calico/v1/policy/tier/default/policy/staged:name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind: "StagedGlobalNetworkPolicy",
+				Name: "name",
+			},
+			Tier: "default",
+		},
+		false,
+	),
+	Entry(
+		"Legacy ClusterNetworkPolicy",
+		"/calico/v1/policy/tier/kube-admin/policy/kcnp.kube-admin.name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind: "KubernetesClusterNetworkPolicy",
+				Name: "kube-admin.name",
+			},
+			Tier: "kube-admin",
+		},
+		false,
+	),
+	Entry(
+		"Legacy KubernetesNetworkPolicy",
+		"/calico/v1/policy/tier/default/policy/ns%2fknp.default.name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind:      "KubernetesNetworkPolicy",
+				Namespace: "ns",
+				Name:      "name",
+			},
+			Tier: "default",
+		},
+		false,
+	),
+	Entry(
+		"Legacy StagedKubernetesNetworkPolicy",
+		"/calico/v1/policy/tier/default/policy/ns%2fstaged:knp.default.name",
+		LegacyPolicyKey{
+			PolicyKey: PolicyKey{
+				Kind:      "StagedKubernetesNetworkPolicy",
+				Namespace: "ns",
+				Name:      "name",
+			},
+			Tier: "default",
+		},
+		false,
+	),
 )
 
 var _ = DescribeTable(
 	"value parsing",
-	func(key Key, rawVal string, expectedVal interface{}) {
+	func(key Key, rawVal string, expectedVal any) {
 		val, err := ParseValue(key, []byte(rawVal))
 		Expect(err).ToNot(HaveOccurred())
 		Expect(val).To(Equal(expectedVal))
@@ -416,7 +522,7 @@ var _ = DescribeTable(
 	Entry(
 		"Block affinity claims with confirmed state",
 		BlockAffinityKey{
-			CIDR: mustParseCIDR("172.29.128.64/26"),
+			CIDR: netip.MustParsePrefix("172.29.128.64/26").Masked(),
 			Host: "happyhost.io",
 		},
 		`{"state":"confirmed"}`,
@@ -425,7 +531,7 @@ var _ = DescribeTable(
 	Entry(
 		"Block affinity claims with pending state",
 		BlockAffinityKey{
-			CIDR: mustParseCIDR("172.29.128.0/26"),
+			CIDR: netip.MustParsePrefix("172.29.128.0/26"),
 			Host: "slightlyhappyhost.io",
 		},
 		`{"state":"pending"}`,
@@ -434,7 +540,7 @@ var _ = DescribeTable(
 	Entry(
 		"Block affinity claims with pending-deletion state",
 		BlockAffinityKey{
-			CIDR: mustParseCIDR("172.29.128.192/26"),
+			CIDR: netip.MustParsePrefix("172.29.128.192/26").Masked(),
 			Host: "notsohappyhost.io",
 		},
 		`{"state":"pendingDeletion"}`,
@@ -443,7 +549,7 @@ var _ = DescribeTable(
 	Entry(
 		"Pre-3.0.7 style block affinity claims with no state i.e. empty string in value",
 		BlockAffinityKey{
-			CIDR: mustParseCIDR("172.29.128.128/26"),
+			CIDR: netip.MustParsePrefix("172.29.128.128/26").Masked(),
 			Host: "oldhost.io",
 		},
 		``,
@@ -452,7 +558,7 @@ var _ = DescribeTable(
 	Entry(
 		"Block affinity claims with empty state {} in value",
 		BlockAffinityKey{
-			CIDR: mustParseCIDR("172.29.128.128/26"),
+			CIDR: netip.MustParsePrefix("172.29.128.128/26").Masked(),
 			Host: "oldhost.io",
 		},
 		`{}`,
@@ -484,48 +590,48 @@ var _ = DescribeTable(
 					{
 						Action:        apiv3.Accept,
 						CIDR:          "77.7.1.0/24",
-						MatchOperator: apiv3.In,
+						MatchOperator: apiv3.MatchOperatorIn,
 					},
 					{
 						Action:        apiv3.Reject,
 						CIDR:          "77.7.2.0/24",
-						MatchOperator: apiv3.NotEqual,
+						MatchOperator: apiv3.MatchOperatorNotEqual,
 					},
 				},
 				ImportV4: []apiv3.BGPFilterRuleV4{
 					{
 						Action:        apiv3.Accept,
 						CIDR:          "77.7.3.0/24",
-						MatchOperator: apiv3.NotIn,
+						MatchOperator: apiv3.MatchOperatorNotIn,
 					},
 					{
 						Action:        apiv3.Reject,
 						CIDR:          "77.7.4.0/24",
-						MatchOperator: apiv3.Equal,
+						MatchOperator: apiv3.MatchOperatorEqual,
 					},
 				},
 				ExportV6: []apiv3.BGPFilterRuleV6{
 					{
 						Action:        apiv3.Accept,
 						CIDR:          "7000:1::0/64",
-						MatchOperator: apiv3.Equal,
+						MatchOperator: apiv3.MatchOperatorEqual,
 					},
 					{
 						Action:        apiv3.Reject,
 						CIDR:          "7000:2::0/64",
-						MatchOperator: apiv3.NotEqual,
+						MatchOperator: apiv3.MatchOperatorNotEqual,
 					},
 				},
 				ImportV6: []apiv3.BGPFilterRuleV6{
 					{
 						Action:        apiv3.Accept,
 						CIDR:          "7000:3::0/64",
-						MatchOperator: apiv3.In,
+						MatchOperator: apiv3.MatchOperatorIn,
 					},
 					{
 						Action:        apiv3.Reject,
 						CIDR:          "7000:4::0/64",
-						MatchOperator: apiv3.NotIn,
+						MatchOperator: apiv3.MatchOperatorNotIn,
 					},
 				},
 			},
@@ -533,34 +639,28 @@ var _ = DescribeTable(
 	),
 )
 
-func mustParseCIDR(s string) net.IPNet {
-	_, ipNet, err := net.ParseCIDR(s)
-	if err != nil {
-		panic(err)
+var (
+	benchResult any
+	_           = benchResult
+	benchKeys   = []Key{
+		WorkloadEndpointKey{
+			Hostname:       "ip-12-23-24-52.cloud.foo.bar.baz",
+			OrchestratorID: "kubernetes",
+			WorkloadID:     "some-pod-name-12346",
+			EndpointID:     "eth0",
+		},
+		WireguardKey{NodeName: "ip-12-23-24-53.cloud.foo.bar.baz"},
+		HostEndpointKey{
+			Hostname:   "ip-12-23-24-52.cloud.foo.bar.baz",
+			EndpointID: "eth0",
+		},
+		ResourceKey{
+			Name:      "projectcalico-default-allow",
+			Namespace: "default",
+			Kind:      apiv3.KindNetworkPolicy,
+		},
 	}
-	return *ipNet
-}
-
-var benchResult any
-var _ = benchResult
-var benchKeys = []Key{
-	WorkloadEndpointKey{
-		Hostname:       "ip-12-23-24-52.cloud.foo.bar.baz",
-		OrchestratorID: "kubernetes",
-		WorkloadID:     "some-pod-name-12346",
-		EndpointID:     "eth0",
-	},
-	WireguardKey{NodeName: "ip-12-23-24-53.cloud.foo.bar.baz"},
-	HostEndpointKey{
-		Hostname:   "ip-12-23-24-52.cloud.foo.bar.baz",
-		EndpointID: "eth0",
-	},
-	ResourceKey{
-		Name:      "projectcalico-default-allow",
-		Namespace: "default",
-		Kind:      apiv3.KindNetworkPolicy,
-	},
-}
+)
 
 func BenchmarkOldKeyFromDefaultPath(b *testing.B) {
 	benchmarkKeyFromDefaultPathImpl(b, OldKeyFromDefaultPath)

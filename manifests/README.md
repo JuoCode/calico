@@ -8,7 +8,7 @@ in the repository root.
 
 To make changes to the auto-generated manifests:
 
-1. Modify the source content in either `charts/tigera-operator/` or `charts/calico` 
+1. Modify the source content in either `charts/tigera-operator/` or `charts/calico`
 
 2. Re-run code generation from the top level of this repository
 
@@ -16,10 +16,21 @@ To make changes to the auto-generated manifests:
    make gen-manifests
    ```
 
-Some of these manifests are not automatically generated. To edit these, modify the manifests directly and 
+One manifest is generated, but not from `charts/`:
+
+- `migration.projectcalico.org_datastoremigrations.yaml` is copied from
+  `kube-controllers/pkg/apis/migration/v1/crd/`, which is controller-gen output. Edit the Go
+  types in `kube-controllers/pkg/apis/migration/v1/types.go` and run
+  `make -C kube-controllers gen-files`, then `make gen-manifests`.
+
+  It's not in the charts because it isn't part of a Calico install. The DatastoreMigration API
+  drives a one-time migration of stored resources from the v1 CRDs to the v3 CRDs, so a user only
+  installs the CRD if and when they run that migration.
+
+Some of these manifests are not automatically generated. To edit these, modify the manifests directly and
 commit your changes. **The following manifests are not auto generated:**
 
-- alp/istio-inject-configmap-X.yaml
+- alp/istio-app-layer-policy-envoy-v3.yaml
 - apiserver.yaml
 - calicoctl-etcd.yaml
 - calicoctl.yaml
@@ -33,4 +44,3 @@ commit your changes. **The following manifests are not auto generated:**
 - ocp/01-cr-apiserver.yaml
 - ocp/01-cr-installation.yaml
 - ocp-tigera-operator-no-resource-loading.yaml
-- operator-crds.yaml

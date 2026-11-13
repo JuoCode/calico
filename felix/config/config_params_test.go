@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,25 +16,24 @@ package config_test
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/projectcalico/calico/felix/config"
+	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/testutils"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
-	. "github.com/onsi/gomega"
-
-	log "github.com/sirupsen/logrus"
-
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
 )
 
 var _ = Describe("FelixConfig vs ConfigParams parity", func() {
@@ -61,18 +60,19 @@ var _ = Describe("FelixConfig vs ConfigParams parity", func() {
 		"loadClientConfigFromEnvironment",
 
 		"loadClientConfigFromEnvironment",
-		"useNodeResourceUpdates",
 		"internalOverrides",
 
 		// Temporary field to implement and test IPv6 in BPF dataplane
 		"BpfIpv6Support",
+
+		// Resolved from NFTablesMode at startup rather than configured directly.
+		"NFTablesEnabled",
 	}
 	cpFieldNameToFC := map[string]string{
 		"IpInIpEnabled":                      "IPIPEnabled",
 		"VXLANEnabled":                       "VXLANEnabled",
 		"IpInIpMtu":                          "IPIPMTU",
 		"Ipv6Support":                        "IPv6Support",
-		"IptablesLockTimeoutSecs":            "IptablesLockTimeout",
 		"IptablesLockProbeIntervalMillis":    "IptablesLockProbeInterval",
 		"IptablesPostWriteCheckIntervalSecs": "IptablesPostWriteCheckInterval",
 		"NetlinkTimeoutSecs":                 "NetlinkTimeout",
@@ -115,7 +115,16 @@ var _ = Describe("FelixConfig vs ConfigParams parity", func() {
 		}
 	})
 	It("Config should contain all FelixConfigurationSpec fields", func() {
+		fcFieldsToIgnore := set.From(
+			// NodeSelector is used by the config batcher to scope
+			// FelixConfiguration to specific nodes; it's not a Felix
+			// config parameter.
+			"NodeSelector",
+		)
 		for n := range fcFields {
+			if fcFieldsToIgnore.Contains(n) {
+				continue
+			}
 			mappedName := fcFieldNameToCP[n]
 			if mappedName != "" {
 				n = mappedName
@@ -125,7 +134,7 @@ var _ = Describe("FelixConfig vs ConfigParams parity", func() {
 	})
 })
 
-func fieldsByName(example interface{}) map[string]reflect.StructField {
+func fieldsByName(example any) map[string]reflect.StructField {
 	fields := map[string]reflect.StructField{}
 	t := reflect.TypeOf(example)
 	for i := 0; i < t.NumField(); i++ {
@@ -200,12 +209,31 @@ var _ = Describe("Config override empty", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cp.IptablesBackend).To(Equal("auto"))
 	})
+
+	It("should have correct default EndpointStatusPathPrefix value", func() {
+		Expect(cp.EndpointStatusPathPrefix).To(Equal("/var/run/calico"))
+	})
+
+	Context("with EndpointStatusPathPrefix=none in config file", func() {
+		BeforeEach(func() {
+			changed, err := cp.UpdateFrom(map[string]string{"EndpointStatusPathPrefix": "none"}, config.ConfigFile)
+			Expect(changed).To(BeTrue())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should have EndpointStatusPathPrefix empty", func() {
+			Expect(cp.EndpointStatusPathPrefix).To(Equal(""))
+		})
+	})
 })
 
-var t bool = true
+var (
+	nilServerPortSlice []config.ServerPort
+	t                  bool = true
+)
 
 var _ = DescribeTable("Config parsing",
-	func(key, value string, expected interface{}, errorExpected ...bool) {
+	func(key, value string, expected any, errorExpected ...bool) {
 		cfg := config.New()
 		_, err := cfg.UpdateFrom(map[string]string{key: value}, config.EnvironmentVariable)
 		configPtr := reflect.ValueOf(cfg)
@@ -221,6 +249,10 @@ var _ = DescribeTable("Config parsing",
 			Expect(cfg.Err).NotTo(HaveOccurred(), fmt.Sprintf("Expected no error to be stored when setting %s=%q", key, value))
 		}
 	},
+
+	Entry("Netlink Timeout - default value", "NetlinkTimeoutSecs", "", time.Duration(10*time.Second), false),
+
+	Entry("EndpointStatusPathPrefix - default value", "EndpointStatusPathPrefix", "", "/var/run/calico", false),
 
 	Entry("FelixHostname", "FelixHostname", "hostname", "hostname"),
 	Entry("FelixHostname FQDN", "FelixHostname", "hostname.foo.bar.com", "hostname.foo.bar.com"),
@@ -285,10 +317,6 @@ var _ = DescribeTable("Config parsing",
 
 	Entry("IptablesPostWriteCheckIntervalSecs", "IptablesPostWriteCheckIntervalSecs",
 		"1.5", 1500*time.Millisecond),
-	Entry("IptablesLockFilePath", "IptablesLockFilePath",
-		"/host/run/xtables.lock", "/host/run/xtables.lock"),
-	Entry("IptablesLockTimeoutSecs", "IptablesLockTimeoutSecs",
-		"123", 123*time.Second),
 	Entry("IptablesLockProbeIntervalMillis", "IptablesLockProbeIntervalMillis",
 		"123", 123*time.Millisecond),
 	Entry("IptablesLockProbeIntervalMillis garbage", "IptablesLockProbeIntervalMillis",
@@ -480,6 +508,11 @@ var _ = DescribeTable("Config parsing",
 			{Protocol: "tcp", Port: 6667},
 		},
 	),
+
+	Entry("GoMaxProcs default", "GoMaxProcs", "", -1),
+	Entry("GoMaxProcs -2 should be replaced with default", "GoMaxProcs", "-2", -1),
+	Entry("GoMaxProcs 1000 valid", "GoMaxProcs", "1000", 1000),
+
 	Entry("KubeNodePortRanges empty", "KubeNodePortRanges", "",
 		[]numorstring.Port{
 			{MinPort: 30000, MaxPort: 32767, PortName: ""},
@@ -512,10 +545,17 @@ var _ = DescribeTable("Config parsing",
 	Entry("BPFForceTrackPacketsFromIfaces Multiple valid entries", "BPFForceTrackPacketsFromIfaces", "docker0,docker1", []string{"docker0", "docker1"}),
 	Entry("BPFForceTrackPacketsFromIfaces Single invalid entry", "BPFForceTrackPacketsFromIfaces", "cali@123", []string{"docker+"}),
 	Entry("BPFForceTrackPacketsFromIfaces Multiple invalid entries", "BPFForceTrackPacketsFromIfaces", "cali-123,cali@123", []string{"docker+"}),
+
+	Entry("LogConnectionTransitionsPrefix valid", "LogConnectionTransitionsPrefix", "acme-%n", "acme-%n"),
+	Entry("LogConnectionTransitionsPrefix with quote falls back to default", "LogConnectionTransitionsPrefix", `ab"cd`, "calico-response"),
+
+	Entry("RequireMTUFile valid", "RequireMTUFile", "true", true),
+	Entry("RequireMTUFile valid", "RequireMTUFile", "y", true),
+	Entry("RequireMTUFile valid", "RequireMTUFile", "True", true),
 )
 
 var _ = DescribeTable("OpenStack heuristic tests",
-	func(clusterType, metadataAddr, metadataPort, ifacePrefixes interface{}, expected bool) {
+	func(clusterType, metadataAddr, metadataPort, ifacePrefixes any, expected bool) {
 		c := config.New()
 		values := make(map[string]string)
 		if clusterType != nil {
@@ -762,10 +802,57 @@ var _ = DescribeTable("Config validation",
 	Entry("excessive RouteTableRanges", map[string]string{
 		"RouteTableRanges": "1-100000000",
 	}, false),
+	Entry("excessive RouteTableRanges off-by-one", map[string]string{
+		"RouteTableRanges": "1-65535,99999-99999",
+	}, false),
+	Entry("RouteTableRanges 32-bit wrap-around", map[string]string{
+		"RouteTableRanges": "1-65535,1-2147483647",
+	}, false),
 	Entry("invalid RouteTableRanges", map[string]string{
 		"RouteTableRanges": "abcde",
 	}, false),
+	Entry("VXLAN port range: both unset", map[string]string{}, true),
+	Entry("VXLAN port range: valid min<max", map[string]string{
+		"VXLANSrcPortMin": "49152",
+		"VXLANSrcPortMax": "65535",
+	}, true),
+	Entry("VXLAN port range: min==max", map[string]string{
+		"VXLANSrcPortMin": "12345",
+		"VXLANSrcPortMax": "12345",
+	}, false),
+	Entry("VXLAN port range: only min set", map[string]string{
+		"VXLANSrcPortMin": "49152",
+	}, false),
+	Entry("VXLAN port range: only max set", map[string]string{
+		"VXLANSrcPortMax": "65535",
+	}, false),
+	Entry("VXLAN port range: min > max", map[string]string{
+		"VXLANSrcPortMin": "60000",
+		"VXLANSrcPortMax": "50000",
+	}, false),
 )
+
+var _ = Describe("Config RouteTableRanges", func() {
+	// The dataplane driver hands RouteTableIndices() to NewIndexAllocator, which
+	// sorts the ranges it is given.  If that reordered Felix's own copy of the
+	// config, the next config update would re-parse the raw value in its original
+	// order, see a change, and restart Felix - over and over.
+	const rawRanges = "1-250,1000-1500"
+
+	It("should survive the route-table index allocator without looking changed", func() {
+		conf := config.New()
+		changed, err := conf.UpdateFrom(map[string]string{"RouteTableRanges": rawRanges}, config.DatastoreGlobal)
+		Expect(err).To(Succeed())
+		Expect(changed).To(BeTrue())
+
+		idalloc.NewIndexAllocator(conf.RouteTableIndices(), []idalloc.IndexRange{{Min: 253, Max: 255}})
+
+		changed, err = conf.UpdateFrom(map[string]string{"RouteTableRanges": rawRanges}, config.DatastoreGlobal)
+		Expect(err).To(Succeed())
+		Expect(changed).To(BeFalse(),
+			"re-applying identical config reported a change, which would make Felix restart in a loop")
+	})
+})
 
 var _ = DescribeTable("Config InterfaceExclude",
 	func(excludeList string, expected []*regexp.Regexp) {
@@ -830,7 +917,7 @@ var _ = Describe("Config copy tests", func() {
 		Expect(conf.RawValues()).To(Equal(conf.Copy().RawValues()))
 	})
 
-	It("should copy via protobuf correctly", func() {
+	It("should copy via protobuf correctly UpdateFromConfigUpdate", func() {
 		pb := conf.ToConfigUpdate()
 		confCp := config.New()
 		changedFields, err := confCp.UpdateFromConfigUpdate(pb)
@@ -842,6 +929,17 @@ var _ = Describe("Config copy tests", func() {
 		Expect(confCp.RawValues()).To(Equal(conf.RawValues()))
 
 		changedFields, err = confCp.UpdateFromConfigUpdate(pb)
+		Expect(err).To(Succeed())
+		Expect(changedFields).To(BeEmpty())
+		Expect(confCp.RawValues()).To(Equal(conf.RawValues()))
+	})
+
+	It("should copy via protobuf correctly FromConfigUpdate", func() {
+		pb := conf.ToConfigUpdate()
+		confCp := config.FromConfigUpdate(pb)
+		Expect(confCp.RawValues()).To(Equal(conf.RawValues()))
+
+		changedFields, err := confCp.UpdateFromConfigUpdate(pb)
 		Expect(err).To(Succeed())
 		Expect(changedFields).To(BeEmpty())
 		Expect(confCp.RawValues()).To(Equal(conf.RawValues()))
@@ -893,3 +991,134 @@ var _ = DescribeTable("SafeParamsEqual",
 		false,
 	),
 )
+
+var _ = Describe("ParamForField", func() {
+	It("int(0);1024", func() {
+		param, defaultStr, flags := config.ParamForField("TestField", "int(0);1024")
+		Expect(param).To(BeAssignableToTypeOf(&config.IntParam{}))
+		intParam := param.(*config.IntParam)
+		Expect(intParam.Ranges).To(HaveLen(1))
+		Expect(intParam.Ranges[0].Min).To(BeNumerically("==", 0))
+		Expect(intParam.Ranges[0].Max).To(BeNumerically("==", math.MaxInt))
+		Expect(defaultStr).To(Equal("1024"))
+		Expect(flags).To(Equal(""))
+	})
+	It("int(1:2147483646);512", func() {
+		param, defaultStr, flags := config.ParamForField("TestField6", "int(1:2147483646);512")
+		Expect(param).To(BeAssignableToTypeOf(&config.IntParam{}))
+		intParam := param.(*config.IntParam)
+		Expect(intParam.Ranges).To(HaveLen(1))
+		Expect(intParam.Ranges[0].Min).To(BeNumerically("==", 1))
+		Expect(intParam.Ranges[0].Max).To(BeNumerically("==", 2147483646))
+		Expect(defaultStr).To(Equal("512"))
+		Expect(flags).To(Equal(""))
+	})
+	It("defaults a mis-parsed max to MaxInt, not MinInt", func() {
+		param, defaultStr, flags := config.ParamForField("TestField", "int(0:);1024")
+		Expect(param).To(BeAssignableToTypeOf(&config.IntParam{}))
+		intParam := param.(*config.IntParam)
+		Expect(intParam.Ranges).To(HaveLen(1))
+		Expect(intParam.Ranges[0].Min).To(BeNumerically("==", 0))
+		Expect(intParam.Ranges[0].Max).To(BeNumerically("==", math.MaxInt))
+		Expect(defaultStr).To(Equal("1024"))
+		Expect(flags).To(Equal(""))
+	})
+	It("does not copy min and max across comma-separated ranges", func() {
+		param, defaultStr, flags := config.ParamForField("TestField", "int(10:22,15:,:63);1024")
+		Expect(param).To(BeAssignableToTypeOf(&config.IntParam{}))
+		intParam := param.(*config.IntParam)
+		Expect(intParam.Ranges).To(HaveLen(3))
+		Expect(intParam.Ranges[0].Min).To(BeNumerically("==", 10))
+		Expect(intParam.Ranges[0].Max).To(BeNumerically("==", 22))
+		Expect(intParam.Ranges[1].Min).To(BeNumerically("==", 15))
+		Expect(intParam.Ranges[1].Max).To(BeNumerically("==", math.MaxInt))
+		Expect(intParam.Ranges[2].Min).To(BeNumerically("==", math.MinInt))
+		Expect(intParam.Ranges[2].Max).To(BeNumerically("==", 63))
+		Expect(defaultStr).To(Equal("1024"))
+		Expect(flags).To(Equal(""))
+	})
+	It("handles int with no params", func() {
+		param, defaultStr, flags := config.ParamForField("TestField", "int();1024")
+		Expect(param).To(BeAssignableToTypeOf(&config.IntParam{}))
+		intParam := param.(*config.IntParam)
+		Expect(intParam.Ranges).To(HaveLen(1))
+		Expect(intParam.Ranges[0].Min).To(BeNumerically("==", math.MinInt))
+		Expect(intParam.Ranges[0].Max).To(BeNumerically("==", math.MaxInt))
+		Expect(defaultStr).To(Equal("1024"))
+		Expect(flags).To(Equal(""))
+	})
+})
+
+var _ = Describe("ProgramClusterRoutes", func() {
+	It("defaults to Felix owning the IPIP cluster routes and BIRD owning the rest", func() {
+		c := config.New()
+		Expect(c.ProgramClusterRoutes).To(Equal(v3.EnabledIPIPOnly))
+		Expect(c.ProgramIPIPClusterRoutes()).To(BeTrue())
+		Expect(c.ProgramNoEncapClusterRoutes()).To(BeFalse())
+	})
+
+	DescribeTable("splits the configured value into per-encapsulation ownership",
+		func(raw string, expectedIPIP, expectedNoEncap bool) {
+			c := config.New()
+			_, err := c.UpdateFrom(map[string]string{"ProgramClusterRoutes": raw}, config.DatastoreGlobal)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.ProgramIPIPClusterRoutes()).To(Equal(expectedIPIP))
+			Expect(c.ProgramNoEncapClusterRoutes()).To(Equal(expectedNoEncap))
+		},
+		Entry("Disabled", v3.Disabled, false, false),
+		Entry("EnabledIPIPOnly", v3.EnabledIPIPOnly, true, false),
+		Entry("EnabledNoEncapOnly", v3.EnabledNoEncapOnly, false, true),
+		Entry("Enabled", v3.Enabled, true, true),
+		// Values are matched case-insensitively, as for every other oneof parameter.
+		Entry("enabledipiponly", strings.ToLower(v3.EnabledIPIPOnly), true, false),
+	)
+
+	It("falls back to the default if the value is not recognised", func() {
+		c := config.New()
+		_, err := c.UpdateFrom(map[string]string{"ProgramClusterRoutes": "NotAValue"}, config.DatastoreGlobal)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.ProgramClusterRoutes).To(Equal(v3.EnabledIPIPOnly))
+	})
+})
+
+var _ = Describe("Dataplane-specific parameters", func() {
+	var c *config.Config
+
+	BeforeEach(func() {
+		c = config.New()
+		_, err := c.UpdateFrom(map[string]string{
+			"NFTablesMode":              "Auto",
+			"IptablesFilterAllowAction": "RETURN",
+			"IptablesMangleAllowAction": "RETURN",
+			"IptablesFilterDenyAction":  "REJECT",
+			"IptablesMarkMask":          "0xff000000",
+			"IptablesRefreshInterval":   "11",
+			"NftablesFilterAllowAction": "ACCEPT",
+			"NftablesMangleAllowAction": "ACCEPT",
+			"NftablesFilterDenyAction":  "DROP",
+			"NftablesMarkMask":          "0xffff0000",
+			"NftablesRefreshInterval":   "22",
+		}, config.DatastoreGlobal)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	// The accessors follow the resolved dataplane, not NFTablesMode, so that a cluster
+	// on the default Auto still gets its nftables values.
+	It("returns the nftables values when nftables was resolved", func() {
+		c.NFTablesEnabled = true
+		Expect(c.FilterAllowAction()).To(Equal("ACCEPT"))
+		Expect(c.MangleAllowAction()).To(Equal("ACCEPT"))
+		Expect(c.FilterDenyAction()).To(Equal("DROP"))
+		Expect(c.MarkMask()).To(Equal(uint32(0xffff0000)))
+		Expect(c.TableRefreshInterval()).To(Equal(22 * time.Second))
+	})
+
+	It("returns the iptables values when iptables was resolved", func() {
+		c.NFTablesEnabled = false
+		Expect(c.FilterAllowAction()).To(Equal("RETURN"))
+		Expect(c.MangleAllowAction()).To(Equal("RETURN"))
+		Expect(c.FilterDenyAction()).To(Equal("REJECT"))
+		Expect(c.MarkMask()).To(Equal(uint32(0xff000000)))
+		Expect(c.TableRefreshInterval()).To(Equal(11 * time.Second))
+	})
+})

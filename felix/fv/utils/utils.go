@@ -21,39 +21,48 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/felix/ipsets"
+	"github.com/projectcalico/calico/felix/nftables/nftrender"
+	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
-
-	"github.com/projectcalico/calico/felix/calc"
-	"github.com/projectcalico/calico/felix/ipsets"
-	"github.com/projectcalico/calico/felix/rules"
 )
 
 type EnvConfig struct {
 	// Note: These are overridden in the Makefile!
-	FelixImage   string `default:"calico/felix:latest"`
+	FelixImage   string `default:"calico/felix-test:latest"`
 	EtcdImage    string `default:"quay.io/coreos/etcd"`
 	K8sImage     string `default:"calico/go-build:latest"`
-	TyphaImage   string `default:"calico/typha:latest"`
+	TyphaImage   string `default:"calico/calico:latest"`
 	BusyboxImage string `default:"busybox:latest"`
 }
+
+// TyphaCmd is the subcommand used to launch typha inside the combined
+// calico image.
+var TyphaCmd = []string{"component", "typha"}
 
 var Config EnvConfig
 
 func init() {
+	envErr := godotenv.Load("../.env")
+	if envErr != nil {
+		log.Debugf("Error loading .env file! Err = %s", envErr)
+	}
 	err := envconfig.Process("fv", &Config)
 	if err != nil {
 		panic(err)
@@ -102,7 +111,7 @@ func run(input []byte, checkNoError bool, command string, args ...string) error 
 		}
 	}
 	if checkNoError {
-		ExpectWithOffset(2, err).NotTo(HaveOccurred(), fmt.Sprintf("Command failed\nCommand: %v args: %v\nOutput:\n\n%v",
+		gomega.ExpectWithOffset(2, err).NotTo(gomega.HaveOccurred(), fmt.Sprintf("Command failed\nCommand: %v args: %v\nOutput:\n\n%v",
 			command, args, string(outputBytes)))
 	}
 	if err != nil {
@@ -121,23 +130,27 @@ func indent(s string, prefix string) string {
 }
 
 func formatCommand(command string, args []string) string {
-	out := command
+	var out strings.Builder
+	out.WriteString(command)
 	for _, arg := range args {
 		// Only quote if there are actually some interesting characters in there, just to make it easier to read.
 		quoted := fmt.Sprintf("%q", arg)
 		if quoted == `"`+arg+`"` {
-			out += " " + arg
+			out.WriteString(" " + arg)
 		} else {
-			out += " " + quoted
+			out.WriteString(" " + quoted)
 		}
 	}
-	return out
+	return out.String()
 }
 
 func GetCommandOutput(command string, args ...string) (string, error) {
 	cmd := Command(command, args...)
 	log.Infof("Running '%s %s'", cmd.Path, strings.Join(cmd.Args, " "))
 	output, err := cmd.CombinedOutput()
+	if err != nil {
+		err = fmt.Errorf("command failed %q: %w", cmd, err)
+	}
 	return string(output), err
 }
 
@@ -149,18 +162,17 @@ func RunCommand(command string, args ...string) error {
 
 func Command(name string, args ...string) *exec.Cmd {
 	log.Debugf("Creating Command [%s].", formatCommand(name, args))
-
 	return exec.Command(name, args...)
 }
 
 func LogOutput(cmd *exec.Cmd, name string) error {
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("Getting StdoutPipe failed for %s: %v", name, err)
+		return fmt.Errorf("getting StdoutPipe failed for %s: %v", name, err)
 	}
 	errPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("Getting StderrPipe failed for %s: %v", name, err)
+		return fmt.Errorf("getting StderrPipe failed for %s: %v", name, err)
 	}
 	stdoutReader := bufio.NewReader(outPipe)
 	stderrReader := bufio.NewReader(errPipe)
@@ -196,13 +208,13 @@ func GetEtcdClient(etcdIP string) client.Interface {
 			},
 		},
 	})
-	Expect(err).NotTo(HaveOccurred())
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	return client
 }
 
 func IPSetIDForSelector(rawSelector string) string {
 	sel, err := selector.Parse(rawSelector)
-	Expect(err).ToNot(HaveOccurred())
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
 	ipSetData := calc.IPSetData{
 		Selector: sel,
@@ -229,6 +241,23 @@ func IPSetNameForSelector(ipVersion int, rawSelector string) string {
 	return ipVerConf.NameForMainIPSet(setID)
 }
 
+func NFTSetNameForSelector(ipVersion int, rawSelector string) string {
+	base := IPSetNameForSelector(ipVersion, rawSelector)
+	return nftrender.LegalizeSetName(base)
+}
+
+func IPSetName(ipSetID string, ipVersion uint8) string {
+	ipFamily := ipsets.IPFamilyV4
+	if ipVersion == 6 {
+		ipFamily = ipsets.IPFamilyV6
+	}
+	return ipsets.NewIPVersionConfig(ipFamily, rules.IPSetNamePrefix, nil, nil).NameForMainIPSet(ipSetID)
+}
+
+func NFTSetName(ipSetID string, ipVersion uint8) string {
+	return "@" + IPSetName(ipSetID, ipVersion)
+}
+
 // HasSyscallConn represents objects that can return a syscall.RawConn
 type HasSyscallConn interface {
 	SyscallConn() (syscall.RawConn, error)
@@ -247,7 +276,6 @@ func ConnMTU(hsc HasSyscallConn) (int, error) {
 	err = c.Control(func(fd uintptr) {
 		mtu, sysErr = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MTU)
 	})
-
 	if err != nil {
 		return 0, err
 	}
@@ -268,12 +296,12 @@ func UpdateFelixConfig(client client.Interface, deltaFn func(*api.FelixConfigura
 		cfg.Name = "default"
 		deltaFn(cfg)
 		_, err = client.FelixConfigurations().Create(ctx, cfg, options.SetOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	} else {
-		Expect(err).NotTo(HaveOccurred())
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		deltaFn(cfg)
 		_, err = client.FelixConfigurations().Update(ctx, cfg, options.SetOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	}
 }
 
@@ -284,4 +312,51 @@ func GetSysArch() string {
 		arch = "amd64"
 	}
 	return arch
+}
+
+func GetUbuntuRelease() string {
+	// The full shell command pipeline
+	cmdString := "lsb_release -r | awk '{print $2}'"
+
+	// Execute the command using /bin/sh -c to interpret the pipe
+	cmd := exec.Command("/bin/sh", "-c", cmdString)
+
+	// Run the command and capture its standard output
+	output, err := cmd.Output()
+	if err != nil {
+		// Handle potential errors, e.g., command not found, permission issues, non-zero exit code
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			fmt.Printf("Error: Command exited with non-zero status: %d\n", exitErr.ExitCode())
+			fmt.Printf("Stderr: %s\n", exitErr.Stderr)
+		} else {
+			fmt.Printf("Error: Failed to execute command: %v\n", err)
+		}
+		return "" // Return an empty string on error
+	}
+
+	// Convert the output (byte slice) to a string and trim whitespace
+	versionString := strings.TrimSpace(string(output))
+	return versionString
+}
+
+func UbuntuReleaseGreater(release string) bool {
+	currentReleaseStr := GetUbuntuRelease()
+	if currentReleaseStr == "" {
+		fmt.Println("Could not get current Ubuntu release for comparison.")
+		return false
+	}
+
+	currentRelease, err := strconv.ParseFloat(currentReleaseStr, 64)
+	if err != nil {
+		fmt.Printf("Error parsing current Ubuntu release '%s' to float: %v\n", currentReleaseStr, err)
+		return false
+	}
+
+	compareRelease, err := strconv.ParseFloat(release, 64)
+	if err != nil {
+		fmt.Printf("Error parsing provided release '%s' to float: %v\n", release, err)
+		return false
+	}
+
+	return currentRelease > compareRelease
 }

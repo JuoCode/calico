@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2019 Tigera, Inc. All rights reserved.
+# Copyright (c) 2015-2024 Tigera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,22 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Note: the felix-test image is really a "test environment" image.  It doesn't include Felix itself and we don't ship it.
 
-# NOTE: This Dockerfile should be kept in-sync with the one in calico/node.
-# This ensures that testing of Felix in this repository is done in the same
-# userspace environment as it will be deployed in calico/node.
+ARG BPFTOOL_IMAGE
 
-ARG QEMU_IMAGE
+FROM ${BPFTOOL_IMAGE} AS bpftool
 
-FROM ${QEMU_IMAGE} as qemu
-
-FROM calico/bpftool:v5.3-${TARGETARCH} as bpftool
-
-FROM debian:11-slim as source
-
-LABEL maintainer="Shaun Crampton <shaun@tigera.io>"
-
-COPY --from=qemu /usr/bin/qemu-*-static /usr/bin
+FROM debian:12-slim AS source
 
 # Install remaining runtime deps required for felix from the global repository
 RUN apt-get update && apt-get install -y \
@@ -46,6 +37,7 @@ RUN apt-get update && apt-get install -y \
     # Need netbase in order for ipset to work correctly
     # See https://github.com/kubernetes/kubernetes/issues/68703
     netbase \
+    libnftables-dev \
     # Also needed (provides utilities for browsing procfs like ps)
     procps \
     ca-certificates \
@@ -54,7 +46,10 @@ RUN apt-get update && apt-get install -y \
     ethtool \
     hping3 \
     libpcap0.8 \
-    tcpdump
+    tcpdump \
+    iperf3 \
+    iperf \
+    jq
 
 RUN apt-get install --no-install-recommends -y wireguard-tools
 
@@ -66,20 +61,35 @@ RUN update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 
 # Felix is built with RHEL/UBI and links against libpcap.so.1. We need this symbolic link
 # until Debian changes the soname from .0.8 to .1.
-RUN ln -s $(readlink /usr/lib/*-linux-gnu/libpcap.so.0.8) $(ldconfig -v 2>/dev/null | grep /usr/lib/ | head -n 1 | sed -e 's/://')/libpcap.so.1
+RUN ln -s $(readlink /usr/lib/*-linux-gnu/libpcap.so.0.8) $(ldconfig -v 2>/dev/null | grep '^/lib/' | head -n 1 | cut -f1 -d:)/libpcap.so.1
 
 COPY felix.cfg /etc/calico/felix.cfg
 COPY calico-felix-wrapper /usr/bin
 
 COPY --from=bpftool /bpftool /usr/bin
 
-RUN rm -f /usr/bin/qemu-*-static
-
 FROM scratch
 
 COPY --from=source / /
 
 WORKDIR /code
+
+LABEL org.opencontainers.image.description="Calico's per-host daemon"
+LABEL org.opencontainers.image.authors="maintainers@tigera.io"
+LABEL org.opencontainers.image.source="https://github.com/projectcalico/calico"
+LABEL org.opencontainers.image.title="Calico Felix"
+LABEL org.opencontainers.image.vendor="Project Calico"
+LABEL org.opencontainers.image.version="${GIT_VERSION}"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+# Labels for RedHat OCP certification
+LABEL description="Calico's per-host daemon"
+LABEL maintainer="maintainers@tigera.io"
+LABEL name="Calico Felix"
+LABEL release=1
+LABEL summary="Calico's per-host daemon"
+LABEL vendor="Project Calico"
+LABEL version="${GIT_VERSION}"
 
 # Run felix (via the wrapper script) by default
 CMD ["/usr/bin/calico-felix-wrapper"]

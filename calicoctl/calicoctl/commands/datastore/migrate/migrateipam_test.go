@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package migrate_test
+package migrate
 
 import (
 	"context"
 	"fmt"
+	"net/netip"
 
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/datastore/migrate"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 )
 
 var (
@@ -46,15 +45,19 @@ var _ = Describe("IPAM migration handling", func() {
 	BeforeEach(func() {
 		block1 = &model.KVPair{
 			Key: model.BlockKey{
-				CIDR: net.MustParseCIDR("192.168.201.0/26"),
+				CIDR: netip.MustParsePrefix("192.168.201.0/26"),
 			},
 			Value: &model.AllocationBlock{
 				CIDR:     net.MustParseCIDR("192.168.201.0/26"),
 				Affinity: &blockAffinityField,
 				Attributes: []model.AllocationAttribute{
 					{
-						AttrPrimary: &ipipTunnelHandle,
-						AttrSecondary: map[string]string{
+						HandleID: &ipipTunnelHandle,
+						ActiveOwnerAttrs: map[string]string{
+							"node": nodeName,
+							"type": "ipipTunnelAddress",
+						},
+						AlternateOwnerAttrs: map[string]string{
 							"node": nodeName,
 							"type": "ipipTunnelAddress",
 						},
@@ -65,8 +68,9 @@ var _ = Describe("IPAM migration handling", func() {
 
 		affinity1 = &model.KVPair{
 			Key: model.BlockAffinityKey{
-				CIDR: net.MustParseCIDR("192.168.201.0/26"),
-				Host: nodeName,
+				CIDR:         netip.MustParsePrefix("192.168.201.0/26"),
+				Host:         nodeName,
+				AffinityType: string(ipam.AffinityTypeHost),
 			},
 			Value: &model.BlockAffinity{
 				State:   model.StateConfirmed,
@@ -100,7 +104,7 @@ var _ = Describe("IPAM migration handling", func() {
 
 		bc := NewMockIPAMBackendClient(blocks, affinities, handles)
 		client := NewMockIPAMClient(bc)
-		migrateIPAM := migrate.NewMigrateIPAM(client)
+		migrateIPAM := NewMigrateIPAM(client)
 		migrateIPAM.SetNodeMap(map[string]string{nodeName: newNodeName})
 		err := migrateIPAM.PullFromDatastore()
 		Expect(err).NotTo(HaveOccurred())
@@ -109,13 +113,15 @@ var _ = Describe("IPAM migration handling", func() {
 		Expect(migrateIPAM.IPAMBlocks).To(HaveLen(1))
 		Expect(*migrateIPAM.IPAMBlocks[0].Value.Affinity).To(Equal(fmt.Sprintf("host:%s", newNodeName)))
 		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes).To(HaveLen(1))
-		Expect(*migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AttrPrimary).To(Equal(fmt.Sprintf("ipip-tunnel-addr-%s", newNodeName)))
-		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AttrSecondary["node"]).To(Equal(newNodeName))
+		Expect(*migrateIPAM.IPAMBlocks[0].Value.Attributes[0].HandleID).To(Equal(fmt.Sprintf("ipip-tunnel-addr-%s", newNodeName)))
+		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].ActiveOwnerAttrs["node"]).To(Equal(newNodeName))
+		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AlternateOwnerAttrs["node"]).To(Equal(newNodeName))
 
 		// Check that the block affinity attributes were changed correctly
 		newAffinityKey := model.BlockAffinityKey{
-			CIDR: net.MustParseCIDR("192.168.201.0/26"),
-			Host: newNodeName,
+			CIDR:         netip.MustParsePrefix("192.168.201.0/26"),
+			Host:         newNodeName,
+			AffinityType: string(ipam.AffinityTypeHost),
 		}
 		newAffinityKeyPath, err := model.KeyToDefaultPath(newAffinityKey)
 		Expect(err).NotTo(HaveOccurred())
@@ -145,7 +151,7 @@ var _ = Describe("IPAM migration handling", func() {
 
 		bc := NewMockIPAMBackendClient(blocks, affinities, handles)
 		client := NewMockIPAMClient(bc)
-		migrateIPAM := migrate.NewMigrateIPAM(client)
+		migrateIPAM := NewMigrateIPAM(client)
 		migrateIPAM.SetNodeMap(map[string]string{nodeName: nodeName})
 		err := migrateIPAM.PullFromDatastore()
 		Expect(err).NotTo(HaveOccurred())
@@ -154,8 +160,9 @@ var _ = Describe("IPAM migration handling", func() {
 		Expect(migrateIPAM.IPAMBlocks).To(HaveLen(1))
 		Expect(*migrateIPAM.IPAMBlocks[0].Value.Affinity).To(Equal(fmt.Sprintf("host:%s", nodeName)))
 		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes).To(HaveLen(1))
-		Expect(*migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AttrPrimary).To(Equal(fmt.Sprintf("ipip-tunnel-addr-%s", nodeName)))
-		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AttrSecondary["node"]).To(Equal(nodeName))
+		Expect(*migrateIPAM.IPAMBlocks[0].Value.Attributes[0].HandleID).To(Equal(fmt.Sprintf("ipip-tunnel-addr-%s", nodeName)))
+		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].ActiveOwnerAttrs["node"]).To(Equal(nodeName))
+		Expect(migrateIPAM.IPAMBlocks[0].Value.Attributes[0].AlternateOwnerAttrs["node"]).To(Equal(nodeName))
 
 		// Check that the block affinity attributes were not changed
 		newAffinityKeyPath, err := model.KeyToDefaultPath(affinity1.Key)
@@ -169,6 +176,35 @@ var _ = Describe("IPAM migration handling", func() {
 		Expect(migrateIPAM.IPAMHandles).To(HaveLen(1))
 		Expect(migrateIPAM.IPAMHandles[0].Key).To(Equal(newHandleKeyPath))
 	})
+
+	DescribeTable("Should rename the handle for every tunnel address type",
+		func(oldHandle, wantHandle string) {
+			block, ok := block1.Value.(*model.AllocationBlock)
+			Expect(ok).To(BeTrue())
+			block.Attributes[0].HandleID = &oldHandle
+			handle1.Key = model.IPAMHandleKey{HandleID: oldHandle}
+
+			bc := NewMockIPAMBackendClient(
+				model.KVPairList{KVPairs: []*model.KVPair{block1}},
+				model.KVPairList{KVPairs: []*model.KVPair{affinity1}},
+				model.KVPairList{KVPairs: []*model.KVPair{handle1}},
+			)
+			migrateIPAM := NewMigrateIPAM(NewMockIPAMClient(bc))
+			migrateIPAM.SetNodeMap(map[string]string{nodeName: newNodeName})
+			Expect(migrateIPAM.PullFromDatastore()).To(Succeed())
+
+			Expect(*migrateIPAM.IPAMBlocks[0].Value.Attributes[0].HandleID).To(Equal(wantHandle))
+			wantKeyPath, err := model.KeyToDefaultPath(model.IPAMHandleKey{HandleID: wantHandle})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(migrateIPAM.IPAMHandles[0].Key).To(Equal(wantKeyPath))
+		},
+		Entry("IPIP", "ipip-tunnel-addr-"+nodeName, "ipip-tunnel-addr-"+newNodeName),
+		Entry("VXLAN", "vxlan-tunnel-addr-"+nodeName, "vxlan-tunnel-addr-"+newNodeName),
+		Entry("VXLAN v6", "vxlan-v6-tunnel-addr-"+nodeName, "vxlan-v6-tunnel-addr-"+newNodeName),
+		Entry("WireGuard", "wireguard-tunnel-addr-"+nodeName, "wireguard-tunnel-addr-"+newNodeName),
+		Entry("WireGuard v6", "wireguard-v6-tunnel-addr-"+nodeName, "wireguard-v6-tunnel-addr-"+newNodeName),
+		Entry("pod handle is left alone", "k8s-pod-network."+nodeName, "k8s-pod-network."+nodeName),
+	)
 })
 
 // MockIPAMClient subs out the clientv3.Interface but only in a way where'
@@ -181,6 +217,22 @@ func NewMockIPAMClient(bc bapi.Client) client.Interface {
 	return &MockIPAMClient{
 		backend: bc,
 	}
+}
+
+func (c *MockIPAMClient) StagedGlobalNetworkPolicies() client.StagedGlobalNetworkPolicyInterface {
+	return nil
+}
+
+func (c *MockIPAMClient) StagedNetworkPolicies() client.StagedNetworkPolicyInterface {
+	return nil
+}
+
+func (c *MockIPAMClient) StagedKubernetesNetworkPolicies() client.StagedKubernetesNetworkPolicyInterface {
+	return nil
+}
+
+func (c *MockIPAMClient) Tiers() client.TierInterface {
+	return nil
 }
 
 func (c *MockIPAMClient) Backend() bapi.Client {
@@ -232,6 +284,11 @@ func (c *MockIPAMClient) HostEndpoints() client.HostEndpointInterface {
 	return nil
 }
 
+func (c *MockIPAMClient) LiveMigrations() client.LiveMigrationInterface {
+	// DO NOTHING
+	return nil
+}
+
 func (c *MockIPAMClient) WorkloadEndpoints() client.WorkloadEndpointInterface {
 	// DO NOTHING
 	return nil
@@ -277,7 +334,7 @@ func (c *MockIPAMClient) CalicoNodeStatus() client.CalicoNodeStatusInterface {
 	return nil
 }
 
-func (c *MockIPAMClient) IPAMConfig() client.IPAMConfigInterface {
+func (c *MockIPAMClient) IPAMConfiguration() client.IPAMConfigurationInterface {
 	// DO NOTHING
 	return nil
 }
@@ -289,6 +346,10 @@ func (c *MockIPAMClient) BlockAffinities() client.BlockAffinityInterface {
 
 func (c *MockIPAMClient) EnsureInitialized(ctx context.Context, calicoVersion, clusterType string) error {
 	// DO NOTHING
+	return nil
+}
+
+func (c *MockIPAMClient) Close() error {
 	return nil
 }
 
@@ -351,13 +412,17 @@ func (bc *MockIPAMBackendClient) List(ctx context.Context, list model.ListInterf
 	return nil, nil
 }
 
-func (bc *MockIPAMBackendClient) Watch(ctx context.Context, list model.ListInterface, revision string) (bapi.WatchInterface, error) {
+func (bc *MockIPAMBackendClient) Watch(ctx context.Context, list model.ListInterface, options bapi.WatchOptions) (bapi.WatchInterface, error) {
 	// DO NOTHING
 	return bapi.NewFake(), nil
 }
 
 func (bc *MockIPAMBackendClient) EnsureInitialized() error {
 	// DO NOTHING
+	return nil
+}
+
+func (bc *MockIPAMBackendClient) Close() error {
 	return nil
 }
 

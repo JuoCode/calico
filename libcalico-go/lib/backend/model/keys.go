@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,29 +15,41 @@
 package model
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
-	net2 "net"
+	"net/netip"
 	"reflect"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/json"
 	"github.com/projectcalico/calico/libcalico-go/lib/namespace"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
+)
+
+const (
+	metadataAnnotation = "projectcalico.org/metadata"
 )
 
 // RawString is used a value type to indicate that the value is a bare non-JSON string
-type rawString string
-type rawBool bool
-type rawIP net.IP
+type (
+	rawString string
+	rawBool   bool
+)
 
-var rawStringType = reflect.TypeOf(rawString(""))
-var rawBoolType = reflect.TypeOf(rawBool(true))
-var rawIPType = reflect.TypeOf(rawIP{})
+var (
+	rawStringType = reflect.TypeFor[rawString]()
+	rawBoolType   = reflect.TypeFor[rawBool]()
+)
+
+// LegacyKey is an interface implemented by keys that carry old information but
+// that can be upgraded to a modern Key before use.
+type LegacyKey interface {
+	Upgrade() Key
+}
 
 // Key represents a parsed datastore key.
 type Key interface {
@@ -62,6 +74,7 @@ type Key interface {
 
 	// valueType returns the object type associated with this key.
 	valueType() (reflect.Type, error)
+	parseValue(data []byte) (any, error)
 
 	// String returns a unique string representation of this key.  The string
 	// returned by this method must uniquely identify this Key.
@@ -81,6 +94,11 @@ type ListInterface interface {
 	KeyFromDefaultPath(key string) Key
 }
 
+type LabelSelectingListInterface interface {
+	ListInterface
+	GetLabelSelector() labels.Selector
+}
+
 // KVPair holds a typed key and value object as well as datastore specific
 // revision information.
 //
@@ -92,7 +110,7 @@ type ListInterface interface {
 //     JSON format).
 type KVPair struct {
 	Key      Key
-	Value    interface{}
+	Value    any
 	Revision string
 	UID      *types.UID
 	TTL      time.Duration // For writes, if non-zero, key has a TTL.
@@ -125,12 +143,24 @@ func KeyToDefaultPath(key Key) (string, error) {
 // directories and leaves) key/value datastore such as etcd v3.
 //
 // KeyToDefaultDeletePath returns a different path to KeyToDefaultPath when
-// it is a passed a Key that represents a non-leaf which, for example, has its
-// own metadata but also contains other resource types as children.
+// it is a passed a Key that represents a non-leaf, such as a TierKey.  (A
+// tier has its own metadata but it also contains policies as children.)
 //
 // KeyToDefaultDeletePath returns the common prefix of the non-leaf key and
 // its children so that a recursive delete of that key would delete the
 // object itself and any children it has.
+//
+// For example, KeyToDefaultDeletePath(TierKey{Tier: "a"}) returns
+//
+//	"/calico/v1/policy/tier/a"
+//
+// which is a prefix of both KeyToDefaultPath(TierKey{Tier: "a"}):
+//
+//	"/calico/v1/policy/tier/a/metadata"
+//
+// and KeyToDefaultPath(PolicyKey{Kind: "NetworkPolicy", Namespace: "default", Name: "b"}):
+//
+//	"/calico/v1/policy/NetworkPolicy/default/b"
 func KeyToDefaultDeletePath(key Key) (string, error) {
 	return key.defaultDeletePath()
 }
@@ -167,7 +197,19 @@ func KeyToDefaultDeleteParentPaths(key Key) ([]string, error) {
 
 // ListOptionsToDefaultPathRoot converts list options struct into a
 // common-prefix path suitable for querying a datastore that uses the paths
-// returned by KeyToDefaultPath.
+// returned by KeyToDefaultPath.  For example,
+//
+//	ListOptionsToDefaultPathRoot(TierListOptions{})
+//
+// doesn't specify any particular tier so it returns
+// "/calico/v1/policy/tier" which is a prefix for all tiers.  The datastore
+// must then do a recursive query to find all children of that path.
+// However,
+//
+//	ListOptionsToDefaultPathRoot(TierListOptions{Tier:"a"})
+//
+// returns a more-specific path, which filters down to the specific tier of
+// interest: "/calico/v1/policy/tier/a"
 func ListOptionsToDefaultPathRoot(listOptions ListInterface) string {
 	return listOptions.defaultPathRoot()
 }
@@ -247,7 +289,7 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 				}
 			case "config":
 				return HostConfigKey{
-					Hostname: hostname,
+					Hostname: unescapeName(hostname),
 					Name:     strings.Join(parts[5:], "/"),
 				}
 			case "metadata":
@@ -257,19 +299,12 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 				return HostMetadataKey{
 					Hostname: hostname,
 				}
-			case "bird_ip":
-				if len(parts) != 5 {
-					return nil
-				}
-				return HostIPKey{
-					Hostname: hostname,
-				}
 			case "wireguard":
 				if len(parts) != 5 {
 					return nil
 				}
 				return WireguardKey{
-					NodeName: hostname,
+					NodeName: unescapeName(hostname),
 				}
 			}
 		case "netset":
@@ -285,7 +320,7 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 			}
 			return ReadyFlagKey{}
 		case "policy":
-			if len(parts) < 6 {
+			if len(parts) < 5 {
 				return nil
 			}
 			switch parts[3] {
@@ -294,13 +329,20 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 					return nil
 				}
 				switch parts[5] {
+				case "metadata":
+					if len(parts) != 6 {
+						return nil
+					}
+					return TierKey{
+						Name: unescapeName(parts[4]),
+					}
 				case "policy":
+					// This is a legacy policy key of form /calico/v1/policy/tier/<Tier>/policy/<Name>.
+					// We can translate this to a modern PolicyKey by parsing the necessary info from the Name.
 					if len(parts) != 7 {
 						return nil
 					}
-					return PolicyKey{
-						Name: unescapeName(parts[6]),
-					}
+					return parseLegacyPolicyName(unescapeName(parts[4]), unescapeName(parts[6]))
 				}
 			case "profile":
 				pk := unescapeName(parts[4])
@@ -309,6 +351,16 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 					return ProfileRulesKey{ProfileKey: ProfileKey{pk}}
 				case "labels":
 					return ProfileLabelsKey{ProfileKey: ProfileKey{pk}}
+				}
+			default:
+				// Policy key of form /calico/v1/policy/<Kind>/<Namespace>/<Name>
+				if len(parts) != 6 {
+					return nil
+				}
+				return PolicyKey{
+					Kind:      unescapeName(parts[3]),
+					Namespace: unescapeName(parts[4]),
+					Name:      unescapeName(parts[5]),
 				}
 			}
 		}
@@ -362,13 +414,13 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 					log.Warnf("(BUG) unknown resource type: %v", path)
 					return nil
 				}
-				if namespace.IsNamespaced(ri.kind) {
+				if namespace.IsNamespaced(ri.Kind()) {
 					log.Warnf("(BUG) Path is a global resource, but resource is namespaced: %v", path)
 					return nil
 				}
 				log.Debugf("Path is a global resource: %v", path)
 				return ResourceKey{
-					Kind: ri.kind,
+					Kind: ri.Kind(),
 					Name: unescapeName(parts[5]),
 				}
 			case 7:
@@ -377,13 +429,13 @@ func keyFromDefaultPathInner(path string, parts []string) Key {
 					log.Warnf("(BUG) unknown resource type: %v", path)
 					return nil
 				}
-				if !namespace.IsNamespaced(ri.kind) {
+				if !namespace.IsNamespaced(ri.Kind()) {
 					log.Warnf("(BUG) Path is a namespaced resource, but resource is global: %v", path)
 					return nil
 				}
 				log.Debugf("Path is a namespaced resource: %v", path)
 				return ResourceKey{
-					Kind:      ri.kind,
+					Kind:      ri.Kind(),
 					Namespace: unescapeName(parts[5]),
 					Name:      unescapeName(parts[6]),
 				}
@@ -456,13 +508,13 @@ func OldKeyFromDefaultPath(path string) Key {
 			log.Warnf("(BUG) unknown resource type: %v", path)
 			return nil
 		}
-		if namespace.IsNamespaced(ri.kind) {
+		if namespace.IsNamespaced(ri.Kind()) {
 			log.Warnf("(BUG) Path is a global resource, but resource is namespaced: %v", path)
 			return nil
 		}
 		log.Debugf("Path is a global resource: %v", path)
 		return ResourceKey{
-			Kind: ri.kind,
+			Kind: ri.Kind(),
 			Name: unescapeName(m[2]),
 		}
 	} else if m := matchNamespacedResource.FindStringSubmatch(path); m != nil {
@@ -471,20 +523,22 @@ func OldKeyFromDefaultPath(path string) Key {
 			log.Warnf("(BUG) unknown resource type: %v", path)
 			return nil
 		}
-		if !namespace.IsNamespaced(ri.kind) {
+		if !namespace.IsNamespaced(ri.Kind()) {
 			log.Warnf("(BUG) Path is a namespaced resource, but resource is global: %v", path)
 			return nil
 		}
 		log.Debugf("Path is a namespaced resource: %v", path)
 		return ResourceKey{
-			Kind:      resourceInfoByPlural[unescapeName(m[1])].kind,
+			Kind:      resourceInfoByPlural[unescapeName(m[1])].Kind(),
 			Namespace: unescapeName(m[2]),
 			Name:      unescapeName(m[3]),
 		}
 	} else if m := matchPolicy.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a policy: %v", path)
 		return PolicyKey{
-			Name: unescapeName(m[2]),
+			Kind:      unescapeName(m[1]),
+			Namespace: unescapeName(m[2]),
+			Name:      unescapeName(m[3]),
 		}
 	} else if m := matchProfile.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a profile: %v (%v)", path, m[2])
@@ -498,28 +552,28 @@ func OldKeyFromDefaultPath(path string) Key {
 			return ProfileLabelsKey{ProfileKey: pk}
 		}
 		return nil
-	} else if m := matchHostIp.FindStringSubmatch(path); m != nil {
-		log.Debugf("Path is a host ID: %v", path)
-		return HostIPKey{Hostname: m[1]}
+	} else if m := matchTier.FindStringSubmatch(path); m != nil {
+		log.Debugf("Path is a policy tier: %v", path)
+		return TierKey{Name: m[1]}
 	} else if m := matchWireguard.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a node name: %v", path)
-		return WireguardKey{NodeName: m[1]}
+		return WireguardKey{NodeName: unescapeName(m[1])}
 	} else if m := matchIPPool.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a pool: %v", path)
 		mungedCIDR := m[1]
 		cidr := strings.Replace(mungedCIDR, "-", "/", 1)
-		_, c, err := net.ParseCIDR(cidr)
+		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
 			log.WithError(err).Warningf("Failed to parse CIDR %s", cidr)
 		} else {
-			return IPPoolKey{CIDR: *c}
+			return IPPoolKey{CIDR: prefix.Masked()}
 		}
 	} else if m := matchGlobalConfig.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a global felix config: %v", path)
 		return GlobalConfigKey{Name: m[1]}
 	} else if m := matchHostConfig.FindStringSubmatch(path); m != nil {
 		log.Debugf("Path is a host config: %v", path)
-		return HostConfigKey{Hostname: m[1], Name: m[2]}
+		return HostConfigKey{Hostname: unescapeName(m[1]), Name: m[2]}
 	} else if matchReadyFlag.MatchString(path) {
 		log.Debugf("Path is a ready flag: %v", path)
 		return ReadyFlagKey{}
@@ -546,62 +600,47 @@ func OldKeyFromDefaultPath(path string) Key {
 	return nil
 }
 
+func parseRawString(rawData []byte) string {
+	return string(rawData)
+}
+
+func parseRawBool(rawData []byte) bool {
+	return string(rawData) == "true"
+}
+
+func parseJSONValue[V any](key Key, rawData []byte) (V, error) {
+	var v V
+
+	err := json.Unmarshal(rawData, &v)
+	if err != nil {
+		log.Warningf("Failed to unmarshal %v %#v into value %#v",
+			key, string(rawData), v)
+		var zero V
+		return zero, err
+	}
+
+	return v, nil
+}
+
+func parseJSONPointer[V any](key Key, rawData []byte) (*V, error) {
+	var v V
+
+	err := json.Unmarshal(rawData, &v)
+	if err != nil {
+		log.Warningf("Failed to unmarshal %v %#v into value %#v",
+			key, string(rawData), v)
+		return nil, err
+	}
+
+	return &v, nil
+}
+
 // ParseValue parses the default JSON representation of our data into one of
 // our value structs, according to the type of key.  I.e. if passed a
 // PolicyKey as the first parameter, it will try to parse rawData into a
 // Policy struct.
-func ParseValue(key Key, rawData []byte) (interface{}, error) {
-	valueType, err := key.valueType()
-	if err != nil {
-		return nil, err
-	}
-	if valueType == rawStringType {
-		return string(rawData), nil
-	}
-	if valueType == rawBoolType {
-		return string(rawData) == "true", nil
-	}
-	if valueType == rawIPType {
-		ip := net2.ParseIP(string(rawData))
-		if ip == nil {
-			return nil, nil
-		}
-		return &net.IP{IP: ip}, nil
-	}
-	value := reflect.New(valueType)
-	elem := value.Elem()
-	if elem.Kind() == reflect.Struct && elem.NumField() > 0 {
-		if elem.Field(0).Type() == reflect.ValueOf(key).Type() {
-			elem.Field(0).Set(reflect.ValueOf(key))
-		}
-	}
-	iface := value.Interface()
-	err = json.Unmarshal(rawData, iface)
-	if err != nil {
-		// This is a special case to address backwards compatibility from the time when we had no state information as block affinity value.
-		// example:
-		// Key: "/calico/ipam/v2/host/myhost.io/ipv4/block/172.29.82.0-26"
-		// Value: ""
-		// In 3.0.7 we added block affinity state as the value, so old "" value is no longer a valid JSON, so for that
-		// particular case we replace the "" with a "{}" so it can be parsed and we don't leak blocks after upgrade to Calico 3.0.7
-		// See: https://github.com/projectcalico/calico/issues/1956
-		if bytes.Equal(rawData, []byte(``)) && valueType == typeBlockAff {
-			rawData = []byte(`{}`)
-			if err = json.Unmarshal(rawData, iface); err != nil {
-				return nil, err
-			}
-		} else {
-			log.Warningf("Failed to unmarshal %#v into value %#v",
-				string(rawData), value)
-			return nil, err
-		}
-	}
-
-	if elem.Kind() != reflect.Struct {
-		// Pointer to a map or slice, unwrap.
-		iface = elem.Interface()
-	}
-	return iface, nil
+func ParseValue(key Key, rawData []byte) (any, error) {
+	return key.parseValue(rawData)
 }
 
 // SerializeValue serializes a value in the model to a []byte to be stored in the datastore.  This
@@ -618,10 +657,28 @@ func SerializeValue(d *KVPair) ([]byte, error) {
 		return []byte(d.Value.(string)), nil
 	}
 	if valueType == rawBoolType {
-		return []byte(fmt.Sprint(d.Value)), nil
-	}
-	if valueType == rawIPType {
-		return []byte(fmt.Sprint(d.Value)), nil
+		return fmt.Append(nil, d.Value), nil
 	}
 	return json.Marshal(d.Value)
+}
+
+// determinePolicyName updates Policy name based on either the projectcalico.org/metadata annotation that was added in 3.30,
+// or defaults the name to be returned without the default prefix if no annotation was found. This was the default behaviour in =<3.28
+func determinePolicyName(name, tier string, annotations map[string]string) (string, map[string]string, error) {
+	if annotations != nil && annotations[metadataAnnotation] != "" {
+		meta := &metav1.ObjectMeta{}
+		err := json.Unmarshal([]byte(annotations[metadataAnnotation]), meta)
+		if err != nil {
+			return "", nil, fmt.Errorf("CRD annotation %q contained invalid JSON: %w", metadataAnnotation, err)
+		}
+		delete(annotations, metadataAnnotation)
+		return meta.Name, annotations, nil
+	}
+
+	if tier == "default" || tier == "" {
+		// It's possible the policy does not contain tier, that means it's in the default Tier it's added later by the API server
+		return strings.TrimPrefix(name, "default."), annotations, nil
+	}
+
+	return name, annotations, nil
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,26 +16,23 @@ package config_test
 
 import (
 	"context"
-	"os"
+	"regexp"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/kube-controllers/tests/testutils"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
-var _ = Describe("KubeControllersConfiguration FV tests", func() {
+var _ = Describe("KubeControllersConfiguration FV tests", Ordered, ContinueOnFailure, func() {
 	var (
 		etcd              *containers.Container
 		uut               *containers.Container
@@ -43,10 +40,11 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 		c                 client.Interface
 		k8sClient         *kubernetes.Clientset
 		controllerManager *containers.Container
-		kconfigFile       *os.File
+		kconfigFile       string
+		removeKubeconfig  func()
 	)
 
-	BeforeEach(func() {
+	BeforeAll(func() {
 		// Run etcd.
 		etcd = testutils.RunEtcd()
 		c = testutils.GetCalicoClient(apiconfig.EtcdV3, etcd.IP, "")
@@ -56,16 +54,9 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 
 		// Write out a kubeconfig file
 		var err error
-		kconfigFile, err = os.CreateTemp("", "ginkgo-nodecontroller")
-		Expect(err).NotTo(HaveOccurred())
-		data := testutils.BuildKubeconfig(apiserver.IP)
-		_, err = kconfigFile.Write([]byte(data))
-		Expect(err).NotTo(HaveOccurred())
+		kconfigFile, removeKubeconfig = testutils.BuildKubeconfig(apiserver.IP)
 
-		// Make the kubeconfig readable by the container.
-		Expect(kconfigFile.Chmod(os.ModePerm)).NotTo(HaveOccurred())
-
-		k8sClient, err = testutils.GetK8sClient(kconfigFile.Name())
+		k8sClient, err = testutils.GetK8sClient(kconfigFile)
 		Expect(err).NotTo(HaveOccurred())
 
 		// Wait for the apiserver to be available.
@@ -82,17 +73,25 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 		controllerManager = testutils.RunK8sControllerManager(apiserver.IP)
 	})
 
-	AfterEach(func() {
-		os.Remove(kconfigFile.Name())
+	AfterAll(func() {
+		_ = c.Close()
 		controllerManager.Stop()
-		uut.Stop()
 		apiserver.Stop()
 		etcd.Stop()
+		removeKubeconfig()
+	})
+
+	AfterEach(func() {
+		if uut != nil {
+			uut.Stop()
+			uut = nil
+		}
+		_, _ = c.KubeControllersConfiguration().Delete(context.Background(), "default", options.DeleteOptions{})
 	})
 
 	Context("with no KubeControllersConfig at start of day", func() {
 		BeforeEach(func() {
-			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile.Name(), nil)
+			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile, nil)
 		})
 
 		It("should create default config", func() {
@@ -103,6 +102,7 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			}, time.Second*10, time.Millisecond*500).ShouldNot(BeNil())
 
 			// Spot check the status to make sure it's set.
+			Expect(out.Status.RunningConfig).ToNot(BeNil())
 			Expect(out.Status.RunningConfig.HealthChecks).To(Equal(v3.Enabled))
 		})
 
@@ -124,11 +124,16 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 				if err != nil {
 					return ""
 				}
+				if out.Status.RunningConfig == nil {
+					return ""
+				}
 				return out.Status.RunningConfig.HealthChecks
 			}, time.Second*5).Should(Equal(v3.Enabled))
 		})
 
 		It("should restart if config is changed", func() {
+			restartChan := uut.WatchStdoutFor(regexp.MustCompile("Received exit status [[:digit:]]*, restarting"))
+
 			var out *v3.KubeControllersConfiguration
 			Eventually(func() *v3.KubeControllersConfiguration {
 				out, _ = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
@@ -140,8 +145,9 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			out, err := c.KubeControllersConfiguration().Update(context.Background(), out, options.SetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			// container stops
-			Eventually(uut.Stopped, time.Second*30, time.Second).Should(BeTrue())
+			// kube-controller restarts due to configuration change
+			// the cmdWrapper we use in the image will restart kube-controllers
+			Eventually(restartChan, time.Second*30, time.Second).Should(BeClosed())
 
 			// Clear the status, so we know when the new system comes up
 			out, err = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
@@ -150,13 +156,13 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			out, err = c.KubeControllersConfiguration().Update(context.Background(), out, options.SetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			// restart the container (in a real system, Kubernetes restarts it)
-			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile.Name(), nil)
-
 			// Wait for status to get set again, by checking a field for non-empty value
 			Eventually(func() bool {
 				out, err = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
+				if out.Status.RunningConfig == nil {
+					return false
+				}
 				return out.Status.RunningConfig.HealthChecks != ""
 			}, time.Second*10, time.Millisecond*500).Should(BeTrue())
 
@@ -177,7 +183,7 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			_, err := c.KubeControllersConfiguration().Create(context.Background(), kcc, options.SetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile.Name(), nil)
+			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile, nil)
 		})
 
 		It("should set status matching config with defaults for unset values", func() {
@@ -186,12 +192,16 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 				var err error
 				out, err = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
+				if out.Status.RunningConfig == nil {
+					return nil
+				}
 				return out.Status.RunningConfig.Controllers.Namespace
 			}, time.Second*10, time.Millisecond*500).ShouldNot(BeNil())
 			Expect(out.Status.RunningConfig.Controllers.Node).To(BeNil())
 			Expect(out.Status.RunningConfig.Controllers.Policy).To(BeNil())
 			Expect(out.Status.RunningConfig.Controllers.WorkloadEndpoint).To(BeNil())
 			Expect(out.Status.RunningConfig.Controllers.ServiceAccount).To(BeNil())
+			Expect(out.Status.RunningConfig.Controllers.LoadBalancer).To(BeNil())
 
 			// These fields are defaulted
 			Expect(out.Status.RunningConfig.HealthChecks).To(Equal(v3.Enabled))
@@ -212,7 +222,7 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			_, err := c.KubeControllersConfiguration().Create(context.Background(), kcc, options.SetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile.Name(), map[string]string{
+			uut = testutils.RunKubeControllerWithEnv(apiconfig.EtcdV3, etcd.IP, kconfigFile, map[string]string{
 				"ENABLED_CONTROLLERS": "node",
 			})
 		})
@@ -244,6 +254,19 @@ var _ = Describe("KubeControllersConfiguration FV tests", func() {
 			kcc, err = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(kcc.Status.EnvironmentVars).To(Equal(map[string]string{"ENABLED_CONTROLLERS": "node"}))
+		})
+
+		It("should not default loadbalancer config if not part of ENABLED_CONTROLLERS", func() {
+			// Wait until controller is up and has set status
+			var kcc *v3.KubeControllersConfiguration
+			Eventually(func() map[string]string {
+				var err error
+				kcc, err = c.KubeControllersConfiguration().Get(context.Background(), "default", options.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				return kcc.Status.EnvironmentVars
+			}, time.Second*10, time.Millisecond*500).Should(Equal(map[string]string{"ENABLED_CONTROLLERS": "node"}))
+
+			Expect(kcc.Status.RunningConfig.Controllers.LoadBalancer).To(BeNil())
 		})
 	})
 })

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,24 @@ package etcdv3
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client/pkg/v3/srv"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
@@ -49,6 +51,7 @@ var (
 const (
 	profilesKey            = "/calico/resources/v3/projectcalico.org/profiles/"
 	defaultAllowProfileKey = "/calico/resources/v3/projectcalico.org/profiles/projectcalico-default-allow"
+	metadataAnnotation     = "projectcalico.org/metadata"
 )
 
 type etcdV3Client struct {
@@ -114,7 +117,10 @@ func NewEtcdV3Client(config *apiconfig.EtcdConfig) (api.Client, error) {
 		return nil, fmt.Errorf("could not initialize etcdv3 client: %+v", err)
 	}
 
-	baseTLSConfig := calicotls.NewTLSConfig()
+	baseTLSConfig, err := calicotls.NewTLSConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TLS Config: %w", err)
+	}
 	tlsConfig.MaxVersion = baseTLSConfig.MaxVersion
 	tlsConfig.MinVersion = baseTLSConfig.MinVersion
 	tlsConfig.CipherSuites = baseTLSConfig.CipherSuites
@@ -144,11 +150,34 @@ func NewEtcdV3Client(config *apiconfig.EtcdConfig) (api.Client, error) {
 	return &etcdV3Client{etcdClient: client}, nil
 }
 
+// writeOp is the operation a Create or Update transaction runs once its preconditions
+// hold. A dry run reads the key instead, so the caller still gets the same
+// already-exists and conflict errors as a real write.
+func writeOp(ctx context.Context, key, value string, putOpts []clientv3.OpOption) clientv3.Op {
+	if api.IsDryRun(ctx) {
+		return clientv3.OpGet(key)
+	}
+	return clientv3.OpPut(key, value, putOpts...)
+}
+
 // Create an entry in the datastore.  If the entry already exists, this will return
 // an ErrorResourceAlreadyExists error and the current entry.
 func (c *etcdV3Client) Create(ctx context.Context, d *model.KVPair) (*model.KVPair, error) {
-	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key, "value": d.Value, "ttl": d.TTL, "rev": d.Revision})
+	// Take a copy of the key before we default any policy names, we use this key for error returns to return the same name that user provided for create
+	keyCopy := d.Key
+
+	// Do not log d.Value, it may contain sensitive resource specs.
+	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key, "ttl": d.TTL, "rev": d.Revision})
 	logCxt.Debug("Processing Create request")
+
+	err := defaultPolicyName(d)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = prepForWrite(d); err != nil {
+		return nil, err
+	}
 
 	key, value, err := getKeyValueStrings(d)
 	if err != nil {
@@ -167,7 +196,7 @@ func (c *etcdV3Client) Create(ctx context.Context, d *model.KVPair) (*model.KVPa
 	txnResp, err := c.etcdClient.Txn(ctx).If(
 		clientv3.Compare(clientv3.Version(key), "=", 0),
 	).Then(
-		clientv3.OpPut(key, value, putOpts...),
+		writeOp(ctx, key, value, putOpts),
 	).Else(
 		clientv3.OpGet(key),
 	).Commit()
@@ -185,7 +214,7 @@ func (c *etcdV3Client) Create(ctx context.Context, d *model.KVPair) (*model.KVPa
 		if len(getResp.Kvs) != 0 {
 			existing, _ = etcdToKVPair(d.Key, getResp.Kvs[0])
 		}
-		return existing, cerrors.ErrorResourceAlreadyExists{Identifier: d.Key}
+		return existing, cerrors.ErrorResourceAlreadyExists{Identifier: keyCopy}
 	}
 
 	v, err := model.ParseValue(d.Key, []byte(value))
@@ -195,6 +224,9 @@ func (c *etcdV3Client) Create(ctx context.Context, d *model.KVPair) (*model.KVPa
 	d.Value = v
 	d.Revision = strconv.FormatInt(txnResp.Header.Revision, 10)
 
+	if err = prepForReturn(d); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -202,8 +234,21 @@ func (c *etcdV3Client) Create(ctx context.Context, d *model.KVPair) (*model.KVPa
 // an ErrorResourceDoesNotExist error.  The ResourceVersion must be specified, and if
 // incorrect will return an ErrorResourceUpdateConflict error and the current entry.
 func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPair, error) {
-	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key, "value": d.Value, "ttl": d.TTL, "rev": d.Revision})
+	// Take a copy of the key before we default any policy names, we use this key for error returns to return the same name that user provided for update
+	keyCopy := d.Key
+
+	// Do not log d.Value, it may contain sensitive resource specs.
+	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key, "ttl": d.TTL, "rev": d.Revision})
 	logCxt.Debug("Processing Update request")
+
+	err := defaultPolicyName(d)
+	if err != nil {
+		return nil, err
+	}
+	if err = prepForWrite(d); err != nil {
+		return nil, err
+	}
+
 	key, value, err := getKeyValueStrings(d)
 	if err != nil {
 		return nil, err
@@ -226,11 +271,10 @@ func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPa
 	txnResp, err := c.etcdClient.Txn(ctx).If(
 		conds...,
 	).Then(
-		clientv3.OpPut(key, value, opts...),
+		writeOp(ctx, key, value, opts),
 	).Else(
 		clientv3.OpGet(key),
 	).Commit()
-
 	if err != nil {
 		logCxt.WithError(err).Warning("Update failed")
 		return nil, cerrors.ErrorDatastoreError{Err: err}
@@ -243,12 +287,12 @@ func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPa
 		getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
 		if len(getResp.Kvs) == 0 {
 			logCxt.Debug("Update transaction failed due to resource not existing")
-			return nil, cerrors.ErrorResourceDoesNotExist{Identifier: d.Key}
+			return nil, cerrors.ErrorResourceDoesNotExist{Identifier: keyCopy}
 		}
 
 		logCxt.Debug("Update transaction failed due to resource update conflict")
 		existing, _ := etcdToKVPair(d.Key, getResp.Kvs[0])
-		return existing, cerrors.ErrorResourceUpdateConflict{Identifier: d.Key}
+		return existing, cerrors.ErrorResourceUpdateConflict{Identifier: keyCopy}
 	}
 
 	v, err := model.ParseValue(d.Key, []byte(value))
@@ -256,6 +300,9 @@ func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPa
 	d.Value = v
 	d.Revision = strconv.FormatInt(txnResp.Header.Revision, 10)
 
+	if err = prepForReturn(d); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -265,8 +312,26 @@ func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPa
 // It's possible that we will just perform that processing in the clients (e.g. calicoctl),
 // but that is to be decided.
 func (c *etcdV3Client) Apply(ctx context.Context, d *model.KVPair) (*model.KVPair, error) {
-	logCxt := log.WithFields(log.Fields{"etcdKey": d.Key, "value": d.Value, "ttl": d.TTL, "rev": d.Revision})
+	// Do not log d.Value, it may contain sensitive resource specs.
+	logCxt := log.WithFields(log.Fields{"etcdKey": d.Key, "ttl": d.TTL, "rev": d.Revision})
 	logCxt.Debug("Processing Apply request")
+
+	if api.IsDryRun(ctx) {
+		return nil, cerrors.ErrorOperationNotSupported{
+			Identifier: d.Key,
+			Operation:  "Apply",
+			Reason:     "dry run is not supported",
+		}
+	}
+
+	err := defaultPolicyName(d)
+	if err != nil {
+		return nil, err
+	}
+	if err = prepForWrite(d); err != nil {
+		return nil, err
+	}
+
 	key, value, err := getKeyValueStrings(d)
 	if err != nil {
 		return nil, err
@@ -289,6 +354,9 @@ func (c *etcdV3Client) Apply(ctx context.Context, d *model.KVPair) (*model.KVPai
 	d.Value = v
 	d.Revision = strconv.FormatInt(resp.Header.Revision, 10)
 
+	if err = prepForReturn(d); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -298,8 +366,11 @@ func (c *etcdV3Client) DeleteKVP(ctx context.Context, kvp *model.KVPair) (*model
 
 // Delete an entry in the datastore.  This errors if the entry does not exists.
 func (c *etcdV3Client) Delete(ctx context.Context, k model.Key, revision string) (*model.KVPair, error) {
+	// Take a copy of the key before we default any policy names, we use this key for error returns to return the same name that user provided for delete
+	keyCopy := k
 	logCxt := log.WithFields(log.Fields{"model-etcdKey": k, "rev": revision})
 	logCxt.Debug("Processing Delete request")
+
 	key, err := model.KeyToDefaultDeletePath(k)
 	if err != nil {
 		return nil, err
@@ -326,7 +397,7 @@ func (c *etcdV3Client) Delete(ctx context.Context, k model.Key, revision string)
 	).Commit()
 	if err != nil {
 		logCxt.WithError(err).Warning("Delete failed")
-		return nil, cerrors.ErrorDatastoreError{Err: err, Identifier: k}
+		return nil, cerrors.ErrorDatastoreError{Err: err, Identifier: keyCopy}
 	}
 
 	// Transaction did not succeed - which means the ModifiedIndex check failed.  We can respond
@@ -337,20 +408,20 @@ func (c *etcdV3Client) Delete(ctx context.Context, k model.Key, revision string)
 		getResp := txnResp.Responses[0].GetResponseRange()
 		if len(getResp.Kvs) == 0 {
 			logCxt.Debug("Delete transaction failed due to resource not existing")
-			return nil, cerrors.ErrorResourceDoesNotExist{Identifier: k}
+			return nil, cerrors.ErrorResourceDoesNotExist{Identifier: keyCopy}
 		}
 		latestValue, err := etcdToKVPair(k, getResp.Kvs[0])
 		if err != nil {
 			return nil, err
 		}
-		return latestValue, cerrors.ErrorResourceUpdateConflict{Identifier: k}
+		return latestValue, cerrors.ErrorResourceUpdateConflict{Identifier: keyCopy}
 	}
 
 	// The delete response should have succeeded since the Get response did.
 	delResp := txnResp.Responses[0].GetResponseDeleteRange()
 	if delResp.Deleted == 0 {
 		logCxt.Debug("Delete transaction failed due to resource not existing")
-		return nil, cerrors.ErrorResourceDoesNotExist{Identifier: k}
+		return nil, cerrors.ErrorResourceDoesNotExist{Identifier: keyCopy}
 	}
 
 	// Parse the deleted value.  Don't propagate the error in this case since the
@@ -361,6 +432,8 @@ func (c *etcdV3Client) Delete(ctx context.Context, k model.Key, revision string)
 
 // Get an entry from the datastore.  This errors if the entry does not exist.
 func (c *etcdV3Client) Get(ctx context.Context, k model.Key, revision string) (*model.KVPair, error) {
+	// Take a copy of the key before we default any policy names, we use this key for error returns to return the same name that user provided for get
+	keyCopy := k
 	logCxt := log.WithFields(log.Fields{"model-etcdKey": k, "rev": revision})
 	logCxt.Debug("Processing Get request")
 
@@ -394,7 +467,7 @@ func (c *etcdV3Client) Get(ctx context.Context, k model.Key, revision string) (*
 	}
 	if len(resp.Kvs) == 0 {
 		logCxt.Debug("No results returned from etcdv3 client")
-		return nil, cerrors.ErrorResourceDoesNotExist{Identifier: k}
+		return nil, cerrors.ErrorResourceDoesNotExist{Identifier: keyCopy}
 	}
 
 	return etcdToKVPair(k, resp.Kvs[0])
@@ -431,6 +504,9 @@ func (c *etcdV3Client) List(ctx context.Context, l model.ListInterface, revision
 	list := []*model.KVPair{}
 	for _, p := range resp.Kvs {
 		if kv := convertListResponse(p, l); kv != nil {
+			if err = prepForReturn(kv); err != nil {
+				return nil, err
+			}
 			list = append(list, kv)
 		}
 	}
@@ -442,10 +518,29 @@ func (c *etcdV3Client) List(ctx context.Context, l model.ListInterface, revision
 		list = append(list, resources.DefaultAllowProfile())
 	}
 
+	if ls, ok := l.(model.LabelSelectingListInterface); ok {
+		selector := ls.GetLabelSelector()
+		if selector != nil {
+			list = filterListByLabelSelector(list, selector)
+		}
+	}
+
 	return &model.KVPairList{
 		KVPairs:  list,
 		Revision: strconv.FormatInt(resp.Header.Revision, 10),
 	}, nil
+}
+
+func filterListByLabelSelector(input []*model.KVPair, sel labels.Selector) []*model.KVPair {
+	output := input[:0]
+	for _, kv := range input {
+		if labeled, ok := kv.Value.(metav1.Object); ok {
+			if sel.Matches(labels.Set(labeled.GetLabels())) {
+				output = append(output, kv)
+			}
+		}
+	}
+	return output
 }
 
 func calculateListKeyAndOptions(logCxt *log.Entry, l model.ListInterface) (string, []clientv3.OpOption) {
@@ -480,7 +575,7 @@ func calculateListKeyAndOptions(logCxt *log.Entry, l model.ListInterface) (strin
 // EnsureInitialized makes sure that the etcd data is initialized for use by
 // Calico.
 func (c *etcdV3Client) EnsureInitialized() error {
-	//TODO - still need to worry about ready flag.
+	// TODO - still need to worry about ready flag.
 	return nil
 }
 
@@ -490,7 +585,6 @@ func (c *etcdV3Client) Clean() error {
 	_, err := c.etcdClient.Txn(context.Background()).If().Then(
 		clientv3.OpDelete("/calico/", clientv3.WithPrefix()),
 	).Commit()
-
 	if err != nil {
 		return cerrors.ErrorDatastoreError{Err: err}
 	}
@@ -512,11 +606,18 @@ func (c *etcdV3Client) IsClean() (bool, error) {
 	return len(resp.Kvs) == 0, nil
 }
 
+// Close() closes the underlying etcd client
+func (c *etcdV3Client) Close() error {
+	log.Debug("Calling Close on etcdv3 client")
+	return c.etcdClient.Close()
+}
+
 // getTTLOption returns a OpOption slice containing a Lease granted for the TTL.
 func (c *etcdV3Client) getTTLOption(ctx context.Context, d *model.KVPair) ([]clientv3.OpOption, error) {
 	putOpts := []clientv3.OpOption{}
 
-	if d.TTL != 0 {
+	// A dry run writes nothing, and granting a lease would.
+	if d.TTL != 0 && !api.IsDryRun(ctx) {
 		resp, err := c.etcdClient.Lease.Grant(ctx, int64(d.TTL.Seconds()))
 		if err != nil {
 			log.WithError(err).Error("Failed to grant a lease")
@@ -532,7 +633,8 @@ func (c *etcdV3Client) getTTLOption(ctx context.Context, d *model.KVPair) ([]cli
 // getKeyValueStrings returns the etcdv3 etcdKey and serialized value calculated from the
 // KVPair.
 func getKeyValueStrings(d *model.KVPair) (string, string, error) {
-	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key, "value": d.Value})
+	// Do not log d.Value, it may contain sensitive resource specs.
+	logCxt := log.WithFields(log.Fields{"model-etcdKey": d.Key})
 	key, err := model.KeyToDefaultPath(d.Key)
 	if err != nil {
 		logCxt.WithError(err).Error("Failed to convert model-etcdKey to etcdv3 etcdKey")
@@ -569,4 +671,117 @@ func parseRevision(revs string) (int64, error) {
 		}
 	}
 	return rev, nil
+}
+
+func storePolicyName(name string, annotations map[string]string) (map[string]string, error) {
+	metadata := map[string]string{}
+	metadata["name"] = name
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[metadataAnnotation] = string(metadataBytes)
+
+	return annotations, nil
+}
+
+func prepForWrite(d *model.KVPair) error {
+	// We receive v3 block affinity objects from the client, but they are stored as internalapi objects
+	// for historical reasons.
+	if _, ok := d.Value.(*apiv3.BlockAffinity); ok {
+		value := d.Value.(*apiv3.BlockAffinity)
+
+		// Convert the v3 API object to an internalapi object for storage.
+		v1Obj := internalapi.NewBlockAffinity()
+		v1Obj.ObjectMeta = value.ObjectMeta
+		v1Obj.Spec = internalapi.BlockAffinitySpec{
+			State:   string(value.Spec.State),
+			Node:    value.Spec.Node,
+			Type:    value.Spec.Type,
+			CIDR:    value.Spec.CIDR,
+			Deleted: fmt.Sprintf("%t", value.Spec.Deleted),
+		}
+		d.Value = v1Obj
+	}
+	return nil
+}
+
+func prepForReturn(d *model.KVPair) error {
+	// We store internalapi block affinity objects, but we return v3 API objects to the client.
+	// So convert them here.
+	if _, ok := d.Value.(*internalapi.BlockAffinity); ok {
+		value := d.Value.(*internalapi.BlockAffinity)
+
+		// Convert the internalapi object to a v3 API object for return.
+		v3Obj := apiv3.NewBlockAffinity()
+		v3Obj.ObjectMeta = value.ObjectMeta
+		deleted, err := strconv.ParseBool(value.Spec.Deleted)
+		if err != nil {
+			return fmt.Errorf("error parsing BlockAffinity.Spec.Deleted field: %w", err)
+		}
+		v3Obj.Spec = apiv3.BlockAffinitySpec{
+			State:   apiv3.BlockAffinityState(value.Spec.State),
+			Node:    value.Spec.Node,
+			Type:    value.Spec.Type,
+			CIDR:    value.Spec.CIDR,
+			Deleted: deleted,
+		}
+		d.Value = v3Obj
+	}
+	return nil
+}
+
+func defaultPolicyName(d *model.KVPair) error {
+	if _, ok := d.Value.(*apiv3.NetworkPolicy); ok {
+		value := d.Value.(*apiv3.NetworkPolicy)
+
+		// First, capture the policy name that was used on the v3 API and store it as an annotation.
+		// This allows us to recreate the original object in List() and Watch() calls correctly, returning the object as expected by the client.
+		annotations, err := storePolicyName(value.Name, value.Annotations)
+		if err != nil {
+			return err
+		}
+
+		value.Annotations = annotations
+	}
+
+	if _, ok := d.Value.(*apiv3.GlobalNetworkPolicy); ok {
+		value := d.Value.(*apiv3.GlobalNetworkPolicy)
+
+		annotations, err := storePolicyName(value.Name, value.Annotations)
+		if err != nil {
+			return err
+		}
+
+		value.Annotations = annotations
+	}
+
+	if _, ok := d.Value.(*apiv3.StagedNetworkPolicy); ok {
+		value := d.Value.(*apiv3.StagedNetworkPolicy)
+
+		annotations, err := storePolicyName(value.Name, value.Annotations)
+		if err != nil {
+			return err
+		}
+
+		value.Annotations = annotations
+	}
+
+	if _, ok := d.Value.(*apiv3.StagedGlobalNetworkPolicy); ok {
+		value := d.Value.(*apiv3.StagedGlobalNetworkPolicy)
+
+		annotations, err := storePolicyName(value.Name, value.Annotations)
+		if err != nil {
+			return err
+		}
+
+		value.Annotations = annotations
+	}
+
+	return nil
 }

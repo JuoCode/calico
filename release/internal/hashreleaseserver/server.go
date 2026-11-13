@@ -1,0 +1,221 @@
+// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hashreleaseserver
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"cloud.google.com/go/storage"
+	"github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/release/internal/registry"
+)
+
+const (
+
+	// BaseDomain is the base URL of the hashrelease
+	BaseDomain = "hashrelease.tools.tigera.net"
+
+	releaseLibFileName = "all-releases"
+)
+
+type Hashrelease struct {
+	// Name is the name of the hashrelease.
+	// When publishing a hashrelease, this is the name of the folder in the server.
+	// When getting a hashrelease, this is the full path of the hashrelease folder.
+	Name string `yaml:"name"`
+
+	// Hash is the hash of the hashrelease
+	Hash string `yaml:"hash"`
+
+	// Note is the info about the hashrelease
+	Note string `yaml:"note,omitempty"`
+
+	// Stream is the version the hashrelease is for (e.g master, v3.19)
+	Stream string `yaml:"stream"`
+
+	// ProductVersion is the product version in the hashrelease
+	ProductVersion string `yaml:"version"`
+
+	// ChartVersion qualifies the chart version when the charts rev with the product version.
+	ChartVersion string `yaml:"chartVersion,omitempty"`
+
+	// Operator is the operator for the hashrelease
+	Operator registry.Component `yaml:"operator"`
+
+	// Components are the pinned components in the hashrelease.
+	Components map[string]registry.Component `yaml:"components,omitempty"`
+
+	// Source is the source of hashrelease content on the local filesystem
+	Source string `yaml:"source,omitempty"`
+
+	// Latest is if the hashrelease is the latest for the stream
+	Latest bool `yaml:"latest,omitempty"`
+
+	// ImageScanResultURL is the URL to the image scan result for this hashrelease
+	ImageScanResultURL string `yaml:"iss_url,omitempty"`
+}
+
+// BucketURI is where the hashrelease's content is served from.
+func (h *Hashrelease) BucketURI(cfg *Config) string {
+	return fmt.Sprintf("gs://%s/%s", cfg.BucketName, h.Name)
+}
+
+func (h *Hashrelease) URL() string {
+	return HashreleaseURL(h.Name)
+}
+
+func HashreleaseURL(hashreleaseName string) string {
+	return fmt.Sprintf("https://%s.%s", hashreleaseName, BaseDomain)
+}
+
+// Uploading the content is the caller's, not this.
+func Record(productCode string, h *Hashrelease, cfg *Config) error {
+	logrus.WithFields(logrus.Fields{
+		"hashrelease": h.Name,
+		"latest":      h.Latest,
+	}).Info("Recording hashrelease")
+
+	if err := addToHashreleaseLibrary(*h, cfg); err != nil {
+		logrus.WithError(err).Error("failed to add hashrelease to library")
+		return err
+	}
+
+	if h.Latest {
+		if err := setHashreleaseAsLatest(*h, productCode, cfg); err != nil {
+			// Being unreachable as "latest" is not worth failing a publish over.
+			logrus.WithError(err).Error("failed to set hashrelease as latest")
+		}
+	}
+
+	return nil
+}
+
+func HasHashrelease(hash string, cfg *Config) (bool, error) {
+	logrus.WithField("hash", hash).Debug("Checking if hashrelease exists")
+	bucket, err := cfg.Bucket()
+	if err != nil {
+		logrus.WithError(err).Error("Failed to get bucket handler for hashrelease server")
+		return false, fmt.Errorf("failed to get bucket handler for hashrelease server: %w", err)
+	}
+	reader, err := bucket.Object(releaseLibFileName).NewReader(context.Background())
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			logrus.Debug("Hashrelease library does not exist")
+			return false, nil // No hashreleases published yet
+		}
+		logrus.WithError(err).Error("Failed to read hashrelease library from bucket")
+		return false, fmt.Errorf("failed to read hashrelease library from bucket: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, hash) {
+			logrus.WithField("hash", hash).Debug("Found hashrelease in library")
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logrus.WithError(err).Error("Failed to scan hashrelease library")
+		return false, fmt.Errorf("failed to scan hashrelease library: %w", err)
+	}
+	return false, nil
+}
+
+// setHashreleaseAsLatest sets the hashrelease as the latest for the stream
+func setHashreleaseAsLatest(rel Hashrelease, productCode string, cfg *Config) error {
+	logrus.WithFields(logrus.Fields{
+		"hashrelease": rel.Name,
+		"stream":      rel.Stream,
+		"productCode": productCode,
+	}).Info("Setting hashrelease as latest for stream")
+	content := rel.URL() + "/"
+	relFilePath := filepath.Join("latest-"+productCode, rel.Stream+".txt")
+	bucket, err := cfg.Bucket()
+	if err != nil {
+		logrus.WithError(err).Error("Failed to get bucket handler for hashrelease server")
+		return fmt.Errorf("failed to get bucket handler for hashrelease publishing: %w", err)
+	}
+	if err := updateBucketTextFile(bucket, relFilePath, content, false); err != nil {
+		logrus.WithError(err).Errorf("Failed to write to latest hashrelease file for %s %s in bucket", productCode, rel.Stream)
+		return fmt.Errorf("failed to update latest hashrelease file in bucket: %w", err)
+	}
+	return nil
+}
+
+func addToHashreleaseLibrary(rel Hashrelease, cfg *Config) error {
+	logrus.WithField("hashrelease", rel.Name).WithField("hash", rel.Hash).Info("Adding hashrelease to library")
+	content := fmt.Sprintf("%s - %s ", rel.Hash, rel.Note)
+	bucket, err := cfg.Bucket()
+	if err != nil {
+		// For now if we can't get the bucket, do not fail the operation
+		logrus.WithError(err).Error("Failed to get bucket for hashrelease server")
+		return fmt.Errorf("failed to get bucket for hashrelease publishing: %w", err)
+	}
+	if err := updateBucketTextFile(bucket, releaseLibFileName, content, true); err != nil {
+		logrus.WithError(err).Error("Failed to write to hashrelease library in bucket")
+		return fmt.Errorf("failed to update hashrelease library in bucket: %w", err)
+	}
+	return nil
+}
+
+func updateBucketTextFile(bucket *storage.BucketHandle, filePath, content string, appendContent bool) error {
+	ctx := context.Background()
+	obj := bucket.Object(filePath)
+	w := obj.NewWriter(ctx)
+	w.ContentType = "text/plain"
+	w.Metadata = map[string]string{
+		"updated-by": "hashreleaseserver",
+		"updated-at": time.Now().Format(time.RFC3339),
+	}
+	defer func() {
+		if err := w.Close(); err != nil {
+			logrus.WithError(err).Errorf("Failed to close writer for bucket: %s", filePath)
+		}
+	}()
+	// If the file already exists and we are not appending, we will overwrite it
+	updatedContent := content
+	if appendContent {
+		// If we are appending, we need to read the existing content first
+		existingReader, err := obj.NewReader(ctx)
+		if err != nil {
+			if !errors.Is(err, storage.ErrObjectNotExist) {
+				logrus.WithError(err).Errorf("Failed to read existing content from bucket: %s", filePath)
+				return fmt.Errorf("failed to read existing content from bucket %s: %w", filePath, err)
+			}
+		} else {
+			defer func() { _ = existingReader.Close() }()
+			existingContent, err := io.ReadAll(existingReader)
+			if err != nil {
+				logrus.WithError(err).Errorf("Failed to read existing content from bucket: %s", filePath)
+				return fmt.Errorf("failed to read existing content from bucket %s: %w", filePath, err)
+			}
+			updatedContent = strings.TrimRight(string(existingContent), "\n") + "\n" + content + "\n"
+		}
+	}
+	if _, err := w.Write([]byte(updatedContent)); err != nil {
+		logrus.WithError(err).Errorf("Failed to write content to bucket: %s", filePath)
+		return fmt.Errorf("failed to write content to bucket %s: %w", filePath, err)
+	}
+	return nil
+}

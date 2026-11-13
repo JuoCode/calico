@@ -17,18 +17,21 @@ package infrastructure
 import (
 	"net"
 
-	. "github.com/onsi/gomega"
-
+	"github.com/onsi/gomega"
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/utils"
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
 
 // DatastoreInfra is an interface that is to be used to abstract away
 // the datastore being used and the functions that are datastore specific
 type DatastoreInfra interface {
+	// setBPFLogByteLimit is called before the infra is started by the
+	// WithBPFLogByteLimit option.
+	setBPFLogByteLimit(limit int)
+
 	// GetDockerArgs returns a string slice of args to be passed to the docker
 	// run command when starting Typha or Felix. It includes
 	// CALICO_DATASTORE_TYPE, FELIX_DATASTORETYPE, an appropriate endpoint,
@@ -41,17 +44,22 @@ type DatastoreInfra interface {
 	// GetCalicoClient will return a client.Interface configured to access
 	// the datastore.
 	GetCalicoClient() client.Interface
+
+	// UseProjectCalicoV3API returns true if the datastore should be accessed using the v3 CRD API instead
+	// of the crd.projectcalico.org API group.
+	UseProjectCalicoV3API() bool
+
 	// GetClusterGUID will return the cluster GUID.
 	GetClusterGUID() string
 	// SetExpectedIPIPTunnelAddr will set the Felix object's
 	// ExpectedIPIPTunnelAddr field, if we expect Felix to see that field being
 	// set after it has started up for the first time.
-	SetExpectedIPIPTunnelAddr(felix *Felix, cidr *net.IPNet, idx int, needBGP bool)
+	SetExpectedIPIPTunnelAddr(felix *Felix, ip string, needBGP bool)
 	// SetExpectedVXLANTunnelAddr will set the Felix object's
 	// ExpectedVXLANTunnelAddr field, if we expect Felix to see that field being
 	// set after it has started up for the first time.
-	SetExpectedVXLANTunnelAddr(felix *Felix, cidr *net.IPNet, idx int, needVXLAN bool)
-	SetExpectedVXLANV6TunnelAddr(felix *Felix, cidr *net.IPNet, idx int, needVXLAN bool)
+	SetExpectedVXLANTunnelAddr(felix *Felix, ip string)
+	SetExpectedVXLANV6TunnelAddr(felix *Felix, ip string)
 	// SetExpectedWireguardTunnelAddr will set the Felix object's
 	// ExpectedWireguardTunnelAddr field, if we expect Felix to see that field being
 	// set after it has started up for the first time.
@@ -71,11 +79,14 @@ type DatastoreInfra interface {
 	AddNode(felix *Felix, v4CIDR *net.IPNet, v6CIDR *net.IPNet, idx int, needBGP bool)
 	// AddWorkload will take the appropriate steps to create a workload in the
 	// datastore with the passed in wep values. If this succeeds then the
-	// *libapi.WorkloadEndpoint will be returned, otherwise an error will be
+	// *internalapi.WorkloadEndpoint will be returned, otherwise an error will be
 	// returned.
-	AddWorkload(wep *libapi.WorkloadEndpoint) (*libapi.WorkloadEndpoint, error)
+	AddWorkload(wep *internalapi.WorkloadEndpoint) (*internalapi.WorkloadEndpoint, error)
 	// RemoveWorkload reverses the effect of AddWorkload.
 	RemoveWorkload(ns string, name string) error
+	// UpdateWorkload updates a workload in the infra. On kdd the workload is
+	// removed then added.
+	UpdateWorkload(wep *internalapi.WorkloadEndpoint) (*internalapi.WorkloadEndpoint, error)
 	// AddDefaultAllow will ensure that the datastore is configured so that
 	// the default profile/namespace will allow traffic. Returns the name of the
 	// default profile.
@@ -91,6 +102,10 @@ type DatastoreInfra interface {
 	// occurs.
 	DumpErrorData()
 
+	// AddCleanup registers a function to be run during Stop(), in reverse order of registration.
+	AddCleanup(func())
+	// RegisterFelix records a Felix node to include in diagnostics.
+	RegisterFelix(*Felix)
 	// Stop cleans up anything necessary in preparation for the end of the test.
 	Stop()
 }
@@ -107,7 +122,13 @@ func CreateDefaultProfile(c client.Interface, name string, labels map[string]str
 		Source: api.EntityRule{Selector: entityRuleSelector},
 	}}
 	_, err := c.Profiles().Create(utils.Ctx, d, utils.NoOptions)
-	Expect(err).NotTo(HaveOccurred())
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 }
 
 type CreateOption func(DatastoreInfra)
+
+func WithBPFLogByteLimit(limit int) CreateOption {
+	return func(di DatastoreInfra) {
+		di.setBPFLogByteLimit(limit)
+	}
+}

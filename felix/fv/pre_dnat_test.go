@@ -12,29 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
-	"github.com/projectcalico/calico/felix/fv/connectivity"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	"github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-
+	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 // Setup for planned further FV tests:
@@ -48,7 +46,6 @@ import (
 //     +-----------------------------+  +-----------------------------+
 
 var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 workloads", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-
 	var (
 		infra          infrastructure.DatastoreInfra
 		tc             infrastructure.TopologyContainers
@@ -58,11 +55,17 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 	)
 
 	BeforeEach(func() {
+		if NFTMode() {
+			Skip("This test is not yet supported in NFT mode")
+		}
+
 		infra = getInfra()
 
 		options := infrastructure.DefaultTopologyOptions()
 		// For variety, run this test with IPv6 disabled.
 		options.EnableIPv6 = false
+		options.ExtraEnvVars["FELIX_PrometheusMetricsEnabled"] = "true"
+
 		tc, client = infrastructure.StartSingleNodeTopology(options, infra)
 
 		// Install a default profile that allows all ingress and egress, in the absence of any Policy.
@@ -77,30 +80,11 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 
 		// We will use this container to model an external client trying to connect into
 		// workloads on a host.  Create a route in the container for the workload CIDR.
-		externalClient = infrastructure.RunExtClient("ext-client")
+		externalClient = infrastructure.RunExtClient(infra, "ext-client")
 		externalClient.Exec("ip", "r", "add", "10.65.0.0/24", "via", tc.Felixes[0].IP)
 	})
 
-	AfterEach(func() {
-
-		if CurrentGinkgoTestDescription().Failed {
-			infra.DumpErrorData()
-			tc.Felixes[0].Exec("iptables-save", "-c")
-			tc.Felixes[0].Exec("ip", "r")
-			tc.Felixes[0].Exec("ip", "a")
-		}
-
-		for ii := range w {
-			w[ii].Stop()
-		}
-		tc.Stop()
-
-		infra.Stop()
-		externalClient.Stop()
-	})
-
 	Context("with node port DNATs", func() {
-
 		BeforeEach(func() {
 			tc.Felixes[0].Exec(
 				"iptables", "-t", "nat",
@@ -132,7 +116,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 		})
 
 		Context("with pre-DNAT policy denying all ingress", func() {
-
 			BeforeEach(func() {
 				// Make sure our host endpoints won't cut felix off from the datastore.
 				err := infra.AddAllowToDatastore("has(host-endpoint)")
@@ -151,7 +134,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 			})
 
 			Context("with host endpoint applying policy to eth0", func() {
-
 				BeforeEach(func() {
 					hostEp := api.NewHostEndpoint()
 					hostEp.Name = "felix-eth0"
@@ -172,7 +154,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole to 32010", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-ingress-32010"
@@ -205,7 +186,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole to 8055", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-ingress-8055"
@@ -215,16 +195,28 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 						policy.Spec.ApplyOnForward = true
 						protocol := numorstring.ProtocolFromString("tcp")
 						ports := numorstring.SinglePort(8055)
+						metricsPort := numorstring.SinglePort(9091)
+
 						policy.Spec.Ingress = []api.Rule{{
 							Action:   api.Allow,
 							Protocol: &protocol,
 							Destination: api.EntityRule{Ports: []numorstring.Port{
 								ports,
+								metricsPort,
 							}},
 						}}
 						policy.Spec.Selector = "has(host-endpoint)"
 						_, err := client.GlobalNetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
 						Expect(err).NotTo(HaveOccurred())
+					})
+
+					AfterEach(func() {
+						if CurrentGinkgoTestDescription().Failed {
+							logrus.WithFields(logrus.Fields{
+								"filter": tc.Felixes[0].IPTablesChains("filter"),
+								"mangle": tc.Felixes[0].IPTablesChains("mangle"),
+							}).Debug("dumping iptables")
+						}
 					})
 
 					It("external client cannot connect", func() {
@@ -235,11 +227,172 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 						cc.ExpectNone(externalClient, w[0], 32010)
 						cc.CheckConnectivity()
 					})
+
+					It("increments Prometheus gauge proportionally to programming rules", func() {
+						dataplaneProgrammed := func() bool {
+							// Check if a particular known chain has been programmed into the mangle table.
+							mangleChains := tc.Felixes[0].IPTablesChains("mangle")
+							if _, ok := mangleChains["cali-fh-eth0"]; !ok {
+								return false
+							}
+
+							if len(mangleChains["cali-fh-eth0"]) == 0 {
+								return false
+							}
+
+							return true
+						}
+						Eventually(dataplaneProgrammed).Should(BeTrue(), "Dataplane never got fully programmed")
+
+						// A test-HEP to apply.
+						hep := api.NewHostEndpoint()
+						hep.Name = "t0"
+						hep.Spec.Node = tc.Felixes[0].Hostname
+						hep.Labels = map[string]string{"abc123": "true"}
+						hep.Spec.InterfaceName = "*"
+
+						// A test-GNP for the HEP.
+						policy := api.NewGlobalNetworkPolicy()
+						policy.Name = "allow-ingress-8055-1"
+						order := float64(11)
+						policy.Spec.Order = &order
+						policy.Spec.PreDNAT = true
+						policy.Spec.ApplyOnForward = true
+						protocol := numorstring.ProtocolFromString("tcp")
+						testPort := numorstring.SinglePort(9999)
+						ports := numorstring.SinglePort(8055)
+						metricsPort := numorstring.SinglePort(9091)
+						policy.Spec.Ingress = []api.Rule{{
+							Action:   api.Allow,
+							Protocol: &protocol,
+							Destination: api.EntityRule{Ports: []numorstring.Port{
+								testPort,
+								ports,
+								metricsPort,
+							}},
+						}}
+						policy.Spec.Selector = "has(abc123)"
+						// The same GNP but with stateful fields set.
+						var appliedGNP *api.GlobalNetworkPolicy
+
+						mangleRulesMetric := tc.Felixes[0].PromMetric("felix_iptables_rules{ip_version=\"4\",table=\"mangle\"}")
+						filterRulesMetric := tc.Felixes[0].PromMetric("felix_iptables_rules{ip_version=\"4\",table=\"filter\"}")
+						Eventually(mangleRulesMetric.Int, "5s").ShouldNot(BeZero(), "Metrics traffic was never allowed")
+
+						collectMetrics := func() (mangleMetric int, filterMetric int) {
+							mangleMetric, err := mangleRulesMetric.Int()
+							Expect(err).NotTo(HaveOccurred())
+
+							filterMetric, err = filterRulesMetric.Int()
+							Expect(err).NotTo(HaveOccurred())
+
+							return mangleMetric, filterMetric
+						}
+						// Perform database changes in steps.
+						type operation struct {
+							description string
+							do          func()
+						}
+						operations := []operation{
+							{"Creating a pre-DNAT GNP and a HEP", func() {
+								var err error
+								curMangleRulesMetric, err := mangleRulesMetric.Int()
+								Expect(err).NotTo(HaveOccurred())
+
+								appliedGNP, err = client.GlobalNetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
+								Expect(err).NotTo(HaveOccurred(), "Couldn't create pre-DNAT GNP")
+
+								_, err = client.HostEndpoints().Create(utils.Ctx, hep, utils.NoOptions)
+								Expect(err).NotTo(HaveOccurred(), "Failed to create HEP")
+
+								Eventually(mangleRulesMetric.Int, "5s").ShouldNot(BeEquivalentTo(curMangleRulesMetric), "Mangle rules metric never changed following change of GNP")
+							}},
+							{"Switching GNP to preDNAT: false", func() {
+								curMangleRulesMetric, err := mangleRulesMetric.Int()
+								Expect(err).NotTo(HaveOccurred())
+
+								appliedGNP.Spec.PreDNAT = false
+								_, err = client.GlobalNetworkPolicies().Update(utils.Ctx, appliedGNP, utils.NoOptions)
+								Expect(err).NotTo(HaveOccurred(), "Couldn't update GNP from pre-DNAT=true to pre-DNAT=false")
+
+								// Wait for the change to take effect.
+								Eventually(mangleRulesMetric.Int, "5s").ShouldNot(BeNumerically(">", curMangleRulesMetric), "Mangle rules metric never changed following change of GNP")
+							}},
+							{"Deleting GNP", func() {
+								curFilterRulesMetric, err := filterRulesMetric.Int()
+								Expect(err).NotTo(HaveOccurred())
+
+								// Metrics port should still be open thanks to another GNP created in the parent BeforeEach
+								_, err = client.GlobalNetworkPolicies().Delete(utils.Ctx, appliedGNP.Name, options.DeleteOptions{})
+								Expect(err).NotTo(HaveOccurred())
+
+								Eventually(filterRulesMetric.Int, "5s").ShouldNot(BeEquivalentTo(curFilterRulesMetric), "Filter rules metric never changed following deletion of GNP")
+							}},
+							{"Deleting HEP", func() {
+								curFilterRulesMetric, err := filterRulesMetric.Int()
+								Expect(err).NotTo(HaveOccurred())
+
+								_, err = client.HostEndpoints().Delete(utils.Ctx, "t0", options.DeleteOptions{})
+								Expect(err).NotTo(HaveOccurred())
+
+								Eventually(filterRulesMetric.Int, "5s").ShouldNot(BeEquivalentTo(curFilterRulesMetric), "Filter rules metric never changed following deletion of HEP")
+							}},
+						}
+
+						// Measure metrics and IPTables output and ensure
+						// they change proportionally to one-another.
+						baselineMangleMetric, baselineFilterMetric := collectMetrics()
+						baselineMangleTableIptablesSave := tc.Felixes[0].AllCalicoIPTablesRules("mangle")
+						baselineFilterTableIptablesSave := tc.Felixes[0].AllCalicoIPTablesRules("filter")
+						checkMangleMetricDeltaMatchesIptablesDelta := func() error {
+							mangleIptablesSave := tc.Felixes[0].AllCalicoIPTablesRules("mangle")
+							iptablesDelta := len(mangleIptablesSave) - len(baselineMangleTableIptablesSave)
+
+							mangleMetric, err := mangleRulesMetric.Int()
+							if err != nil {
+								return err
+							}
+
+							metricDelta := mangleMetric - baselineMangleMetric
+							if iptablesDelta != metricDelta {
+								return fmt.Errorf("Mangle metric delta (%d) did not match IPTables delta (%d)", metricDelta, iptablesDelta)
+							}
+
+							return nil
+						}
+						checkFilterMetricDeltaMatchesIptablesDelta := func() error {
+							filterIptablesSave := tc.Felixes[0].AllCalicoIPTablesRules("filter")
+							iptablesDelta := len(filterIptablesSave) - len(baselineFilterTableIptablesSave)
+
+							filterMetric, err := filterRulesMetric.Int()
+							if err != nil {
+								return err
+							}
+
+							metricDelta := filterMetric - baselineFilterMetric
+							if iptablesDelta != metricDelta {
+								return fmt.Errorf("Filter metric delta (%d) did not match IPTables delta (%d)", metricDelta, iptablesDelta)
+							}
+
+							return nil
+						}
+
+						for _, operation := range operations {
+							By(operation.description)
+
+							operation.do()
+
+							Eventually(checkMangleMetricDeltaMatchesIptablesDelta).ShouldNot(HaveOccurred(), fmt.Sprintf("Mangle metric delta did not match iptables delta. During operation: %s", operation.description))
+							Eventually(checkFilterMetricDeltaMatchesIptablesDelta).ShouldNot(HaveOccurred(), fmt.Sprintf("Filter metric delta did not match iptables delta. During operation: %s", operation.description))
+						}
+
+						Expect(mangleRulesMetric.Int()).To(Equal(baselineMangleMetric))
+						Expect(filterRulesMetric.Int()).To(Equal(baselineFilterMetric))
+					})
 				})
 			})
 
 			Context("with all-interfaces host endpoint", func() {
-
 				BeforeEach(func() {
 					hostEp := api.NewHostEndpoint()
 					hostEp.Name = "felix-all"
@@ -260,7 +413,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole via 32010", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-via-32010"
@@ -292,16 +444,17 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 					})
 
 					Context("with workload egress policy to deny 32010 flow", func() {
-
 						BeforeEach(func() {
 							policy := api.NewNetworkPolicy()
 							policy.Name = "deny-to-32010"
 							policy.Namespace = "default"
 							order := float64(10)
 							policy.Spec.Order = &order
-							policy.Spec.Egress = []api.Rule{{
-								Action:      api.Deny,
-								Destination: api.EntityRule{Selector: "name=='" + w[0].Name + "'"}},
+							policy.Spec.Egress = []api.Rule{
+								{
+									Action:      api.Deny,
+									Destination: api.EntityRule{Selector: "name=='" + w[0].Name + "'"},
+								},
 							}
 							policy.Spec.Selector = "name=='" + w[1].Name + "'"
 							_, err := client.NetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)

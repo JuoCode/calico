@@ -16,38 +16,32 @@ package commands
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/docopt/docopt-go"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
 	v2 "github.com/projectcalico/calico/felix/bpf/conntrack/v2"
-	v3 "github.com/projectcalico/calico/felix/bpf/conntrack/v3"
+	v4 "github.com/projectcalico/calico/felix/bpf/conntrack/v4"
 	"github.com/projectcalico/calico/felix/bpf/maps"
-
-	"github.com/docopt/docopt-go"
-	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 )
 
 func init() {
 	conntrackCmd.AddCommand(newConntrackDumpCmd())
 	conntrackCmd.AddCommand(newConntrackRemoveCmd())
-	conntrackCmd.AddCommand(&cobra.Command{
-		Use:   "clean",
-		Short: "Clean all  conntrack entries",
-		Run:   runClean,
-	})
+	conntrackCmd.AddCommand(newConntrackCleanCmd())
 	conntrackCmd.AddCommand(newConntrackWriteCmd())
-	conntrackCmd.AddCommand(newConntrackFillCmd())
 	conntrackCmd.AddCommand(newConntrackCreateCmd())
+	conntrackCmd.AddCommand(newConntrackStatsCmd())
 	rootCmd.AddCommand(conntrackCmd)
 }
 
@@ -62,11 +56,15 @@ var (
 	voidIP6 = net.ParseIP("::")
 )
 
+type conntrackOpts struct {
+	version int
+	ipv6    bool
+}
+
 type conntrackDumpCmd struct {
 	*cobra.Command
-	version int
-	raw     bool
-	ipv6    bool
+	raw bool
+	conntrackOpts
 }
 
 func newConntrackDumpCmd() *cobra.Command {
@@ -77,21 +75,9 @@ func newConntrackDumpCmd() *cobra.Command {
 		},
 	}
 
-	var version string
-
-	cmd.Command.Flags().StringVarP((&version), "ver", "v", "", "version to dump from")
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "version to dump from")
 	cmd.Command.Flags().BoolVar((&cmd.raw), "raw", false, "dump the raw conntrack table as is. For version < 3 it is always raw")
-	cmd.Command.Args = cmd.Args
 	cmd.Command.Run = cmd.Run
-
-	if version != "" {
-		v, err := strconv.Atoi(version)
-		if err != nil {
-			cmd.PrintErr("--ver needs to be a number")
-			os.Exit(-1)
-		}
-		cmd.version = v
-	}
 
 	return cmd.Command
 }
@@ -119,26 +105,23 @@ func dumpCtMapV2(ctMap maps.Map) error {
 }
 
 func (cmd *conntrackDumpCmd) Run(c *cobra.Command, _ []string) {
-	var ctMap maps.Map
+	var (
+		ctMap maps.Map
+		ctErr error
+	)
 
 	cmd.ipv6 = ipv6 != nil && *ipv6
 	if cmd.version < 3 && cmd.version != 0 {
 		cmd.raw = true
 	}
 
-	switch cmd.version {
-	case 2:
-		ctMap = conntrack.MapV2()
-	default:
-		if cmd.ipv6 {
-			ctMap = conntrack.MapV6()
-		} else {
-			ctMap = conntrack.Map()
-		}
+	if ctMap, ctErr = GetCTMap(cmd.version, cmd.ipv6); ctErr != nil {
+		log.WithError(ctErr).Fatal("Failed to get ConntrackMap")
 	}
 	if err := ctMap.Open(); err != nil {
 		log.WithError(err).Fatal("Failed to access ConntrackMap")
 	}
+	defer ctMap.Close()
 	if cmd.version == 2 {
 		err := dumpCtMapV2(ctMap)
 		if err != nil {
@@ -152,6 +135,13 @@ func (cmd *conntrackDumpCmd) Run(c *cobra.Command, _ []string) {
 	if cmd.ipv6 {
 		keyFromBytes = conntrack.KeyV6FromBytes
 		valFromBytes = conntrack.ValueV6FromBytes
+	}
+
+	if *jsonOutput {
+		if err := cmd.dumpJSON(ctMap, keyFromBytes, valFromBytes); err != nil {
+			log.WithError(err).Error("Failed to dump conntrack as JSON")
+		}
+		return
 	}
 
 	err := ctMap.Iter(func(k, v []byte) maps.IteratorAction {
@@ -173,18 +163,38 @@ func (cmd *conntrackDumpCmd) Run(c *cobra.Command, _ []string) {
 }
 
 func protoStr(proto uint8) string {
-	switch proto {
-	case 6:
-		return "TCP"
-	case 17:
-		return "UDP"
-	case 1:
-		return "ICMP"
-	case 58:
-		return "ICMP6"
+	for name, num := range protoNames {
+		if num == proto {
+			return strings.ToUpper(name)
+		}
 	}
 
-	return "UNKNOWN"
+	return fmt.Sprintf("Proto-%d", proto)
+}
+
+// protoNames holds one canonical name per protocol; aliases live in protoFromString.
+var protoNames = map[string]uint8{
+	"icmp":  conntrack.ProtoICMP,
+	"tcp":   conntrack.ProtoTCP,
+	"udp":   conntrack.ProtoUDP,
+	"icmp6": conntrack.ProtoICMP6,
+	"sctp":  conntrack.ProtoSCTP,
+}
+
+// protoFromString resolves a protocol name or number. The dataplane tracks
+// every IP protocol, so any number is accepted.
+func protoFromString(s string) (uint8, error) {
+	s = strings.ToLower(s)
+	if s == "icmpv6" {
+		s = "icmp6"
+	}
+	if proto, ok := protoNames[s]; ok {
+		return proto, nil
+	}
+	if proto, err := strconv.ParseUint(s, 10, 8); err == nil {
+		return uint8(proto), nil
+	}
+	return 0, fmt.Errorf("unknown protocol %s", s)
 }
 
 func (cmd *conntrackDumpCmd) prettyDump(k conntrack.KeyInterface, v conntrack.ValueInterface) {
@@ -192,7 +202,7 @@ func (cmd *conntrackDumpCmd) prettyDump(k conntrack.KeyInterface, v conntrack.Va
 
 	switch v.Type() {
 	case conntrack.TypeNormal:
-		if v.Flags()&v3.FlagSrcDstBA != 0 {
+		if v.Flags()&v4.FlagSrcDstBA != 0 {
 			cmd.Printf("%s %s:%d -> %s:%d ", protoStr(k.Proto()), k.AddrB(), k.PortB(), k.AddrA(), k.PortA())
 		} else {
 			cmd.Printf("%s %s:%d -> %s:%d ", protoStr(k.Proto()), k.AddrA(), k.PortA(), k.AddrB(), k.PortB())
@@ -200,7 +210,7 @@ func (cmd *conntrackDumpCmd) prettyDump(k conntrack.KeyInterface, v conntrack.Va
 	case conntrack.TypeNATForward:
 		return
 	case conntrack.TypeNATReverse:
-		if v.Flags()&v3.FlagSrcDstBA != 0 {
+		if v.Flags()&v4.FlagSrcDstBA != 0 {
 			cmd.Printf("%s %s:%d -> %s:%d -> %s:%d ",
 				protoStr(k.Proto()), k.AddrB(), k.PortB(), d.OrigDst, d.OrigPort, k.AddrA(), k.PortA())
 		} else {
@@ -213,17 +223,18 @@ func (cmd *conntrackDumpCmd) prettyDump(k conntrack.KeyInterface, v conntrack.Va
 		}
 	}
 
-	if v.Flags()&v3.FlagHostPSNAT != 0 {
+	if v.Flags()&v4.FlagHostPSNAT != 0 {
 		cmd.Printf("source port changed from %d ", d.OrigSPort)
 	}
 
 	now := bpf.KTimeNanos()
-	cmd.Printf(" Age: %s Active ago %s",
-		time.Duration(now-v.Created()), time.Duration(now-v.LastSeen()))
+	cmd.Printf(" Active ago %s", time.Duration(now-v.LastSeen()))
 
 	if k.Proto() == 6 {
-		if (v.IsForwardDSR() && d.FINsSeenDSR()) || d.FINsSeen() || d.RSTSeen() {
+		if (v.IsForwardDSR() && d.FINsSeenDSR()) || d.FINsSeen() {
 			cmd.Printf(" CLOSED")
+		} else if d.RSTSeen() {
+			cmd.Printf(" RESET")
 		} else if d.Established() {
 			cmd.Printf(" ESTABLISHED")
 		} else {
@@ -231,14 +242,293 @@ func (cmd *conntrackDumpCmd) prettyDump(k conntrack.KeyInterface, v conntrack.Va
 		}
 	}
 
+	srcToDst, dstToSrc := orientedLegs(v)
+	if h := legFwdHint(srcToDst); h != "" {
+		cmd.Printf(" fwd-hint[src->dst: %s]", h)
+	}
+	if h := legFwdHint(dstToSrc); h != "" {
+		cmd.Printf(" fwd-hint[dst->src: %s]", h)
+	}
+
 	cmd.Printf("\n")
+}
+
+// ctEntryJSON is a conntrack entry in raw JSON mode — one object per map entry.
+type ctEntryJSON struct {
+	Proto     string   `json:"proto"`
+	AddrA     string   `json:"addr_a"`
+	PortA     uint16   `json:"port_a"`
+	AddrB     string   `json:"addr_b"`
+	PortB     uint16   `json:"port_b"`
+	Type      string   `json:"type"`
+	Flags     []string `json:"flags"`
+	ActiveAgo string   `json:"active_ago"`
+	TCPState  string   `json:"tcp_state,omitempty"`
+	// For nat-forward entries: the key of the reverse entry this points to.
+	RevProto string `json:"rev_proto,omitempty"`
+	RevAddrA string `json:"rev_addr_a,omitempty"`
+	RevPortA uint16 `json:"rev_port_a,omitempty"`
+	RevAddrB string `json:"rev_addr_b,omitempty"`
+	RevPortB uint16 `json:"rev_port_b,omitempty"`
+}
+
+// legFwdHint renders a leg's forwarding-hint state - the tunnel/pinned/checked
+// flags this leg carries as an egress hint for the opposite direction - as a
+// terse string, empty when the leg carries none of them.
+func legFwdHint(leg v4.Leg) string {
+	var f []string
+	if leg.Tunnel {
+		f = append(f, "tunnel")
+	}
+	if leg.Pinned {
+		f = append(f, "pinned")
+	}
+	if leg.Checked {
+		f = append(f, "checked")
+	}
+	if len(f) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s if=%d", strings.Join(f, ","), leg.Ifindex)
+}
+
+// legFwdHintJSON is the structured form of the same, nil when the leg carries
+// no hint flags.
+type legFwdHintJSON struct {
+	Tunnel  bool   `json:"tunnel"`
+	Pinned  bool   `json:"pinned"`
+	Checked bool   `json:"checked"`
+	Ifindex uint32 `json:"ifindex"`
+}
+
+func legFwdHintJSONOf(leg v4.Leg) *legFwdHintJSON {
+	if !leg.Tunnel && !leg.Pinned && !leg.Checked {
+		return nil
+	}
+	return &legFwdHintJSON{
+		Tunnel:  leg.Tunnel,
+		Pinned:  leg.Pinned,
+		Checked: leg.Checked,
+		Ifindex: leg.Ifindex,
+	}
+}
+
+// ctConnectionJSON is a logical connection in pretty JSON mode.
+// For NAT connections, forward and reverse entries are grouped.
+type ctConnectionJSON struct {
+	Type          string          `json:"type"`
+	Proto         string          `json:"proto"`
+	Src           string          `json:"src"`
+	Dst           string          `json:"dst"`
+	OrigDst       string          `json:"orig_dst,omitempty"`
+	TunnelIP      string          `json:"tunnel_ip,omitempty"`
+	OrigSrcPort   uint16          `json:"orig_src_port,omitempty"`
+	Flags         []string        `json:"flags"`
+	FwdHintSrcDst *legFwdHintJSON `json:"fwd_hint_src_dst,omitempty"`
+	FwdHintDstSrc *legFwdHintJSON `json:"fwd_hint_dst_src,omitempty"`
+	ActiveAgo     string          `json:"active_ago"`
+	TCPState      string          `json:"tcp_state,omitempty"`
+}
+
+func ctTypeStr(t uint8) string {
+	switch t {
+	case conntrack.TypeNormal:
+		return "normal"
+	case conntrack.TypeNATForward:
+		return "nat-forward"
+	case conntrack.TypeNATReverse:
+		return "nat-reverse"
+	}
+	return fmt.Sprintf("unknown(%d)", t)
+}
+
+func tcpStateStr(k conntrack.KeyInterface, v conntrack.ValueInterface) string {
+	if k.Proto() != 6 {
+		return ""
+	}
+	d := v.Data()
+	if (v.IsForwardDSR() && d.FINsSeenDSR()) || d.FINsSeen() {
+		return "CLOSED"
+	}
+	if d.RSTSeen() {
+		return "RESET"
+	}
+	if d.Established() {
+		return "ESTABLISHED"
+	}
+	return "SYN-SENT"
+}
+
+func (cmd *conntrackDumpCmd) dumpJSON(
+	ctMap maps.Map,
+	keyFromBytes func([]byte) conntrack.KeyInterface,
+	valFromBytes func([]byte) conntrack.ValueInterface,
+) error {
+	now := bpf.KTimeNanos()
+
+	if cmd.raw {
+		return cmd.dumpRawJSON(ctMap, keyFromBytes, valFromBytes, now)
+	}
+	return cmd.dumpPrettyJSON(ctMap, keyFromBytes, valFromBytes, now)
+}
+
+func (cmd *conntrackDumpCmd) dumpRawJSON(
+	ctMap maps.Map,
+	keyFromBytes func([]byte) conntrack.KeyInterface,
+	valFromBytes func([]byte) conntrack.ValueInterface,
+	now int64,
+) error {
+	var entries []ctEntryJSON
+	err := ctMap.Iter(func(k, v []byte) maps.IteratorAction {
+		ctKey := keyFromBytes(k)
+		ctVal := valFromBytes(v)
+		entry := ctEntryJSON{
+			Proto:     protoStr(ctKey.Proto()),
+			AddrA:     ctKey.AddrA().String(),
+			PortA:     ctKey.PortA(),
+			AddrB:     ctKey.AddrB().String(),
+			PortB:     ctKey.PortB(),
+			Type:      ctTypeStr(ctVal.Type()),
+			Flags:     v4.FlagNames(ctVal.Flags()),
+			ActiveAgo: time.Duration(now - ctVal.LastSeen()).String(),
+			TCPState:  tcpStateStr(ctKey, ctVal),
+		}
+		if ctVal.Type() == conntrack.TypeNATForward {
+			rk := ctVal.ReverseNATKey()
+			entry.RevProto = protoStr(rk.Proto())
+			entry.RevAddrA = rk.AddrA().String()
+			entry.RevPortA = rk.PortA()
+			entry.RevAddrB = rk.AddrB().String()
+			entry.RevPortB = rk.PortB()
+		}
+		entries = append(entries, entry)
+		return maps.IterNone
+	})
+	if err != nil {
+		return fmt.Errorf("failed to iterate over conntrack entries: %w", err)
+	}
+
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(entries)
+}
+
+func (cmd *conntrackDumpCmd) dumpPrettyJSON(
+	ctMap maps.Map,
+	keyFromBytes func([]byte) conntrack.KeyInterface,
+	valFromBytes func([]byte) conntrack.ValueInterface,
+	now int64,
+) error {
+	type ctEntry struct {
+		key conntrack.KeyInterface
+		val conntrack.ValueInterface
+	}
+
+	// Collect all entries; skip NAT forward entries since the reverse
+	// entry already contains the full connection information.
+	var normals []ctEntry
+	var natReverses []ctEntry
+
+	err := ctMap.Iter(func(k, v []byte) maps.IteratorAction {
+		ctKey := keyFromBytes(k)
+		ctVal := valFromBytes(v)
+		e := ctEntry{key: ctKey, val: ctVal}
+
+		switch ctVal.Type() {
+		case conntrack.TypeNormal:
+			normals = append(normals, e)
+		case conntrack.TypeNATReverse:
+			natReverses = append(natReverses, e)
+		}
+		return maps.IterNone
+	})
+	if err != nil {
+		return fmt.Errorf("failed to iterate over conntrack entries: %w", err)
+	}
+
+	var connections []ctConnectionJSON
+
+	// Emit normal connections.
+	for _, e := range normals {
+		k, v := e.key, e.val
+		src, dst := orientedAddrs(k, v)
+		srcToDst, dstToSrc := orientedLegs(v)
+		connections = append(connections, ctConnectionJSON{
+			Type:          "normal",
+			Proto:         protoStr(k.Proto()),
+			Src:           src,
+			Dst:           dst,
+			Flags:         v4.FlagNames(v.Flags()),
+			FwdHintSrcDst: legFwdHintJSONOf(srcToDst),
+			FwdHintDstSrc: legFwdHintJSONOf(dstToSrc),
+			ActiveAgo:     time.Duration(now - v.LastSeen()).String(),
+			TCPState:      tcpStateStr(k, v),
+		})
+	}
+
+	// Emit NAT connections from reverse entries.
+	for _, e := range natReverses {
+		k, v := e.key, e.val
+		d := v.Data()
+		src, dst := orientedAddrs(k, v)
+		srcToDst, dstToSrc := orientedLegs(v)
+		origDst := net.JoinHostPort(d.OrigDst.String(), fmt.Sprint(d.OrigPort))
+
+		conn := ctConnectionJSON{
+			Type:          "nat",
+			Proto:         protoStr(k.Proto()),
+			Src:           src,
+			OrigDst:       origDst,
+			Dst:           dst,
+			Flags:         v4.FlagNames(v.Flags()),
+			FwdHintSrcDst: legFwdHintJSONOf(srcToDst),
+			FwdHintDstSrc: legFwdHintJSONOf(dstToSrc),
+			ActiveAgo:     time.Duration(now - v.LastSeen()).String(),
+			TCPState:      tcpStateStr(k, v),
+		}
+
+		if (cmd.ipv6 && !d.TunIP.Equal(voidIP6)) || (!cmd.ipv6 && !d.TunIP.Equal(voidIP4)) {
+			conn.TunnelIP = d.TunIP.String()
+		}
+		if v.Flags()&v4.FlagHostPSNAT != 0 {
+			conn.OrigSrcPort = d.OrigSPort
+		}
+
+		connections = append(connections, conn)
+	}
+
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(connections)
+}
+
+// orientedLegs returns the legs in the order the addresses are printed, so a
+// hint is labelled by the direction it serves rather than by key order.
+func orientedLegs(v conntrack.ValueInterface) (srcToDst, dstToSrc v4.Leg) {
+	d := v.Data()
+	if v.Flags()&v4.FlagSrcDstBA != 0 {
+		return d.B2A, d.A2B
+	}
+	return d.A2B, d.B2A
+}
+
+// orientedAddrs returns src and dst as "ip:port" strings, respecting
+// the FlagSrcDstBA direction flag.
+func orientedAddrs(k conntrack.KeyInterface, v conntrack.ValueInterface) (src, dst string) {
+	if v.Flags()&v4.FlagSrcDstBA != 0 {
+		src = net.JoinHostPort(k.AddrB().String(), fmt.Sprint(k.PortB()))
+		dst = net.JoinHostPort(k.AddrA().String(), fmt.Sprint(k.PortA()))
+	} else {
+		src = net.JoinHostPort(k.AddrA().String(), fmt.Sprint(k.PortA()))
+		dst = net.JoinHostPort(k.AddrB().String(), fmt.Sprint(k.PortB()))
+	}
+	return
 }
 
 func dumpExtrav2(k v2.Key, v v2.Value) {
 	now := bpf.KTimeNanos()
 
-	fmt.Printf(" Age: %s Active ago %s",
-		time.Duration(now-v.Created()), time.Duration(now-v.LastSeen()))
+	fmt.Printf(" Active ago %s", time.Duration(now-v.LastSeen()))
 
 	if k.Proto() != conntrack.ProtoTCP {
 		return
@@ -250,8 +540,13 @@ func dumpExtrav2(k v2.Key, v v2.Value) {
 
 	data := v.Data()
 
-	if (v.IsForwardDSR() && data.FINsSeenDSR()) || data.FINsSeen() || data.RSTSeen() {
+	if (v.IsForwardDSR() && data.FINsSeenDSR()) || data.FINsSeen() {
 		fmt.Printf(" CLOSED")
+		return
+	}
+
+	if data.RSTSeen() {
+		fmt.Printf(" RESET")
 		return
 	}
 
@@ -266,8 +561,7 @@ func dumpExtrav2(k v2.Key, v v2.Value) {
 func dumpExtra(k conntrack.KeyInterface, v conntrack.ValueInterface) {
 	now := bpf.KTimeNanos()
 
-	fmt.Printf(" Age: %s Active ago %s",
-		time.Duration(now-v.Created()), time.Duration(now-v.LastSeen()))
+	fmt.Printf(" Active ago %s", time.Duration(now-v.LastSeen()))
 
 	if k.Proto() != conntrack.ProtoTCP {
 		return
@@ -281,6 +575,11 @@ func dumpExtra(k conntrack.KeyInterface, v conntrack.ValueInterface) {
 
 	if (v.IsForwardDSR() && data.FINsSeenDSR()) || data.FINsSeen() {
 		fmt.Printf(" CLOSED")
+		return
+	}
+
+	if data.RSTSeen() {
+		fmt.Printf(" RESET")
 		return
 	}
 
@@ -299,19 +598,26 @@ type conntrackRemoveCmd struct {
 	IP1   string `docopt:"<ip1>"`
 	IP2   string `docopt:"<ip2>"`
 
-	proto uint8
-	ip1   net.IP
-	ip2   net.IP
+	proto    uint8
+	anyProto bool
+	ip1      net.IP
+	ip2      net.IP
+
+	conntrackOpts
 }
 
 func newConntrackRemoveCmd() *cobra.Command {
 	cmd := &conntrackRemoveCmd{
 		Command: &cobra.Command{
 			Use:   "remove <proto> <ip1> <ip2>",
-			Short: "removes connection tracking",
+			Short: "Removes connection tracking entries between two addresses",
+			Long: "Removes the connection tracking entries between <ip1> and <ip2> in either direction.\n" +
+				"<proto> is a protocol name (tcp, udp, icmp, icmp6, sctp), a decimal protocol\n" +
+				"number, or \"any\" to remove the entries of every protocol.",
 		},
 	}
 
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "version to remove from")
 	cmd.Command.Args = cmd.Args
 	cmd.Command.Run = cmd.Run
 
@@ -321,51 +627,58 @@ func newConntrackRemoveCmd() *cobra.Command {
 func (cmd *conntrackRemoveCmd) Args(c *cobra.Command, args []string) error {
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
-	switch proto := strings.ToLower(args[0]); proto {
-	case "udp":
-		cmd.proto = 17
-	case "tcp":
-		cmd.proto = 6
-	default:
-		return errors.Errorf("unknown protocol %s", proto)
+	if strings.ToLower(args[0]) == "any" {
+		cmd.anyProto = true
+	} else if cmd.proto, err = protoFromString(args[0]); err != nil {
+		return err
 	}
 
 	cmd.ip1 = net.ParseIP(cmd.IP1)
 	if cmd.ip1 == nil {
-		return errors.Errorf("ip1: %q is not an ip", cmd.IP1)
+		return fmt.Errorf("ip1: %q is not an ip", cmd.IP1)
 	}
 
 	cmd.ip2 = net.ParseIP(cmd.IP2)
 	if cmd.ip2 == nil {
-		return errors.Errorf("ip2: %q is not an ip", cmd.IP2)
+		return fmt.Errorf("ip2: %q is not an ip", cmd.IP2)
 	}
 
 	return nil
 }
 
 func (cmd *conntrackRemoveCmd) Run(c *cobra.Command, _ []string) {
-	ctMap := conntrack.Map()
+	var (
+		ctMap maps.Map
+		ctErr error
+	)
+
+	cmd.ipv6 = ipv6 != nil && *ipv6
+
+	if ctMap, ctErr = GetCTMap(cmd.version, cmd.ipv6); ctErr != nil {
+		log.WithError(ctErr).Fatal("Failed to get ConntrackMap")
+	}
 	if err := ctMap.Open(); err != nil {
 		log.WithError(err).Error("Failed to access ConntrackMap")
 	}
+	keyFromBytes := conntrack.KeyFromBytes
+	if cmd.ipv6 {
+		keyFromBytes = conntrack.KeyV6FromBytes
+	}
+
 	err := ctMap.Iter(func(k, v []byte) maps.IteratorAction {
-		var ctKey conntrack.Key
-		if len(k) != len(ctKey) {
-			log.Panic("Key has unexpected length")
-		}
-		copy(ctKey[:], k[:])
+		ctKey := keyFromBytes(k)
 
 		log.Infof("Examining conntrack key: %v", ctKey)
 
-		if ctKey.Proto() != cmd.proto {
+		if !cmd.anyProto && ctKey.Proto() != cmd.proto {
 			return maps.IterNone
 		}
 
@@ -383,17 +696,36 @@ func (cmd *conntrackRemoveCmd) Run(c *cobra.Command, _ []string) {
 	}
 }
 
-func runClean(c *cobra.Command, _ []string) {
-	var (
-		ctMap maps.Map
-	)
+type conntrackCleanCmd struct {
+	*cobra.Command
+	conntrackOpts
+}
 
-	if ipv6 != nil && *ipv6 {
-		ctMap = conntrack.MapV6()
-	} else {
-		ctMap = conntrack.Map()
+func newConntrackCleanCmd() *cobra.Command {
+	cmd := &conntrackCleanCmd{
+		Command: &cobra.Command{
+			Use:   "clean [--ver=<version>]",
+			Short: "Cleans all conntrack entries",
+		},
 	}
 
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "conntrack version to clean")
+	cmd.Command.Run = cmd.Run
+
+	return cmd.Command
+}
+
+func (cmd *conntrackCleanCmd) Run(c *cobra.Command, _ []string) {
+	var (
+		ctMap maps.Map
+		ctErr error
+	)
+
+	cmd.ipv6 = ipv6 != nil && *ipv6
+
+	if ctMap, ctErr = GetCTMap(cmd.version, cmd.ipv6); ctErr != nil {
+		log.WithError(ctErr).Fatal("Failed to get ConntrackMap")
+	}
 	if err := ctMap.Open(); err != nil {
 		log.WithError(err).Error("Failed to access ConntrackMap")
 	}
@@ -413,74 +745,54 @@ func runClean(c *cobra.Command, _ []string) {
 
 type conntrackCreateCmd struct {
 	*cobra.Command
-	Version string `docopt:"--ver"`
-	version string
+	conntrackOpts
 }
 
 func newConntrackCreateCmd() *cobra.Command {
 	cmd := &conntrackCreateCmd{
 		Command: &cobra.Command{
 			Use:   "create [--ver=<version>]",
-			Short: "create a conntrack map of specified version",
+			Short: "Creates a conntrack map of specified version",
 		},
 	}
 
-	cmd.Command.Flags().StringVarP((&cmd.version), "ver", "v", "", "conntrack version to create")
-	cmd.Command.Args = cmd.Args
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "conntrack version to create")
 	cmd.Command.Run = cmd.Run
 
 	return cmd.Command
 }
 
-func (cmd *conntrackCreateCmd) Args(c *cobra.Command, args []string) error {
-	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
-	if err != nil {
-		return errors.New(err.Error())
-	}
-
-	err = a.Bind(cmd)
-	if err != nil {
-		return errors.New(err.Error())
-	}
-	return nil
-}
-
 func (cmd *conntrackCreateCmd) Run(c *cobra.Command, _ []string) {
-	var ctMap maps.Map
-	switch cmd.version {
-	case "2":
-		ctMap = conntrack.MapV2()
-	default:
-		ctMap = conntrack.Map()
-	}
+	cmd.ipv6 = ipv6 != nil && *ipv6
+	ctMap := getCTMap(cmd.version, cmd.ipv6)
+
 	if err := ctMap.EnsureExists(); err != nil {
-		log.WithError(err).Errorf("Failed to create conntrackMap version %s", cmd.version)
+		log.WithError(err).Errorf("Failed to create conntrackMap version %d", cmd.version)
 	}
 }
 
 type conntrackWriteCmd struct {
 	*cobra.Command
 
-	Version string `docopt:"--ver"`
-	Key     string `docopt:"<key>"`
-	Value   string `docopt:"<value>"`
+	Key   string `docopt:"<key>"`
+	Value string `docopt:"<value>"`
 
-	key     []byte
-	val     []byte
-	version string
+	key []byte
+	val []byte
+	conntrackOpts
 }
 
 func newConntrackWriteCmd() *cobra.Command {
 	cmd := &conntrackWriteCmd{
 		Command: &cobra.Command{
-			Use:   "write [--ver=<version>] <key> <value>",
-			Short: "write a key-value pair, each encoded in base64",
+			Use:   "write <key> <value>",
+			Short: "Writes a key-value pair, each encoded in base64",
 		},
 	}
 
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "conntrack map version")
 	cmd.Command.Args = cmd.Args
 	cmd.Command.Run = cmd.Run
-	cmd.Command.Flags().StringVarP((&cmd.version), "ver", "v", "", "conntrack map version")
 
 	return cmd.Command
 }
@@ -488,24 +800,28 @@ func newConntrackWriteCmd() *cobra.Command {
 func (cmd *conntrackWriteCmd) Args(c *cobra.Command, args []string) error {
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
+
+	cmd.ipv6 = ipv6 != nil && *ipv6
 
 	cmd.key, err = base64.StdEncoding.DecodeString(cmd.Key)
 	if err != nil {
 		switch cmd.version {
-		case "2":
+		case 2:
 			if len(cmd.key) != len(v2.Key{}) {
-				return errors.Errorf("failed to decode key: %s", err)
+				return fmt.Errorf("failed to decode key: %s", err)
 			}
 		default:
-			if len(cmd.key) != len(conntrack.Key{}) {
-				return errors.Errorf("failed to decode key: %s", err)
+			if cmd.ipv6 && len(cmd.key) != len(conntrack.KeyV6{}) {
+				return fmt.Errorf("failed to decode key: %s", err)
+			} else if !cmd.ipv6 && len(cmd.key) != len(conntrack.Key{}) {
+				return fmt.Errorf("failed to decode key: %s", err)
 			}
 		}
 	}
@@ -513,13 +829,15 @@ func (cmd *conntrackWriteCmd) Args(c *cobra.Command, args []string) error {
 	cmd.val, err = base64.StdEncoding.DecodeString(cmd.Value)
 	if err != nil {
 		switch cmd.version {
-		case "2":
+		case 2:
 			if len(cmd.val) != len(v2.Value{}) {
-				return errors.Errorf("failed to decode val: %s", err)
+				return fmt.Errorf("failed to decode val: %s", err)
 			}
 		default:
-			if len(cmd.val) != len(conntrack.Value{}) {
-				return errors.Errorf("failed to decode val: %s", err)
+			if cmd.ipv6 && len(cmd.val) != len(conntrack.ValueV6{}) {
+				return fmt.Errorf("failed to decode val: %s", err)
+			} else if !cmd.ipv6 && len(cmd.val) != len(conntrack.Value{}) {
+				return fmt.Errorf("failed to decode val: %s", err)
 			}
 		}
 	}
@@ -527,11 +845,15 @@ func (cmd *conntrackWriteCmd) Args(c *cobra.Command, args []string) error {
 }
 
 func (cmd *conntrackWriteCmd) Run(c *cobra.Command, _ []string) {
-	var ctMap maps.Map
-	if cmd.version == "2" {
-		ctMap = conntrack.MapV2()
-	} else {
-		ctMap = conntrack.Map()
+	var (
+		ctMap maps.Map
+		ctErr error
+	)
+
+	cmd.ipv6 = ipv6 != nil && *ipv6
+
+	if ctMap, ctErr = GetCTMap(cmd.version, cmd.ipv6); ctErr != nil {
+		log.WithError(ctErr).Fatal("Failed to get ConntrackMap")
 	}
 
 	if err := ctMap.Open(); err != nil {
@@ -543,73 +865,179 @@ func (cmd *conntrackWriteCmd) Run(c *cobra.Command, _ []string) {
 	}
 }
 
-type conntrackFillCmd struct {
-	conntrackWriteCmd
+type conntrackStatsCmd struct {
+	*cobra.Command
+
+	established int
+	reset       int
+	closed      int
+	synSent     int
+	total       int
+	nat         int
+
+	protos map[int]int
+
+	conntrackOpts
 }
 
-func newConntrackFillCmd() *cobra.Command {
-	cmd := &conntrackFillCmd{
-		conntrackWriteCmd: conntrackWriteCmd{
-			Command: &cobra.Command{
-				Use: "fill <key> <value>",
-				Short: "fill the table with a key-value pair, each encoded in base64. " +
-					"The prot-ip1-ip2 in the key are used as a start, ports are generated.",
-			},
+func newConntrackStatsCmd() *cobra.Command {
+	cmd := &conntrackStatsCmd{
+		Command: &cobra.Command{
+			Use:   "stats [--ver=<version>]",
+			Short: "Prints conntrack statistics",
 		},
+		protos: make(map[int]int),
 	}
 
-	cmd.Command.Args = cmd.Args
+	cmd.Command.Flags().IntVarP((&cmd.version), "ver", "v", 4, "conntrack map version")
+
 	cmd.Command.Run = cmd.Run
 
 	return cmd.Command
 }
 
-func (cmd *conntrackFillCmd) Run(c *cobra.Command, _ []string) {
+func (cmd *conntrackStatsCmd) Run(c *cobra.Command, _ []string) {
 	var (
-		key   conntrack.KeyInterface
 		ctMap maps.Map
+		ctErr error
 	)
 
-	if ipv6 != nil && *ipv6 {
-		var k conntrack.KeyV6
-		copy(k[:], cmd.key)
-		key = k
+	cmd.ipv6 = ipv6 != nil && *ipv6
 
-		ctMap = conntrack.MapV6()
-	} else {
-		var k conntrack.Key
-		copy(k[:], cmd.key)
-		key = k
-
-		ctMap = conntrack.Map()
+	if ctMap, ctErr = GetCTMap(cmd.version, cmd.ipv6); ctErr != nil {
+		log.WithError(ctErr).Fatal("Failed to get ConntrackMap")
 	}
-
-	ipA := key.AddrA()
-	ipB := key.AddrB()
-	proto := key.Proto()
 
 	if err := ctMap.Open(); err != nil {
-		log.WithError(err).Error("Failed to access ConntrackMap")
+		log.WithError(err).Fatal("Failed to access ConntrackMap")
 	}
 
-	// Disable debug if set while writing
-	loglevel := log.GetLevel()
-	log.SetLevel(log.WarnLevel)
+	keyFromBytes := conntrack.KeyFromBytes
+	valFromBytes := conntrack.ValueFromBytes
+	if cmd.ipv6 {
+		keyFromBytes = conntrack.KeyV6FromBytes
+		valFromBytes = conntrack.ValueV6FromBytes
+	}
 
-	for i := 1; ; i++ {
-		portA := uint16(i >> 16)
-		portB := uint16(i & 0xffff)
+	err := ctMap.Iter(func(k, v []byte) maps.IteratorAction {
+		ctKey := keyFromBytes(k)
+		ctVal := valFromBytes(v)
+		d := ctVal.Data()
 
-		key := conntrack.NewKey(proto, ipA, portA, ipB, portB)
+		if ctVal.Type() == conntrack.TypeNATForward {
+			cmd.nat++
+			return maps.IterNone
+		}
 
-		if err := ctMap.Update(key[:], cmd.val); err != nil {
-			log.SetLevel(loglevel)
-			fmt.Printf("i = %+v\n", i)
-			log.Infof("Written %d entries", i-1)
-			if err == unix.E2BIG {
-				return
+		if ctKey.Proto() == 6 {
+			if (ctVal.IsForwardDSR() && d.FINsSeenDSR()) || d.FINsSeen() {
+				cmd.closed++
+			} else if d.RSTSeen() {
+				cmd.reset++
+			} else if d.Established() {
+				cmd.established++
+			} else {
+				cmd.synSent++
 			}
-			log.WithError(err).Fatal("Failed to update ConntrackMap")
+		}
+
+		cmd.total++
+		cmd.protos[int(ctKey.Proto())]++
+
+		return maps.IterNone
+	})
+
+	if *jsonOutput {
+		type ctStatsJSON struct {
+			MapSize        int `json:"map_size"`
+			TotalConns     int `json:"total_connections"`
+			TotalEntries   int `json:"total_entries"`
+			NATConns       int `json:"nat_connections"`
+			TCP            int `json:"tcp"`
+			UDP            int `json:"udp"`
+			Others         int `json:"others"`
+			TCPEstablished int `json:"tcp_established"`
+			TCPClosed      int `json:"tcp_closed"`
+			TCPReset       int `json:"tcp_reset"`
+			TCPSynSent     int `json:"tcp_syn_sent"`
+		}
+		stats := ctStatsJSON{
+			MapSize:        maps.Size(ctMap.GetName()),
+			TotalConns:     cmd.total,
+			TotalEntries:   cmd.total + cmd.nat,
+			NATConns:       cmd.nat,
+			TCP:            cmd.protos[6],
+			UDP:            cmd.protos[17],
+			Others:         cmd.total - cmd.protos[6] - cmd.protos[17],
+			TCPEstablished: cmd.established,
+			TCPClosed:      cmd.closed,
+			TCPReset:       cmd.reset,
+			TCPSynSent:     cmd.synSent,
+		}
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(stats); encErr != nil {
+			log.WithError(encErr).Error("Failed to encode JSON")
+		}
+	} else {
+		cmd.Printf("Conntrack map size: %d\n", maps.Size(ctMap.GetName()))
+
+		cmd.Printf("Total connections: %d\n", cmd.total)
+		cmd.Printf("Total entries: %d\n", cmd.total+cmd.nat)
+		cmd.Printf("NAT connections: %d\n\n", cmd.nat)
+
+		cmd.Printf("TCP : %d\n", cmd.protos[6])
+		cmd.Printf("UDP : %d\n", cmd.protos[17])
+		cmd.Printf("Others : %d\n\n", cmd.total-cmd.protos[6]-cmd.protos[17])
+
+		cmd.Printf("TCP Established: %d\n", cmd.established)
+		cmd.Printf("TCP Closed: %d\n", cmd.closed)
+		cmd.Printf("TCP Reset: %d\n", cmd.reset)
+		cmd.Printf("TCP Syn-sent: %d\n", cmd.synSent)
+	}
+
+	if err != nil {
+		log.WithError(err).Fatal("Failed to iterate over conntrack entries")
+	}
+}
+
+func GetCTMap(version int, ipv6 bool) (maps.Map, error) {
+	// Set the map size based on the actual max entries obtained from the map info.
+	if err := setCTMapSize(version, ipv6); err != nil {
+		return nil, err
+	}
+	return getCTMap(version, ipv6), nil
+}
+
+func getCTMap(version int, ipv6 bool) maps.Map {
+	var ctMap maps.Map
+	switch version {
+	case 2:
+		ctMap = conntrack.MapV2()
+	default:
+		if ipv6 {
+			ctMap = conntrack.MapV6()
+		} else {
+			ctMap = conntrack.Map()
 		}
 	}
+	return ctMap
+}
+
+func setCTMapSize(version int, ipv6 bool) error {
+	ctMap := getCTMap(version, ipv6)
+
+	if err := ctMap.Open(); err != nil {
+		return errors.New("failed to access conntrack Map")
+	}
+	defer ctMap.Close()
+
+	if mapInfo, err := maps.GetMapInfo(ctMap.MapFD()); err != nil {
+		return errors.New("failed to get map info")
+	} else {
+		// Set the map size based on the actual max entries obtained from the map info.
+		maps.SetSize(ctMap.GetName(), mapInfo.MaxEntries)
+	}
+
+	return nil
 }

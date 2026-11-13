@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,14 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,7 +36,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -89,7 +89,7 @@ var (
 	ipPoolCIDR = calinet.MustParseCIDR("10.0.1.0/24")
 	ipPool1    = api.Update{
 		KVPair: model.KVPair{
-			Key: model.IPPoolKey{CIDR: ipPoolCIDR},
+			Key: model.IPPoolKey{CIDR: model.PrefixFromIPNet(ipPoolCIDR)},
 			Value: &model.IPPool{
 				CIDR:          ipPoolCIDR,
 				IPIPInterface: "tunl0",
@@ -120,8 +120,8 @@ var (
 	}
 	v3Node = api.Update{
 		KVPair: model.KVPair{
-			Key: model.ResourceKey{Name: "node1", Kind: libapiv3.KindNode},
-			Value: &libapiv3.Node{
+			Key: model.ResourceKey{Name: "node1", Kind: internalapi.KindNode},
+			Value: &internalapi.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					ResourceVersion: "1237",
 				},
@@ -145,7 +145,7 @@ var (
 	blockAffCIDR = calinet.MustParseCIDR("10.0.1.0/26")
 	blockAff1    = api.Update{
 		KVPair: model.KVPair{
-			Key:      model.BlockAffinityKey{CIDR: blockAffCIDR, Host: "node1"},
+			Key:      model.BlockAffinityKey{CIDR: model.PrefixFromIPNet(blockAffCIDR), AffinityType: model.IPAMAffinityTypeHost, Host: "node1"},
 			Value:    &model.BlockAffinity{State: model.StateConfirmed},
 			Revision: "1239",
 		},
@@ -192,8 +192,8 @@ var _ = Describe("With an in-process Server", func() {
 		// simulates a second connection and check that that also converges to the given state.
 		expectClientState := func(c *ClientState, status api.SyncStatus, kvs map[string]api.Update) {
 			// Wait until we reach that state.
-			Eventually(c.recorder.Status).Should(Equal(status))
-			Eventually(c.recorder.KVs).Should(Equal(kvs))
+			EventuallyWithOffset(1, c.recorder.Status).Should(Equal(status), "Unexpected sync status")
+			EventuallyWithOffset(1, c.recorder.KVs).Should(Equal(kvs), "Unexpected KVs")
 
 			// Now, a newly-connecting client should also reach the same state.
 			log.Info("Starting transient client to read snapshot.")
@@ -212,62 +212,6 @@ var _ = Describe("With an in-process Server", func() {
 		expectFelixClientState := func(status api.SyncStatus, kvs map[string]api.Update) {
 			expectClientState(h.ClientStates[0], status, kvs)
 		}
-
-		It("should drop a bad KV", func() {
-			// Bypass the validation filter (which also converts Nodes to HostIPs).
-			h.FelixCache.OnStatusUpdated(api.ResyncInProgress)
-			h.FelixCache.OnUpdates([]api.Update{{
-				KVPair: model.KVPair{
-					// NodeKeys can't be serialized right now.
-					Key:      model.NodeKey{Hostname: "foobar"},
-					Value:    "bazzbiff",
-					Revision: "1234",
-					TTL:      12,
-				},
-				UpdateType: api.UpdateTypeKVNew,
-			}})
-			h.FelixCache.OnStatusUpdated(api.InSync)
-			expectFelixClientState(api.InSync, map[string]api.Update{})
-		})
-
-		It("validation should drop a bad Node", func() {
-			h.ValFilter.OnStatusUpdated(api.ResyncInProgress)
-			h.ValFilter.OnUpdates([]api.Update{{
-				KVPair: model.KVPair{
-					Key:      model.NodeKey{Hostname: "foobar"},
-					Value:    "bazzbiff",
-					Revision: "1234",
-					TTL:      12,
-				},
-				UpdateType: api.UpdateTypeKVNew,
-			}})
-			h.ValFilter.OnStatusUpdated(api.InSync)
-			expectFelixClientState(api.InSync, map[string]api.Update{})
-		})
-
-		It("validation should convert a valid Node", func() {
-			h.ValFilter.OnStatusUpdated(api.ResyncInProgress)
-			h.ValFilter.OnUpdates([]api.Update{{
-				KVPair: model.KVPair{
-					Key: model.NodeKey{Hostname: "foobar"},
-					Value: &model.Node{
-						FelixIPv4: calinet.ParseIP("10.0.0.1"),
-					},
-					Revision: "1234",
-				},
-				UpdateType: api.UpdateTypeKVNew,
-			}})
-			h.ValFilter.OnStatusUpdated(api.InSync)
-			expectFelixClientState(api.InSync, map[string]api.Update{
-				"/calico/v1/host/foobar/bird_ip": {
-					KVPair: model.KVPair{
-						Key:      model.HostIPKey{Hostname: "foobar"},
-						Value:    &calinet.IP{IP: net.ParseIP("10.0.0.1")},
-						Revision: "1234",
-					},
-					UpdateType: api.UpdateTypeKVNew,
-				}})
-		})
 
 		It("should pass through a KV and status", func() {
 			h.Decoupler.OnStatusUpdated(api.ResyncInProgress)
@@ -303,7 +247,7 @@ var _ = Describe("With an in-process Server", func() {
 						},
 					)
 					// Our updates shouldn't affect the felix syncer.
-					expectFelixClientState(api.WaitForDatastore, map[string]api.Update{})
+					expectFelixClientState(api.ResyncInProgress, map[string]api.Update{})
 				},
 				Entry("IP pool", ipPool1, "/calico/v1/ipam/v4/pool/10.0.1.0-24"),
 				Entry("Node conf", nodeBGPConfNode, "/calico/bgp/v1/host/node1/foo"),
@@ -359,7 +303,7 @@ var _ = Describe("With an in-process Server", func() {
 			expectedState := map[string]api.Update{}
 			const numKeys = 10000
 			const halfNumKeys = numKeys / 2
-			for i := 0; i < numKeys; i++ {
+			for i := range numKeys {
 				upd := api.Update{
 					KVPair: model.KVPair{
 						Key:      model.GlobalConfigKey{Name: fmt.Sprintf("foobar%d", i)},
@@ -374,7 +318,7 @@ var _ = Describe("With an in-process Server", func() {
 					expectedState[fmt.Sprintf("/calico/v1/config/foobar%d", i)] = upd
 				}
 			}
-			for i := 0; i < halfNumKeys; i++ {
+			for i := range halfNumKeys {
 				h.Decoupler.OnUpdates([]api.Update{{
 					KVPair: model.KVPair{
 						Key:      model.GlobalConfigKey{Name: fmt.Sprintf("foobar%d", i)},
@@ -404,7 +348,7 @@ var _ = Describe("With an in-process Server", func() {
 	})
 
 	// Simulate an old client.
-	Describe("with a client that doesn't support connection restart", func() {
+	Describe("with a client that doesn't support decoder restart", func() {
 		BeforeEach(func() {
 			h.CreateClientNoDecodeRestart("no decoder restart", syncproto.SyncerTypeFelix)
 		})
@@ -413,9 +357,7 @@ var _ = Describe("With an in-process Server", func() {
 			expState := h.SendInitialSnapshotPods(10)
 			h.ExpectAllClientsToReachState(api.InSync, expState)
 			expState2 := h.SendPodUpdates(10)
-			for k, v := range expState2 {
-				expState[k] = v
-			}
+			maps.Copy(expState, expState2)
 			h.ExpectAllClientsToReachState(api.InSync, expState)
 		})
 	})
@@ -502,7 +444,9 @@ var _ = Describe("With an in-process Server", func() {
 
 		It("should report the correct number of connections", func() {
 			expectGlobalGaugeValue("typha_connections_active", 100.0)
-			expectPerSyncerGaugeValue(syncproto.SyncerTypeFelix, "typha_connections_streaming", 100.0)
+			// These clients use the default options, so they negotiate zstd.
+			expectPerSyncerCompressionGaugeValue(
+				syncproto.SyncerTypeFelix, syncproto.CompressionZstd, "typha_connections_streaming", 100.0)
 		})
 
 		It("should report the correct number of connections after killing the clients", func() {
@@ -510,17 +454,16 @@ var _ = Describe("With an in-process Server", func() {
 				c.clientCancel()
 			}
 			expectGlobalGaugeValue("typha_connections_active", 0.0)
-			expectPerSyncerGaugeValue(syncproto.SyncerTypeFelix, "typha_connections_streaming", 0.0)
+			expectPerSyncerCompressionGaugeValue(
+				syncproto.SyncerTypeFelix, syncproto.CompressionZstd, "typha_connections_streaming", 0.0)
 		})
 
 		It("with churn, it should report the correct number of connections after killing the clients", func() {
 			// Generate some churn while we disconnect the clients.
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				h.SendInitialSnapshotPods(1000)
-				wg.Done()
-			}()
+			})
 			defer wg.Wait()
 			for _, c := range h.ClientStates {
 				c.clientCancel()
@@ -528,6 +471,348 @@ var _ = Describe("With an in-process Server", func() {
 			}
 			expectGlobalGaugeValue("typha_connections_active", 0.0)
 		})
+	})
+})
+
+var _ = Describe("With explicit compression algorithm", func() {
+	// Test both compression algorithms explicitly by setting the server's
+	// preferred compression order so the desired algorithm is first.
+
+	DescribeTable("should pass through KVs and status with",
+		func(compressionAlgorithm syncproto.CompressionAlgorithm) {
+			log.SetLevel(log.DebugLevel)
+			h := NewHarness()
+			h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{compressionAlgorithm}
+			h.Start()
+			defer h.Stop()
+
+			h.CreateClients(1)
+			recorder := h.ClientStates[0].recorder
+
+			h.Decoupler.OnStatusUpdated(api.ResyncInProgress)
+			h.Decoupler.OnUpdates([]api.Update{configFoobarBazzBiff})
+			h.Decoupler.OnStatusUpdated(api.InSync)
+			Eventually(recorder.Status).Should(Equal(api.InSync))
+			Eventually(recorder.KVs).Should(Equal(map[string]api.Update{
+				"/calico/v1/config/foobar": configFoobarBazzBiff,
+			}))
+		},
+		Entry("snappy compression", syncproto.CompressionSnappy),
+		Entry("zstd compression", syncproto.CompressionZstd),
+	)
+
+	DescribeTable("should pass through many KVs with",
+		func(compressionAlgorithm syncproto.CompressionAlgorithm) {
+			log.SetLevel(log.InfoLevel)
+			h := NewHarness()
+			h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{compressionAlgorithm}
+			h.Start()
+			defer h.Stop()
+
+			h.CreateClients(1)
+			expectedEndState := h.SendInitialSnapshotPods(1000)
+			h.ExpectAllClientsToReachState(api.InSync, expectedEndState)
+		},
+		Entry("snappy compression", syncproto.CompressionSnappy),
+		Entry("zstd compression", syncproto.CompressionZstd),
+	)
+
+	DescribeTable("should handle updates and deletes with",
+		func(compressionAlgorithm syncproto.CompressionAlgorithm) {
+			log.SetLevel(log.DebugLevel)
+			h := NewHarness()
+			h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{compressionAlgorithm}
+			h.Start()
+			defer h.Stop()
+
+			h.CreateClients(1)
+			recorder := h.ClientStates[0].recorder
+
+			h.Decoupler.OnStatusUpdated(api.ResyncInProgress)
+			h.Decoupler.OnUpdates([]api.Update{configFoobarBazzBiff})
+			h.Decoupler.OnStatusUpdated(api.InSync)
+			Eventually(recorder.Status).Should(Equal(api.InSync))
+			Eventually(recorder.KVs).Should(Equal(map[string]api.Update{
+				"/calico/v1/config/foobar": configFoobarBazzBiff,
+			}))
+
+			// Now send a delete and verify it propagates.
+			h.Decoupler.OnUpdates([]api.Update{configFoobarDeleted})
+			Eventually(recorder.KVs).Should(Equal(map[string]api.Update{}))
+		},
+		Entry("snappy compression", syncproto.CompressionSnappy),
+		Entry("zstd compression", syncproto.CompressionZstd),
+	)
+
+	DescribeTable("should handle delta updates after snapshot with",
+		func(compressionAlgorithm syncproto.CompressionAlgorithm) {
+			log.SetLevel(log.InfoLevel)
+			h := NewHarness()
+			h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{compressionAlgorithm}
+			h.Start()
+			defer h.Stop()
+
+			// Send an initial snapshot.
+			expState := h.SendInitialSnapshotPods(100)
+			h.CreateClients(1)
+			h.ExpectAllClientsToReachState(api.InSync, expState)
+
+			// Now send additional delta updates (these go through the
+			// second zstd/snappy frame, after the snapshot).
+			expState2 := h.SendPodUpdates(50)
+			for k, v := range expState2 {
+				expState[k] = v
+			}
+			h.ExpectAllClientsToReachState(api.InSync, expState)
+		},
+		Entry("snappy compression", syncproto.CompressionSnappy),
+		Entry("zstd compression", syncproto.CompressionZstd),
+	)
+
+	DescribeTable("should handle multiple clients with",
+		func(compressionAlgorithm syncproto.CompressionAlgorithm) {
+			log.SetLevel(log.InfoLevel)
+			h := NewHarness()
+			h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{compressionAlgorithm}
+			h.Start()
+			defer h.Stop()
+
+			h.CreateClients(5)
+			expectedEndState := h.SendInitialSnapshotPods(200)
+			h.ExpectAllClientsToReachState(api.InSync, expectedEndState)
+		},
+		Entry("snappy compression", syncproto.CompressionSnappy),
+		Entry("zstd compression", syncproto.CompressionZstd),
+	)
+})
+
+var _ = Describe("With compression algorithm negotiation", func() {
+	// sendFoobarAndExpectInSync pushes one KV plus in-sync through the
+	// harness and waits for the client to see them, which guarantees the
+	// compression negotiation has completed on the client side.
+	sendFoobarAndExpectInSync := func(h *ServerHarness, c *ClientState) {
+		h.Decoupler.OnStatusUpdated(api.ResyncInProgress)
+		h.Decoupler.OnUpdates([]api.Update{configFoobarBazzBiff})
+		h.Decoupler.OnStatusUpdated(api.InSync)
+		Eventually(c.recorder.Status).Should(Equal(api.InSync))
+		Eventually(c.recorder.KVs).Should(Equal(map[string]api.Update{
+			"/calico/v1/config/foobar": configFoobarBazzBiff,
+		}))
+	}
+
+	It("should negotiate zstd when client and server both use the defaults", func() {
+		// A new client advertises snappy and zstd; the server's default
+		// preference order is zstd first, so zstd should win.
+		log.SetLevel(log.InfoLevel)
+		h := NewHarness()
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClient(0, syncproto.SyncerTypeFelix)
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionZstd))
+
+		// The server-side metrics should carry the negotiated algorithm as
+		// the "compression" label.
+		expectPerSyncerCompressionGaugeValue(
+			syncproto.SyncerTypeFelix, syncproto.CompressionZstd, "typha_connections_streaming", 1.0)
+		count, err := getPerSyncerCompressionSummaryCount(
+			syncproto.SyncerTypeFelix, syncproto.CompressionZstd, "typha_client_snapshot_send_secs")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(count).To(BeNumerically(">=", 1))
+	})
+
+	It("should fall back to snappy for an old client that only supports snappy", func() {
+		// Simulates a pre-zstd client: its hello advertises only snappy,
+		// which is exactly what old Felix versions send.
+		log.SetLevel(log.InfoLevel)
+		h := NewHarness()
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClientWithOptions(0, syncclient.Options{
+			SyncerType: syncproto.SyncerTypeFelix,
+			PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+				syncproto.CompressionSnappy,
+			},
+		})
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionSnappy))
+		expectPerSyncerCompressionGaugeValue(
+			syncproto.SyncerTypeFelix, syncproto.CompressionSnappy, "typha_connections_streaming", 1.0)
+	})
+
+	It("should fall back to snappy when the server only supports snappy", func() {
+		// Simulates a new client talking to a pre-zstd server: the client
+		// advertises both algorithms but the server only knows snappy.
+		log.SetLevel(log.InfoLevel)
+		h := NewHarness()
+		h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+			syncproto.CompressionSnappy,
+		}
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClient(0, syncproto.SyncerTypeFelix)
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionSnappy))
+	})
+
+	It("should use the client's only algorithm when the server supports both", func() {
+		// Client only advertises zstd, server prefers snappy,zstd.
+		// Server should pick zstd since that's the only one the client supports.
+		log.SetLevel(log.DebugLevel)
+		h := NewHarness()
+		h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+			syncproto.CompressionSnappy, syncproto.CompressionZstd,
+		}
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClientWithOptions(0, syncclient.Options{
+			SyncerType: syncproto.SyncerTypeFelix,
+			PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+				syncproto.CompressionZstd,
+			},
+		})
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionZstd))
+	})
+
+	It("should fall back to no compression when there is no algorithm overlap", func() {
+		// Client only advertises zstd, server only supports snappy.
+		// No overlap, so chosenCompression stays empty => uncompressed streaming.
+		log.SetLevel(log.DebugLevel)
+		h := NewHarness()
+		h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+			syncproto.CompressionSnappy,
+		}
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClientWithOptions(0, syncclient.Options{
+			SyncerType: syncproto.SyncerTypeFelix,
+			PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+				syncproto.CompressionZstd,
+			},
+		})
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionAlgorithm("")))
+		// Uncompressed connections report compression="none".
+		expectPerSyncerCompressionGaugeValue(
+			syncproto.SyncerTypeFelix, syncproto.CompressionAlgorithm(""), "typha_connections_streaming", 1.0)
+	})
+
+	It("should fall back to no compression with DisableDecoderRestart and zstd-only server", func() {
+		// Server only supports zstd, but client has DisableDecoderRestart.
+		// Compression requires decoder restart, so should fall back to uncompressed.
+		log.SetLevel(log.DebugLevel)
+		h := NewHarness()
+		h.Config.PreferredCompressionAlgorithmOrder = []syncproto.CompressionAlgorithm{
+			syncproto.CompressionZstd,
+		}
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClientNoDecodeRestart(0, syncproto.SyncerTypeFelix)
+		sendFoobarAndExpectInSync(h, c)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionAlgorithm("")))
+	})
+
+	It("should handle many KVs when client restricts to zstd only", func() {
+		log.SetLevel(log.InfoLevel)
+		h := NewHarness()
+		h.Start()
+		defer h.Stop()
+
+		c := h.CreateClientWithOptions(0, syncclient.Options{
+			SyncerType: syncproto.SyncerTypeFelix,
+			PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+				syncproto.CompressionZstd,
+			},
+		})
+		expectedEndState := h.SendInitialSnapshotPods(1000)
+		h.ExpectAllClientsToReachState(api.InSync, expectedEndState)
+		Expect(c.client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionZstd))
+	})
+
+	It("client should disconnect if the server picks an algorithm it didn't advertise", func() {
+		// A fake server that violates the negotiation contract: the client
+		// advertises snappy only, but the server names zstd in its
+		// MsgDecoderRestart.  The client must drop the connection without
+		// ACKing rather than decode with an algorithm it never offered.
+		log.SetLevel(log.InfoLevel)
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			_ = l.Close()
+		}()
+
+		serverDone := make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(serverDone)
+			conn, err := l.Accept()
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_ = conn.Close()
+			}()
+			dec := gob.NewDecoder(conn)
+			enc := gob.NewEncoder(conn)
+
+			var envelope syncproto.Envelope
+			Expect(dec.Decode(&envelope)).To(Succeed())
+			hello, ok := envelope.Message.(syncproto.MsgClientHello)
+			Expect(ok).To(BeTrue(), "expected client hello, got %#v", envelope.Message)
+			Expect(hello.SupportedCompressionAlgorithms).To(ConsistOf(syncproto.CompressionSnappy))
+
+			Expect(enc.Encode(syncproto.Envelope{Message: syncproto.MsgServerHello{
+				Version:                     "fake-server",
+				SyncerType:                  syncproto.SyncerTypeFelix,
+				SupportsNodeResourceUpdates: true,
+			}})).To(Succeed())
+			Expect(enc.Encode(syncproto.Envelope{Message: syncproto.MsgDecoderRestart{
+				Message:              "bogus switch",
+				CompressionAlgorithm: syncproto.CompressionZstd,
+			}})).To(Succeed())
+
+			// The client should hang up on us (read fails) without ACKing.
+			for {
+				var envelope syncproto.Envelope
+				if err := dec.Decode(&envelope); err != nil {
+					return
+				}
+				_, isAck := envelope.Message.(syncproto.MsgACK)
+				Expect(isAck).To(BeFalse(), "client ACKed a compression algorithm it didn't advertise")
+			}
+		}()
+
+		clientCxt, clientCancel := context.WithCancel(context.Background())
+		defer clientCancel()
+		recorder := NewRecorder()
+		client := syncclient.New(
+			discovery.New(discovery.WithAddrOverride(l.Addr().String())),
+			"test-version", "test-host", "test-info",
+			recorder,
+			&syncclient.Options{
+				SyncerType: syncproto.SyncerTypeFelix,
+				PreferredCompressionAlgorithmOrder: []syncproto.CompressionAlgorithm{
+					syncproto.CompressionSnappy,
+				},
+			},
+		)
+		Expect(client.Start(clientCxt)).To(Succeed())
+
+		// The client tears the connection down itself; both sides should
+		// finish without the test cancelling anything.
+		Eventually(serverDone, 10*time.Second).Should(BeClosed())
+		clientFinished := make(chan struct{})
+		go func() {
+			defer close(clientFinished)
+			client.Finished.Wait()
+		}()
+		Eventually(clientFinished, 10*time.Second).Should(BeClosed())
+		Expect(client.NegotiatedCompressionAlgorithm()).To(Equal(syncproto.CompressionAlgorithm("")))
 	})
 })
 
@@ -685,47 +970,9 @@ var _ = Describe("With an in-process Server with short ping timeout", func() {
 		// interval for the check to take place.
 		time.Sleep(1 * time.Second)
 
-		// Check that the client knows it can use node resource updates since the server supports it.
-		supportsNodeResourceUpdates, err := client.SupportsNodeResourceUpdates(10 * time.Second)
-		Expect(supportsNodeResourceUpdates).To(BeTrue())
-		Expect(err).To(BeNil())
-
 		// Then send an update.
 		h.FelixCache.OnStatusUpdated(api.InSync)
 		Eventually(recorder.Status).Should(Equal(api.InSync))
-	})
-
-	It("should return an error if client does not receive a server hello in time", func() {
-		// Start a real client, which will respond correctly to pings.
-		clientCxt, clientCancel := context.WithCancel(context.Background())
-		recorder := NewRecorder()
-
-		client := syncclient.New(
-			h.Discoverer(),
-			"test-version",
-			"test-host",
-			"test-info",
-			recorder,
-			nil,
-		)
-		err := client.Start(clientCxt)
-		recorderCtx, recorderCancel := context.WithCancel(context.Background())
-		defer recorderCancel()
-		go recorder.Loop(recorderCtx)
-		Expect(err).NotTo(HaveOccurred())
-		defer func() {
-			clientCancel()
-			client.Finished.Wait()
-		}()
-
-		// Kill the server
-		h.ServerCancel()
-		h.Server.Finished.Wait()
-
-		// Check that the client knows it can use node resource updates since the server supports it.
-		supportsNodeResourceUpdates, err := client.SupportsNodeResourceUpdates(0 * time.Second)
-		Expect(supportsNodeResourceUpdates).To(BeFalse())
-		Expect(err).NotTo(BeNil())
 	})
 
 	Describe("with a raw connection", func() {
@@ -782,10 +1029,31 @@ var _ = Describe("With an in-process Server with short ping timeout", func() {
 			BeforeEach(func() {
 				err := w.Encode(syncproto.Envelope{
 					Message: syncproto.MsgClientHello{
-						Hostname:   "me",
-						Version:    "test",
-						Info:       "test info",
-						SyncerType: syncproto.SyncerType("garbage"),
+						Hostname:                 "me",
+						Version:                  "test",
+						Info:                     "test info",
+						SyncerType:               syncproto.SyncerType("garbage"),
+						SupportsModernPolicyKeys: true,
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("should disconnect the client", func() {
+				expectDisconnection(100 * time.Millisecond)
+				expectGlobalGaugeValue("typha_connections_active", 0.0)
+			})
+		})
+
+		Describe("After sending Hello with no policy key support", func() {
+			BeforeEach(func() {
+				err := w.Encode(syncproto.Envelope{
+					Message: syncproto.MsgClientHello{
+						Hostname:                 "me",
+						Version:                  "test",
+						Info:                     "test info",
+						SyncerType:               syncproto.SyncerTypeFelix,
+						SupportsModernPolicyKeys: false,
 					},
 				})
 				Expect(err).NotTo(HaveOccurred())
@@ -817,9 +1085,10 @@ var _ = Describe("With an in-process Server with short ping timeout", func() {
 			BeforeEach(func() {
 				err := w.Encode(syncproto.Envelope{
 					Message: syncproto.MsgClientHello{
-						Hostname: "me",
-						Version:  "test",
-						Info:     "test info",
+						Hostname:                 "me",
+						Version:                  "test",
+						Info:                     "test info",
+						SupportsModernPolicyKeys: true,
 					},
 				})
 				Expect(err).NotTo(HaveOccurred())
@@ -963,9 +1232,7 @@ var _ = Describe("With an in-process Server with long ping interval", func() {
 })
 
 var _ = Describe("With an in-process Server with short grace period", func() {
-	var (
-		h *ServerHarness
-	)
+	var h *ServerHarness
 
 	BeforeEach(func() {
 		h = NewHarness()
@@ -974,8 +1241,12 @@ var _ = Describe("With an in-process Server with short grace period", func() {
 		h.Config.PingInterval = 10000 * time.Second
 		h.Config.PongTimeout = 50000 * time.Second
 
-		// Short timeouts so we can hit them quickly.
-		h.Config.MaxFallBehind = time.Second
+		// Short timeouts so we can hit them quickly.  MaxFallBehind is kept
+		// comfortably below the 1s spacing the tests use between breadcrumbs:
+		// the "grace used" check fires on crumbAge > MaxFallBehind, and a
+		// crumbAge manufactured to equal MaxFallBehind is a boundary coin-flip
+		// (a breadcrumb gap measured at 999.95ms once flaked the grace test).
+		h.Config.MaxFallBehind = 500 * time.Millisecond
 		h.Config.NewClientFallBehindGracePeriod = time.Second
 
 		// The snapshot is >10MB; set the write buffer to something much less than that since these
@@ -1035,10 +1306,11 @@ var _ = Describe("With an in-process Server with short grace period", func() {
 			origGaugeValue, err := getPerSyncerCounter(syncproto.SyncerTypeFelix, "typha_connections_grace_used")
 			Expect(err).NotTo(HaveOccurred())
 
-			// Make the client block after it reads the first update.  This means the server will have started
-			// streaming the snapshot but it shouldn't be able to finish streaming the snapshot.  Blocking for
-			// >1s wastes the MaxFallBehind timeout so this client will need to rely on the
-			// NewClientFallBehindGracePeriod, which should kick in only once we've finished reading the snapshot.
+			// Make the client block after it reads the first update, so it can't promptly finish reading
+			// the snapshot.  By the time it does and the server starts streaming deltas, the breadcrumb the
+			// client is on is more than MaxFallBehind old (the server's crumbAge > MaxFallBehind check).
+			// Rather than being cut off immediately, the client then relies on the
+			// NewClientFallBehindGracePeriod to catch up.
 			recorder.BlockAfterNUpdates(1, 2500*time.Millisecond)
 
 			client := syncclient.New(
@@ -1116,7 +1388,15 @@ var _ = Describe("With an in-process Server with short grace period", func() {
 				"test-host",
 				"test-info",
 				recorder,
-				nil,
+				&syncclient.Options{
+					// The kernel autotunes the receive buffer up to many MB, which
+					// can absorb the whole compressed backlog and prevent the
+					// backpressure this test relies on.  Pin it small, like the
+					// server's write buffer.
+					ReadBufferSize: 1024 * 256,
+					// Enable logging of every read since these tests depend on read and write timings.
+					DebugLogReads: true,
+				},
 			)
 			err = client.Start(clientCxt)
 			recorderCtx, recorderCancel := context.WithCancel(context.Background())
@@ -1128,8 +1408,11 @@ var _ = Describe("With an in-process Server with short grace period", func() {
 				client.Finished.Wait()
 			}()
 
-			// Wait until the snapshot is read.
-			Eventually(recorder.Len, time.Second).Should(BeNumerically("==", initialSnapshotSize))
+			// Wait until the snapshot is read.  Building the 10k-KV zstd
+			// snapshot alone can take about a second under the race detector.
+			// The grace period starts only once the snapshot is sent, so a
+			// longer wait here does not change what the test checks.
+			Eventually(recorder.Len, 10*time.Second).Should(BeNumerically("==", initialSnapshotSize))
 
 			// Send a lot of updates.
 
@@ -1175,9 +1458,7 @@ var _ = Describe("With an in-process Server with short grace period", func() {
 })
 
 var _ = Describe("With an in-process Server with short write timeout", func() {
-	var (
-		h *ServerHarness
-	)
+	var h *ServerHarness
 
 	BeforeEach(func() {
 		// Default to debug but some more aggressive tests override this below.
@@ -1234,7 +1515,6 @@ var _ = Describe("With an in-process Server with short write timeout", func() {
 		})
 
 		for _, disabledDecoderRestart := range []bool{true, false} {
-			disabledDecoderRestart := disabledDecoderRestart
 			It(fmt.Sprintf("client (DisabledDecoderRestart=%v) that blocks while reading snapshot should get disconnected", disabledDecoderRestart),
 				func() {
 					clientCxt, clientCancel := context.WithCancel(context.Background())
@@ -1320,10 +1600,51 @@ func getPerSyncerCounter(syncer syncproto.SyncerType, name string) (float64, err
 	return m.GetCounter().GetValue(), nil
 }
 
-func expectPerSyncerGaugeValue(syncer syncproto.SyncerType, name string, value float64) {
+func expectPerSyncerCompressionGaugeValue(
+	syncer syncproto.SyncerType,
+	alg syncproto.CompressionAlgorithm,
+	name string,
+	value float64,
+) {
 	EventuallyWithOffset(1, func() (float64, error) {
-		return getPerSyncerGauge(syncer, name)
+		return getPerSyncerCompressionGauge(syncer, alg, name)
 	}).Should(Equal(value))
+}
+
+func getPerSyncerCompressionGauge(
+	syncer syncproto.SyncerType,
+	alg syncproto.CompressionAlgorithm,
+	name string,
+) (float64, error) {
+	m, err := getLabelledMetric(name, map[string]string{
+		"syncer":      string(syncer),
+		"compression": alg.MetricLabelValue(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if m == nil {
+		return 0, nil
+	}
+	return m.GetGauge().GetValue(), nil
+}
+
+func getPerSyncerCompressionSummaryCount(
+	syncer syncproto.SyncerType,
+	alg syncproto.CompressionAlgorithm,
+	name string,
+) (uint64, error) {
+	m, err := getLabelledMetric(name, map[string]string{
+		"syncer":      string(syncer),
+		"compression": alg.MetricLabelValue(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if m == nil {
+		return 0, nil
+	}
+	return m.GetSummary().GetSampleCount(), nil
 }
 
 func getPerSyncerGauge(syncer syncproto.SyncerType, name string) (float64, error) {
@@ -1337,23 +1658,39 @@ func getPerSyncerGauge(syncer syncproto.SyncerType, name string) (float64, error
 	return m.GetGauge().GetValue(), nil
 }
 
+// getPerSyncerMetric returns the first series of the named metric that has a
+// matching "syncer" label.  Beware: for metrics that also have a
+// "compression" label, the choice of series is arbitrary — use
+// getLabelledMetric for those.
 func getPerSyncerMetric(name string, syncer syncproto.SyncerType) (*io_prometheus_client.Metric, error) {
+	return getLabelledMetric(name, map[string]string{"syncer": string(syncer)})
+}
+
+// getLabelledMetric returns the first series of the named metric whose labels
+// include all of the given label values.  It returns nil if the metric exists
+// but no series matches.
+func getLabelledMetric(name string, labels map[string]string) (*io_prometheus_client.Metric, error) {
 	mfs, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
 		return nil, err
 	}
 	for _, mf := range mfs {
-		if mf.GetName() == name {
-			for _, m := range mf.Metric {
-				for _, l := range m.Label {
-					if l.GetName() == "syncer" && l.GetValue() == string(syncer) {
-						return m, nil
-					}
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.Metric {
+			matched := 0
+			for _, l := range m.Label {
+				if v, ok := labels[l.GetName()]; ok && v == l.GetValue() {
+					matched++
 				}
 			}
-			// Found the metric but no value for that syncer yet.
-			return nil, nil
+			if matched == len(labels) {
+				return m, nil
+			}
 		}
+		// Found the metric but no series with those labels yet.
+		return nil, nil
 	}
 	return nil, errors.New("metric not found")
 }
@@ -1367,9 +1704,16 @@ const (
 	serverURISAN = "spiffe://k8s.example.com/typha-server"
 )
 
-var _ = Describe("with server requiring TLS", func() {
-	var certDir string
+var certDir string
 
+var _ = AfterSuite(func() {
+	// Remove TLS keys and certificates.
+	if certDir != "" {
+		_ = os.RemoveAll(certDir)
+	}
+})
+
+var _ = Describe("with server requiring TLS", func() {
 	BeforeEach(func() {
 		// Generating certs is expensive, so we defer it until this BeforeEach and then reuse the certs for all the
 		// tests.
@@ -1424,13 +1768,6 @@ var _ = Describe("with server requiring TLS", func() {
 		clientCert, clientKey = tlsutils.MakePeerCert(clientCN, clientURISAN, x509.ExtKeyUsageClientAuth, untrustedCert, untrustedKey)
 		tlsutils.WriteKey(clientKey, filepath.Join(certDir, "client-untrusted.key"))
 		tlsutils.WriteCert(clientCert, filepath.Join(certDir, "client-untrusted.crt"))
-	})
-
-	var _ = AfterSuite(func() {
-		// Remove TLS keys and certificates.
-		if certDir != "" {
-			_ = os.RemoveAll(certDir)
-		}
 	})
 
 	// We'll create this pipeline for updates to flow through:
@@ -1535,7 +1872,6 @@ var _ = Describe("with server requiring TLS", func() {
 	})
 
 	testConnection := func(clientCertName string, expectConnection bool) {
-
 		var options *syncclient.Options = nil
 		if clientCertName != "" {
 			options = &syncclient.Options{
@@ -1589,7 +1925,6 @@ var _ = Describe("with server requiring TLS", func() {
 
 		if !expectConnection {
 			// Client connection should have failed, so should not have got any updates.
-			Consistently(clientState.recorder.Status).Should(Equal(api.SyncStatus(0)))
 			Consistently(clientState.recorder.KVs).Should(Equal(map[string]api.Update{}))
 		}
 	}
@@ -1767,5 +2102,4 @@ var _ = Describe("with server requiring TLS", func() {
 			Eventually(server.NumActiveConnections).Should(Equal(0))
 		})
 	})
-
 })

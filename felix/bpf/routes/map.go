@@ -72,14 +72,18 @@ func (k Key) AsBytes() []byte {
 type Flags uint32
 
 const (
-	FlagInIPAMPool  Flags = 0x01
-	FlagNATOutgoing Flags = 0x02
-	FlagWorkload    Flags = 0x04
-	FlagLocal       Flags = 0x08
-	FlagHost        Flags = 0x10
-	FlagSameSubnet  Flags = 0x20
-	FlagTunneled    Flags = 0x40
-	FlagNoDSR       Flags = 0x80
+	FlagInIPAMPool       Flags = 0x01
+	FlagNATOutgoing      Flags = 0x02
+	FlagWorkload         Flags = 0x04
+	FlagLocal            Flags = 0x08
+	FlagHost             Flags = 0x10
+	FlagSameSubnet       Flags = 0x20
+	FlagTunneled         Flags = 0x40
+	FlagNoDSR            Flags = 0x80
+	FlagBlackHoleDrop    Flags = 0x100
+	FlagBlackHoleReject  Flags = 0x200
+	FlagVXLAN            Flags = 0x400
+	FlagSkipIngressRedir Flags = 0x800
 
 	FlagsUnknown            Flags = 0
 	FlagsRemoteWorkload           = FlagWorkload
@@ -91,6 +95,43 @@ const (
 
 	_ = FlagsUnknown
 )
+
+// FlagNames returns the human-readable names for the set bits in f.
+// The result is similar to Value.String() but returns a slice instead
+// of a single formatted string, and additionally includes FlagVXLAN.
+func (f Flags) FlagNames() []string {
+	var names []string
+
+	if f&FlagLocal != 0 {
+		names = append(names, "local")
+	} else if f&FlagBlackHoleDrop == 0 && f&FlagBlackHoleReject == 0 {
+		names = append(names, "remote")
+	}
+	if f&FlagHost != 0 {
+		names = append(names, "host")
+	} else if f&FlagWorkload != 0 {
+		names = append(names, "workload")
+	}
+	for _, pair := range []struct {
+		flag Flags
+		name string
+	}{
+		{FlagInIPAMPool, "in-pool"},
+		{FlagNATOutgoing, "nat-out"},
+		{FlagSameSubnet, "same-subnet"},
+		{FlagNoDSR, "no-dsr"},
+		{FlagTunneled, "tunneled"},
+		{FlagVXLAN, "vxlan"},
+		{FlagSkipIngressRedir, "skip-ingress-redir"},
+		{FlagBlackHoleDrop, "blackhole-drop"},
+		{FlagBlackHoleReject, "blackhole-reject"},
+	} {
+		if f&pair.flag != 0 {
+			names = append(names, pair.name)
+		}
+	}
+	return names
+}
 
 //	struct cali_rt_value {
 //	  __u32 flags;
@@ -136,7 +177,7 @@ func (v Value) String() string {
 
 	if typeFlags&FlagLocal != 0 {
 		parts = append(parts, "local")
-	} else {
+	} else if typeFlags&FlagBlackHoleDrop == 0 && typeFlags&FlagBlackHoleReject == 0 {
 		parts = append(parts, "remote")
 	}
 
@@ -166,12 +207,24 @@ func (v Value) String() string {
 		parts = append(parts, "tunneled")
 	}
 
+	if typeFlags&FlagSkipIngressRedir != 0 {
+		parts = append(parts, "skip-ingress-redir")
+	}
+
 	if typeFlags&FlagLocal != 0 && typeFlags&FlagWorkload != 0 {
 		parts = append(parts, "idx", fmt.Sprint(v.IfaceIndex()))
 	}
 
 	if typeFlags&FlagLocal == 0 && typeFlags&FlagWorkload != 0 {
 		parts = append(parts, "nh", fmt.Sprint(v.NextHop()))
+	}
+
+	if typeFlags&FlagBlackHoleDrop != 0 {
+		parts = append(parts, "blackhole-drop")
+	}
+
+	if typeFlags&FlagBlackHoleReject != 0 {
+		parts = append(parts, "blackhole-reject")
 	}
 
 	if len(parts) == 0 {

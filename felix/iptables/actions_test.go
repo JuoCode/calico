@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,16 @@
 package iptables_test
 
 import (
-	"github.com/projectcalico/calico/felix/environment"
-	. "github.com/projectcalico/calico/felix/iptables"
-
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
+	. "github.com/projectcalico/calico/felix/iptables"
 )
 
 var _ = DescribeTable("Actions",
-	func(features environment.Features, action Action, expRendering string) {
+	func(features environment.Features, action generictables.Action, expRendering string) {
 		Expect(action.ToFragment(&features)).To(Equal(expRendering))
 	},
 	Entry("GotoAction", environment.Features{}, GotoAction{Target: "cali-abcd"}, "--goto cali-abcd"),
@@ -36,7 +37,9 @@ var _ = DescribeTable("Actions",
 	Entry("SNATAction", environment.Features{}, SNATAction{ToAddr: "10.0.0.1"}, "--jump SNAT --to-source 10.0.0.1"),
 	Entry("SNATAction fully random", environment.Features{SNATFullyRandom: true}, SNATAction{ToAddr: "10.0.0.1"}, "--jump SNAT --to-source 10.0.0.1 --random-fully"),
 	Entry("MasqAction", environment.Features{}, MasqAction{}, "--jump MASQUERADE"),
+	Entry("MasqAction", environment.Features{}, MasqAction{ToPorts: "32768-65535"}, "--jump MASQUERADE --to-ports 32768-65535"),
 	Entry("MasqAction", environment.Features{MASQFullyRandom: true}, MasqAction{}, "--jump MASQUERADE --random-fully"),
+	Entry("MasqAction", environment.Features{MASQFullyRandom: true}, MasqAction{ToPorts: "32768-65535"}, "--jump MASQUERADE --to-ports 32768-65535 --random-fully"),
 	Entry("ClearMarkAction", environment.Features{}, ClearMarkAction{Mark: 0x1000}, "--jump MARK --set-mark 0/0x1000"),
 	Entry("SetMarkAction", environment.Features{}, SetMarkAction{Mark: 0x1000}, "--jump MARK --set-mark 0x1000/0x1000"),
 	Entry("SetMaskedMarkAction", environment.Features{}, SetMaskedMarkAction{
@@ -47,4 +50,16 @@ var _ = DescribeTable("Actions",
 	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{RestoreMask: 0x100}, "--jump CONNMARK --restore-mark --mask 0x100"),
 	Entry("SaveConnMarkAction", environment.Features{}, SaveConnMarkAction{}, "--jump CONNMARK --save-mark --mask 0xffffffff"),
 	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{}, "--jump CONNMARK --restore-mark --mask 0xffffffff"),
+	Entry("LimitPacketRateAction", environment.Features{}, LimitPacketRateAction{Rate: 1000, Burst: 5, Mark: 0x200}, "-m limit --limit 1000/sec --limit-burst 5 --jump MARK --set-mark 0x200/0x200"),
+	Entry("LimitNumConnectionsAction", environment.Features{}, LimitNumConnectionsAction{Num: 10, RejectWith: generictables.RejectWithTCPReset}, "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 10 --connlimit-mask 0 -j REJECT --reject-with tcp-reset"),
+	Entry("DSCPAction", environment.Features{}, DSCPAction{Value: 0}, "--jump DSCP --set-dscp 0"),
+	Entry("DSCPAction", environment.Features{}, DSCPAction{Value: 20}, "--jump DSCP --set-dscp 20"),
 )
+
+var _ = Describe("FlowOffload", func() {
+	It("panics in iptables mode; flowtable offload is nftables-only", func() {
+		Expect(func() {
+			Actions().FlowOffload()
+		}).To(Panic())
+	})
+})

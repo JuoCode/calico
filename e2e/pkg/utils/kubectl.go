@@ -1,0 +1,114 @@
+// Copyright (c) 2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package utils
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/onsi/gomega"
+	"k8s.io/kubernetes/test/e2e/framework/kubectl"
+)
+
+// Kubectl is a wrapper around kubectl commands used in tests. Note that this helper is
+// NOT meant to be used for general resource CRUD operations, for that use the client in
+// pkg/utils/client.
+type Kubectl struct{}
+
+func (k *Kubectl) Logs(ns, label, user string) (string, error) {
+	options := []string{"logs"}
+	if user != "" {
+		options = append(options, fmt.Sprintf("--as=%v", user))
+	}
+	if label != "" {
+		options = append(options, fmt.Sprintf("-l %s", label))
+	}
+
+	output, err := kubectl.NewKubectlCommand(ns, options...).Exec()
+	return output, err
+}
+
+func (k *Kubectl) Wait(kind, ns, name, user, condition string, timeout time.Duration) error {
+	options := []string{"wait", kind, name, "--for", condition, "--timeout", timeout.String()}
+	if user != "" {
+		options = append(options, fmt.Sprintf("--as=%v", user))
+	}
+	_, err := kubectl.NewKubectlCommand(ns, options...).Exec()
+	return err
+}
+
+// PortForward starts a kubectl port-forward in the background, allocating a random
+// local port to avoid conflicts when tests run in parallel. It returns the local port.
+// kubectl port-forward exits on the first refused connection, so it is re-spawned
+// until the caller signals shutdown via timeOut; a connection refused while a pod is
+// still starting no longer strands the caller with a dead local port.
+func (k *Kubectl) PortForward(ns, pod, remotePort, user string, timeOut chan time.Time) (int, error) {
+	localPort, err := getFreePort()
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate local port: %w", err)
+	}
+
+	options := []string{"port-forward", pod, fmt.Sprintf("%d:%s", localPort, remotePort)}
+	if user != "" {
+		options = append(options, fmt.Sprintf("--as=%v", user))
+	}
+
+	go func() {
+		for {
+			select {
+			case <-timeOut:
+				return
+			default:
+			}
+			if _, err := kubectl.NewKubectlCommand(ns, options...).WithTimeout(timeOut).Exec(); err != nil {
+				// Back off before re-spawning so a persistent failure does not
+				// busy-loop; return promptly when the caller signals shutdown.
+				select {
+				case <-timeOut:
+					return
+				case <-time.After(time.Second):
+				}
+			}
+		}
+	}()
+	return localPort, nil
+}
+
+// WaitForPortForward polls the URL until the forwarded connection serves a response,
+// so callers do not race a proxy Pod that is Ready but not yet serving traffic.
+func (k *Kubectl) WaitForPortForward(httpClient *http.Client, url string) {
+	gomega.Eventually(func() error {
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, err = io.ReadAll(resp.Body)
+		return err
+	}, 2*time.Minute, 500*time.Millisecond).Should(gomega.Succeed(), "timed out waiting for port-forward to %s to be ready", url)
+}
+
+func getFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port, nil
+}

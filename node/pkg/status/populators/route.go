@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,10 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/table"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/olekukonko/tablewriter"
-
 	log "github.com/sirupsen/logrus"
 )
 
@@ -321,10 +319,11 @@ func (b BirdRoutes) Populate(status *apiv3.CalicoNodeStatus) error {
 		// If it is a connection error, e.g. BGP is not enabled,
 		// set empty status.
 		if _, ok := err.(ErrorSocketConnection); ok {
+			// Clear only this family, since the other family's populator may already have filled its own routes.
 			if b.ipv == IPFamilyV4 {
-				status.Status.Routes = apiv3.CalicoNodeBGPRouteStatus{}
+				status.Status.Routes.RoutesV4 = nil
 			} else {
-				status.Status.Routes = apiv3.CalicoNodeBGPRouteStatus{}
+				status.Status.Routes.RoutesV6 = nil
 			}
 			return nil
 		}
@@ -372,23 +371,15 @@ func (b BirdRoutes) Show() {
 
 // printRoutes prints out the slice of route in table format.
 func printRoutes(routes []route, out io.Writer) {
-	table := tablewriter.NewWriter(out)
-	table.SetHeader([]string{"Destination", "Gateway", "Iface", "LearnedFrom", "primary"})
-
+	t := table.NewWriter()
+	t.SetOutputMirror(out)
+	t.AppendHeader(table.Row{"Destination", "Gateway", "Iface", "LearnedFrom", "primary"})
 	for _, r := range routes {
 		var primary string
 		if r.primary {
 			primary = "*"
 		}
-		row := []string{
-			r.dest,
-			r.gateway,
-			r.iface,
-			r.learnedFrom,
-			primary,
-		}
-		table.Append(row)
+		t.AppendRow(table.Row{r.dest, r.gateway, r.iface, r.learnedFrom, primary})
 	}
-
-	table.Render()
+	t.Render()
 }

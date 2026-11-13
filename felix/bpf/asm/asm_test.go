@@ -129,6 +129,61 @@ func TestSkipUnreachable(t *testing.T) {
 	}))
 }
 
+func TestSkipUnreachableReusedLabel(t *testing.T) {
+	RegisterTestingT(t)
+	b := NewBlock(false)
+
+	b.JumpEq64(R1, R2, "exit")
+	b.Jump("end")
+	// Reachable: the JumpEq64 targets it.
+	b.LabelNextInsn("exit")
+	b.Exit()
+	// Reachable: the Jump targets it.
+	b.LabelNextInsn("end")
+	b.Exit()
+	// Unreachable: "exit" was used before but nothing jumps here now.
+	b.LabelNextInsn("exit")
+	b.MovImm64(R0, 2)
+	b.Exit()
+
+	insns, err := b.Assemble()
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(insns).To(Equal(Insns{
+		MakeInsn(JumpEq64, 1, 2, 1, 0),
+		MakeInsn(JumpA, 0, 0, 1, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	}))
+}
+
+func TestReusedLabelWithPendingJump(t *testing.T) {
+	RegisterTestingT(t)
+	b := NewBlock(false)
+
+	b.JumpEq64(R1, R2, "target")
+	b.Exit()
+	b.LabelNextInsn("target")
+	b.JumpEq64(R1, R2, "target")
+	b.Exit()
+	// Reachable: the second JumpEq64 targets this placement of the label.
+	Expect(b.HasPendingJumps("target")).To(BeTrue())
+	b.LabelNextInsn("target")
+	Expect(b.HasPendingJumps("target")).To(BeFalse())
+	b.Exit()
+
+	insns, err := b.Assemble()
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(insns).To(Equal(Insns{
+		MakeInsn(JumpEq64, 1, 2, 1, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+		MakeInsn(JumpEq64, 1, 2, 1, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	}))
+}
+
 func TestLongJump(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -165,7 +220,7 @@ func TestJumpBackwardsTooFar(t *testing.T) {
 	// Subtract one because the jump is relative to the instruction
 	// after the jump itself.
 	safeNumInsns := -math.MinInt16 - 1
-	for i := 0; i < safeNumInsns; i++ {
+	for range safeNumInsns {
 		b.NoOp()
 	}
 	b.JumpEq32(R0, R1, "label")
@@ -187,6 +242,26 @@ func TestJumpBackwardsTooFar(t *testing.T) {
 	Expect(err).To(HaveOccurred())
 }
 
+func TestTrampolineKeepsJumpPending(t *testing.T) {
+	RegisterTestingT(t)
+	b := NewBlock(false)
+	b.SetTrampolineStride(10)
+
+	b.JumpEq64(R1, R2, "target")
+	for range 20 {
+		b.Mov64(R1, R2)
+	}
+	// A trampoline placed "target" and jumps on to it from there.
+	Expect(b.labelToInsnIdx).To(HaveKey("target"))
+	Expect(b.HasPendingJumps("target")).To(BeTrue())
+	b.LabelNextInsn("target")
+	b.Exit()
+
+	insns, err := b.Assemble()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(CheckCFG(insns)).To(Succeed())
+}
+
 func TestSingleTrampoline(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -196,7 +271,7 @@ func TestSingleTrampoline(t *testing.T) {
 	// a trampoline.
 	b.JumpEq64(R1, R2, "longB")
 	b.JumpEq64(R1, R2, "longA")
-	for i := 0; i < trampolineInterval; i++ {
+	for range TrampolineStrideDefault {
 		b.NoOp()
 	}
 
@@ -214,7 +289,7 @@ func TestSingleTrampoline(t *testing.T) {
 	// Calculate where the trampoline should be.  We sort the jumps within
 	// the trampoline for determinacy so longA will be before longB.
 	const (
-		trampolineStartAddr = trampolineInterval + iota
+		trampolineStartAddr = TrampolineStrideDefault + iota
 		longATrampolineAddr
 		longBTrampolineAddr
 		trampolineEndAddr
@@ -227,7 +302,7 @@ func TestSingleTrampoline(t *testing.T) {
 	Expect(insns[jumpToAAddr]).To(Equal(MakeInsn(JumpEq64, R1, R2, longATrampolineAddr-jumpToAAddr-1, 0)))
 
 	noOp := MakeInsn(Mov64, R0, R0, 0, 0)
-	for i := 2; i < trampolineInterval-1; i++ {
+	for i := 2; i < TrampolineStrideDefault-1; i++ {
 		Expect(insns[i]).To(Equal(noOp))
 	}
 
@@ -259,7 +334,7 @@ func TestTrampolineLoadImm64(t *testing.T) {
 	// a trampoline.
 	b.JumpEq64(R1, R2, "longB")
 	b.JumpEq64(R1, R2, "longA")
-	for i := 0; i < trampolineInterval-3; i++ {
+	for range TrampolineStrideDefault - 3 {
 		b.NoOp()
 	}
 	b.LoadImm64(R3, 1234)
@@ -281,7 +356,7 @@ func TestTrampolineLoadImm64(t *testing.T) {
 	// Calculate where the trampoline should be.  We sort the jumps within
 	// the trampoline for determinacy so longA will be before longB.
 	const (
-		trampolineStartAddr = trampolineInterval + 1 + iota
+		trampolineStartAddr = TrampolineStrideDefault + 1 + iota
 		longBTrampolineAddr
 		trampolineEndAddr
 	)
@@ -293,7 +368,7 @@ func TestTrampolineLoadImm64(t *testing.T) {
 	Expect(insns[jumpToAAddr]).To(Equal(MakeInsn(JumpEq64, R1, R2, trampolineStartAddr-jumpToAAddr-1, 0)))
 
 	noOp := MakeInsn(Mov64, R0, R0, 0, 0)
-	for i := 2; i < trampolineInterval-1; i++ {
+	for i := 2; i < TrampolineStrideDefault-1; i++ {
 		Expect(insns[i]).To(Equal(noOp))
 	}
 
@@ -319,7 +394,7 @@ func TestShortJumpAndTrampoline(t *testing.T) {
 	b.JumpEq64(R1, R2, "shortA")
 	b.JumpEq64(R1, R2, "longA")
 	b.LabelNextInsn("shortA")
-	for i := 0; i < trampolineInterval; i++ {
+	for range TrampolineStrideDefault {
 		b.NoOp()
 	}
 
@@ -335,7 +410,7 @@ func TestShortJumpAndTrampoline(t *testing.T) {
 	// Calculate where the trampoline should be.  We sort the jumps within
 	// the trampoline for determinacy so longA will be before longB.
 	const (
-		trampolineStartAddr = trampolineInterval + iota
+		trampolineStartAddr = TrampolineStrideDefault + iota
 		longATrampolineAddr
 		trampolineEndAddr
 	)
@@ -348,7 +423,7 @@ func TestShortJumpAndTrampoline(t *testing.T) {
 	Expect(insns[jumpToLong]).To(Equal(MakeInsn(JumpEq64, R1, R2, longATrampolineAddr-jumpToLong-1, 0)))
 
 	noOp := MakeInsn(Mov64, R0, R0, 0, 0)
-	for i := 2; i < trampolineInterval-1; i++ {
+	for i := 2; i < TrampolineStrideDefault-1; i++ {
 		Expect(insns[i]).To(Equal(noOp))
 	}
 
@@ -376,7 +451,7 @@ func TestDoubleTrampoline(t *testing.T) {
 	// a trampoline.
 	b.JumpEq64(R1, R2, "longB")
 	b.JumpEq64(R1, R2, "longA")
-	for i := 0; i < trampolineInterval; i++ {
+	for range TrampolineStrideDefault {
 		b.NoOp()
 	}
 
@@ -385,7 +460,7 @@ func TestDoubleTrampoline(t *testing.T) {
 	b.JumpEq64(R1, R2, "longA")
 	b.JumpEq64(R1, R3, "longC")
 
-	for i := 0; i < trampolineInterval; i++ {
+	for range TrampolineStrideDefault {
 		b.NoOp()
 	}
 
@@ -405,7 +480,7 @@ func TestDoubleTrampoline(t *testing.T) {
 	// Calculate where the trampolines should be.  We sort the jumps within
 	// the trampoline for determinacy so longA will be before longB.
 	const (
-		trampoline0StartAddr = trampolineInterval + iota
+		trampoline0StartAddr = TrampolineStrideDefault + iota
 		longATrampoline0Addr
 		longBTrampoline0Addr
 		trampoline0EndAddr
@@ -415,7 +490,7 @@ func TestDoubleTrampoline(t *testing.T) {
 		jumpToAAddr
 	)
 	const (
-		trampoline1StartAddr = trampolineInterval*2 + iota
+		trampoline1StartAddr = TrampolineStrideDefault*2 + iota
 		longATrampoline1Addr
 		longBTrampoline1Addr
 		longCTrampoline1Addr
@@ -433,7 +508,7 @@ func TestDoubleTrampoline(t *testing.T) {
 	Expect(insns[jumpToBAddr]).To(Equal(MakeInsn(JumpEq64, R1, R2, longBTrampoline0Addr-jumpToBAddr-1, 0)))
 	Expect(insns[jumpToAAddr]).To(Equal(MakeInsn(JumpEq64, R1, R2, longATrampoline0Addr-jumpToAAddr-1, 0)))
 	noOp := MakeInsn(Mov64, R0, R0, 0, 0)
-	for i := 2; i < trampolineInterval-1; i++ {
+	for i := 2; i < TrampolineStrideDefault-1; i++ {
 		Expect(insns[i]).To(Equal(noOp))
 	}
 
@@ -496,4 +571,45 @@ func logSummarisingNoOps(t *testing.T, insns Insns) {
 		}
 		t.Log(fmt.Sprintf("%d:", i), insn)
 	}
+}
+
+func TestCheckCFG(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(CheckCFG(Insns{
+		MakeInsn(JumpEq64, 1, 2, 3, 0),
+		MakeInsn(LoadImm64, 1, 0, 0, 0),
+		MakeInsn(LoadImm64Pt2, 0, 0, 0, 0),
+		MakeInsn(Call, 0, 0, 0, 12),
+		MakeInsn(MovImm64, 0, 0, 0, 2),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	})).To(Succeed())
+
+	Expect(CheckCFG(Insns{
+		MakeInsn(JumpEq64, 1, 2, 2, 0),
+		MakeInsn(LoadImm64, 1, 0, 0, 0),
+		MakeInsn(LoadImm64Pt2, 0, 0, 0, 0),
+		MakeInsn(Call, 0, 0, 0, 12),
+		MakeInsn(JumpA, 0, 0, 1, 0),
+		MakeInsn(MovImm64, 0, 0, 0, 2),
+		MakeInsn(Exit, 0, 0, 0, 0),
+		MakeInsn(MovImm64, 0, 0, 0, 2),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	})).To(MatchError("unreachable insns [5 7 8]"))
+
+	Expect(CheckCFG(Insns{
+		MakeInsn(JumpEq64, 1, 2, 5, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	})).To(MatchError("jump out of range from insn 0 to 6"))
+
+	Expect(CheckCFG(Insns{
+		MakeInsn(JumpEq64, 1, 2, 1, 0),
+		MakeInsn(LoadImm64, 1, 0, 0, 0),
+		MakeInsn(LoadImm64Pt2, 0, 0, 0, 0),
+		MakeInsn(Exit, 0, 0, 0, 0),
+	})).To(MatchError("jump from insn 0 into the middle of LoadImm64 insn 1"))
+
+	Expect(CheckCFG(Insns{
+		MakeInsn(MovImm64, 0, 0, 0, 2),
+	})).To(MatchError("jump out of range from insn 0 to 1"))
 }

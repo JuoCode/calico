@@ -1,0 +1,558 @@
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ippool
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
+	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	uruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+
+	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
+	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/accounting"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+)
+
+const (
+	IPPoolFinalizer = "projectcalico.org/ippool-finalizer"
+
+	// maxRetries is how many times a failed reconcile is retried before we fall back
+	// to the informer resync in run.go.
+	maxRetries = 5
+
+	// reconcileKey is the single workqueue key this controller uses. Overlap detection is global
+	// across all pools, so there is nothing to gain from per-pool keys.
+	reconcileKey = "reconcile"
+
+	// utilizationDelay collapses block and reservation churn into at most one reconcile per interval.
+	utilizationDelay = 5 * time.Second
+)
+
+// IPPoolController is responsible for watching IPPool and IPAMBlock resources and managing the finalization / deletion
+// of IP pools. when a new IP pool is added, it ensures a finalizer is added to it. When an IP pool is deleted, it ensures that all
+// associated IPAM blocks are released before allowing the pool to be fully deleted.
+type IPPoolController struct {
+	ctx context.Context
+
+	poolInformer cache.SharedIndexInformer
+
+	// tracker is the process's shared IPAM accounting, kept current by the data feed. Its counts are partial until
+	// inSync.
+	tracker *accounting.Tracker
+	inSync  atomic.Bool
+
+	// handlersSynced reports when the pool handler and the data feed have each delivered their initial state.
+	handlersSynced []cache.InformerSynced
+
+	cli   clientset.Interface
+	ipam  ipam.Interface
+	queue workqueue.TypedRateLimitingInterface[string]
+}
+
+func NewController(
+	ctx context.Context,
+	cli clientset.Interface,
+	poolInformer cache.SharedIndexInformer,
+	dataFeed *utils.DataFeed,
+	tracker *accounting.Tracker,
+	ipam ipam.Interface,
+) controller.Controller {
+	c := &IPPoolController{
+		ctx:          ctx,
+		cli:          cli,
+		poolInformer: poolInformer,
+		tracker:      tracker,
+		ipam:         ipam,
+		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+
+	poolReg, err := poolInformer.AddEventHandler(c.poolHandlers())
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to register event handler for IPPool")
+	}
+	dataFeed.RegisterForSyncStatus(c.onStatusUpdate)
+	dataFeed.RegisterForNotification(model.BlockKey{}, c.onBlockUpdate)
+	dataFeed.RegisterForNotification(model.ResourceKey{}, c.onResourceUpdate)
+	c.handlersSynced = []cache.InformerSynced{poolReg.HasSynced, c.inSync.Load}
+
+	return c
+}
+
+// poolHandlers enqueue the sentinel key, letting the workqueue collapse bursts into one pass.
+func (c *IPPoolController) poolHandlers() cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { c.queue.Add(reconcileKey) },
+		UpdateFunc: func(_, _ any) { c.queue.Add(reconcileKey) },
+		DeleteFunc: func(any) { c.queue.Add(reconcileKey) },
+	}
+}
+
+// The data feed handlers run on the syncer goroutine, after the IPAMFeed has applied the same update to the tracker.
+func (c *IPPoolController) onStatusUpdate(status bapi.SyncStatus) {
+	c.inSync.Store(status == bapi.InSync)
+	if status == bapi.InSync {
+		c.queue.Add(reconcileKey)
+	}
+}
+
+func (c *IPPoolController) onBlockUpdate(update bapi.Update) {
+	if update.Value == nil {
+		// Block deletions can unblock finalization of a deleting pool, so reconcile straight away.
+		c.queue.Add(reconcileKey)
+		return
+	}
+	c.queue.AddAfter(reconcileKey, utilizationDelay)
+}
+
+func (c *IPPoolController) onResourceUpdate(update bapi.Update) {
+	key, ok := update.Key.(model.ResourceKey)
+	if !ok {
+		return
+	}
+	switch key.Kind {
+	case v3.KindIPPool:
+		// The tracker sees a pool's new status here, which can lag the informer's copy.
+		c.queue.Add(reconcileKey)
+	case v3.KindIPReservation:
+		c.queue.AddAfter(reconcileKey, utilizationDelay)
+	}
+}
+
+// Run starts the IP pool controller. It does start-of-day preparation
+// and then launches worker threads.
+func (c *IPPoolController) Run(stopCh chan struct{}) {
+	defer uruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	logrus.Info("Starting IPPool controller")
+
+	// The first reconcile waits for the tracker's full state, or it would undercount a pool and drop its nearly-full
+	// condition, or finalize a pool whose blocks it has yet to see.
+	logrus.Debug("Waiting to sync with Kubernetes API")
+	if !cache.WaitForNamedCacheSync("pools", stopCh, c.handlersSynced...) {
+		logrus.Info("Failed to sync resources, received signal for controller to shut down.")
+		return
+	}
+
+	logrus.Debug("Finished syncing with Kubernetes API")
+
+	// Run once against a consistent view of both caches now that they are synced.
+	c.queue.Add(reconcileKey)
+
+	go wait.Until(c.runWorker, time.Second, stopCh)
+
+	<-stopCh
+	logrus.Info("Stopping IPPool controller")
+}
+
+func (c *IPPoolController) runWorker() {
+	for c.processNextItem() {
+	}
+}
+
+func (c *IPPoolController) processNextItem() bool {
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+	defer c.queue.Done(key)
+
+	err := c.reconcile()
+	c.handleErr(err, key)
+	return true
+}
+
+func (c *IPPoolController) handleErr(err error, key string) {
+	if err == nil {
+		c.queue.Forget(key)
+		return
+	}
+	if c.queue.NumRequeues(key) < maxRetries {
+		logrus.WithError(err).Warning("Error reconciling IP pools, will retry")
+		c.queue.AddRateLimited(key)
+		return
+	}
+	c.queue.Forget(key)
+	logrus.WithError(err).Error("Dropping IP pool reconcile out of queue after max retries")
+}
+
+// reconcile derives the desired state for every pool. Overlap detection is global, so a single
+// pass covers all pools rather than keying off whichever pool triggered the event.
+func (c *IPPoolController) reconcile() error {
+	var errs []error
+
+	// Conditions first: whether a pool is allocatable decides whether it should carry a finalizer.
+	pools, err := c.reconcileConditions(c.ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if !c.inSync.Load() {
+		logrus.Debug("IPAM data feed not in sync; leaving AddressSpaceNearlyFull for now")
+	} else if !c.trackerAgreesOnOverlap(pools) {
+		// The tracker learns of a CIDROverlap change from the data feed, which can lag the informer, and until then
+		// credits blocks to the wrong pool. The feed's update queues the next pass.
+		logrus.Debug("Tracker has yet to see a CIDROverlap change; leaving AddressSpaceNearlyFull to the next pass")
+	} else if err := c.reconcileNearlyFull(c.ctx, pools); err != nil {
+		errs = append(errs, err)
+	}
+
+	for _, p := range pools {
+		logCtx := logrus.WithFields(logrus.Fields{
+			"name":         p.Name,
+			"cidr":         p.Spec.CIDR,
+			"hasFinalizer": hasFinalizer(p),
+		})
+		if err := c.reconcileFinalizer(c.ctx, logCtx, p); err != nil {
+			logCtx.WithError(err).Error("Failed to reconcile finalizer for IPPool")
+			errs = append(errs, fmt.Errorf("reconcile finalizer for IPPool %s: %w", p.Name, err))
+		}
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+// reconcileConditions checks for various conditions that should be set on each IP pool. It returns
+// the pools with the derived conditions applied, so the finalizer pass acts on what we just wrote
+// rather than on the informer cache, which will not have caught up yet.
+func (c *IPPoolController) reconcileConditions(ctx context.Context) ([]*v3.IPPool, error) {
+	// Copy up front. Objects in the indexer are shared with the informer and every other handler,
+	// so mutating one in place both races and leaves the cache asserting state the API server may
+	// have rejected, which would suppress every future write attempt.
+	objs := c.poolInformer.GetIndexer().List()
+	pools := make([]*v3.IPPool, 0, len(objs))
+	for _, obj := range objs {
+		p, ok := obj.(*v3.IPPool)
+		if !ok {
+			logrus.WithField("type", fmt.Sprintf("%T", obj)).Error("Unexpected object type in IPPool cache")
+			continue
+		}
+		pools = append(pools, p.DeepCopy())
+	}
+	slices.SortFunc(pools, poolSortFunc)
+
+	var errs []error
+
+	// Every time an IP pool is added, updated, or deleted, we need to check if it changes the active set of pools. We only
+	// allow a single IP pool covering a given CIDR to be active at a time, and so we need to ensure that:
+	// - When a pool is added / updated, if it overlaps with an existing active pool, we should not enable the new pool.
+	// - When a pool is deleted, if it was the only active pool covering its CIDR, we should enable another overlapping pool if there is one.
+	// Use a trie to find overlapping pools more efficiently. We can insert each pool into the trie, and if we find an existing pool that
+	// overlaps with it, we can mark the new pool as disabled.
+	trie := ip.NewCIDRTrie()
+	triev6 := ip.NewCIDRTrie()
+	active := map[string]*v3.IPPool{}
+	overlapping := map[string]*v3.IPPool{}
+	for _, pool := range pools {
+		cidr, err := ip.CIDRFromString(pool.Spec.CIDR)
+		if err != nil {
+			logrus.WithError(err).WithField("cidr", pool.Spec.CIDR).Error("Failed to parse CIDR from IPPool")
+			continue
+		}
+
+		// Use the appropriate trie based on the IP address family of this pool.
+		t := trie
+		if cidr.Version() == 6 {
+			t = triev6
+		}
+
+		// If the pool is administratively disabled, reflect that in its conditions and skip it for the purposes of
+		// determining overlaps, since an administratively disabled pool should not block other pools from being active.
+		if pool.Spec.Disabled {
+			cond := metav1.Condition{
+				Type:    v3.IPPoolConditionAllocatable,
+				Status:  metav1.ConditionFalse,
+				Reason:  v3.IPPoolReasonDisabled,
+				Message: "IPPool.Spec.Disabled is true",
+			}
+			if err := updateCondition(ctx, c.cli, pool, cond); err != nil {
+				logrus.WithError(err).WithField("pool", pool.Name).Error("Failed to update status of IPPool")
+				errs = append(errs, err)
+			}
+			continue
+		}
+		if pool.DeletionTimestamp != nil {
+			cond := metav1.Condition{
+				Type:    v3.IPPoolConditionAllocatable,
+				Status:  metav1.ConditionFalse,
+				Reason:  v3.IPPoolReasonTerminating,
+				Message: "IPPool is being deleted",
+			}
+			if err := updateCondition(ctx, c.cli, pool, cond); err != nil {
+				logrus.WithError(err).WithField("pool", pool.Name).Error("Failed to update status of IPPool")
+				errs = append(errs, err)
+			}
+			// If the pool is being deleted, we still want to consider it for overlaps.
+			// This ensures we don't preemptively enable another pool that might overlap with it until this pool
+			// is fully deleted.
+			t.Update(cidr, pool)
+			continue
+		}
+
+		// Check if this pool is overlapped by any existing active pool in the trie.
+		if t.Overlaps(cidr) {
+			// This pool overlaps with an existing active pool, so we should disable it.
+			logrus.WithField("overlap", pool.Name).Debug("Found overlapping pools")
+			overlapping[pool.Name] = pool
+		}
+
+		if _, ok := overlapping[pool.Name]; !ok {
+			// This pool does not overlap with any existing active pools, so we can add it to the active set and insert it into the trie.
+			logrus.WithField("pool", pool.Name).Debug("Found non-overlapping pool, adding to active set")
+			active[pool.Name] = pool
+			t.Update(cidr, pool)
+		}
+	}
+
+	// Mark any overlapping pools as disabled.
+	for _, pool := range overlapping {
+		// Disable any other overlapping pools by setting a condition on them, which will prevent IPAM from allocating from those pools.
+		cond := metav1.Condition{
+			Type:    v3.IPPoolConditionAllocatable,
+			Status:  metav1.ConditionFalse,
+			Reason:  v3.IPPoolReasonCIDROverlap,
+			Message: "CIDR overlaps another pool; disabled to prevent IP allocation conflicts.",
+		}
+		if err := updateCondition(ctx, c.cli, pool, cond); err != nil {
+			logrus.WithError(err).WithField("pool", pool.Name).Error("Failed to update status of IPPool")
+			errs = append(errs, err)
+		}
+	}
+
+	// Make sure non-overlapping pools are enabled by removing the disabled condition if it exists.
+	for _, pool := range active {
+		cond := metav1.Condition{
+			Type:    v3.IPPoolConditionAllocatable,
+			Status:  metav1.ConditionTrue,
+			Reason:  v3.IPPoolReasonOK,
+			Message: "IPPool is available for IP allocation.",
+		}
+		if err := updateCondition(ctx, c.cli, pool, cond); err != nil {
+			logrus.WithError(err).WithField("pool", pool.Name).Error("Failed to update status of IPPool")
+			errs = append(errs, err)
+		}
+	}
+
+	return pools, utilerrors.NewAggregate(errs)
+}
+
+// trackerAgreesOnOverlap is whether the tracker has seen the CIDROverlap state just derived for every pool it knows.
+func (c *IPPoolController) trackerAgreesOnOverlap(pools []*v3.IPPool) bool {
+	for _, p := range pools {
+		if lost, ok := c.tracker.PoolLostOverlap(p.Name); ok && lost != accounting.LostOverlap(p) {
+			return false
+		}
+	}
+	return true
+}
+
+func poolSortFunc(poolA, poolB *v3.IPPool) int {
+	aCat := poolSortCategory(poolA)
+	bCat := poolSortCategory(poolB)
+	if aCat != bCat {
+		return aCat - bCat
+	}
+
+	// Within the same category, sort by creation timestamp (older first).
+	if poolA.CreationTimestamp.Before(&poolB.CreationTimestamp) {
+		return -1
+	}
+	if poolB.CreationTimestamp.Before(&poolA.CreationTimestamp) {
+		return 1
+	}
+
+	// If creation timestamps are equal, sort by name to ensure a deterministic order.
+	return strings.Compare(poolA.Name, poolB.Name)
+}
+
+// poolSortCategory returns the sort priority for a pool:
+//   - 0: Active pools (Allocatable=True, not being deleted) — sorted first so we prefer to keep existing active pools active.
+//   - 1: Terminating pools (DeletionTimestamp set) — sorted after active but before disabled pools, so they are
+//     inserted into the overlap trie before disabled pools are evaluated. This ensures terminating pools continue
+//     to mask overlapping disabled pools until fully deleted.
+//   - 2: Disabled pools (Allocatable=False, not being deleted) — sorted after terminating pools.
+//   - 3: New pools (no Allocatable condition yet) — sorted last so they don't preempt any existing pools.
+func poolSortCategory(p *v3.IPPool) int {
+	if hasCondition(p, v3.IPPoolConditionAllocatable, metav1.ConditionTrue) && p.DeletionTimestamp == nil {
+		return 0
+	}
+	if p.DeletionTimestamp != nil {
+		return 1
+	}
+	if hasCondition(p, v3.IPPoolConditionAllocatable, metav1.ConditionFalse) {
+		return 2
+	}
+	return 3
+}
+
+// reconcileFinalizer ensures that a finalizer is added to the pool when it is created, and that when the pool is deleted, all associated
+// IPAM blocks are released before the finalizer is removed and the pool can be fully deleted.
+func (c *IPPoolController) reconcileFinalizer(ctx context.Context, logCtx *logrus.Entry, p *v3.IPPool) error {
+	var err error
+
+	if p.DeletionTimestamp != nil {
+		logCtx = logCtx.WithField("deletionTimestamp", p.DeletionTimestamp.String())
+	}
+
+	if p.DeletionTimestamp == nil {
+		if hasCondition(p, v3.IPPoolConditionAllocatable, metav1.ConditionFalse) {
+			// If this pool is disabled due to CIDR overlaps or other validation issues, we should not add a finalizer to it
+			// since any IPAM blocks within this CIDR belong to the active pool and we don't want to interfere with the deletion of this
+			// pool if the user tries to delete it to resolve the overlap.
+			if hasFinalizer(p) {
+				logCtx.Info("IPPool is not active, removing finalizer")
+				if err = c.updateFinalizers(ctx, p, withoutFinalizer(p)); err != nil {
+					logCtx.WithError(err).Error("Failed to remove finalizer from IPPool")
+					return err
+				}
+			}
+			return nil
+		}
+
+		// If the IP pool is not being deleted, add a finalizer to it so we can insert ourselves into the deletion flow.
+		if !hasFinalizer(p) {
+			logCtx.Info("Adding finalizer to IPPool")
+			if err = c.updateFinalizers(ctx, p, append(slices.Clone(p.Finalizers), IPPoolFinalizer)); err != nil {
+				logCtx.WithError(err).Error("Failed to add finalizer to IPPool")
+				return err
+			}
+		}
+		return nil
+	}
+
+	if !hasFinalizer(p) {
+		logCtx.Info("IPPool is being deleted, but no finalizer is present, skipping finalization")
+		return nil
+	}
+
+	// If the IP pool is being deleted, and we have a finalizer:
+	// - Release all affinities for this IP pool in order to prevent new allocations.
+	// - Wait until all IPAM blocks within the pool are released before removing the finalizer.
+	_, parsedNet, err := cnet.ParseCIDR(p.Spec.CIDR)
+	if err != nil {
+		return err
+	}
+	logCtx.Info("IPPool is being deleted, releasing affinities")
+	if err = c.ipam.ReleasePoolAffinities(ctx, *parsedNet); err != nil {
+		return err
+	}
+
+	if !c.inSync.Load() {
+		logCtx.Info("IPAM data feed not in sync, not removing finalizer")
+		return nil
+	}
+
+	// If there are no IPAM blocks left in this pool, it is safe to remove our finalizer.
+	if c.tracker.HasBlocksWithin(*parsedNet) {
+		logCtx.Info("IPAM blocks still exist in pool, not removing finalizer")
+		return nil
+	}
+
+	logCtx.Info("No IPAM blocks left in pool, removing finalizer")
+	if err := c.updateFinalizers(ctx, p, withoutFinalizer(p)); err != nil {
+		logCtx.WithError(err).Error("Failed to remove finalizer from IPPool")
+		return err
+	}
+	return nil
+}
+
+// updateFinalizers writes p with the given finalizer set, leaving p itself untouched so that a
+// failed write cannot strand a mutation on an object we may not own.
+func (c *IPPoolController) updateFinalizers(ctx context.Context, p *v3.IPPool, finalizers []string) error {
+	updated := p.DeepCopy()
+	updated.Finalizers = finalizers
+	_, err := c.cli.ProjectcalicoV3().IPPools().Update(ctx, updated, metav1.UpdateOptions{})
+	return err
+}
+
+func withoutFinalizer(p *v3.IPPool) []string {
+	return slices.DeleteFunc(slices.Clone(p.Finalizers), func(s string) bool { return s == IPPoolFinalizer })
+}
+
+func hasFinalizer(p *v3.IPPool) bool {
+	return slices.Contains(p.Finalizers, IPPoolFinalizer)
+}
+
+func hasCondition(p *v3.IPPool, conditionType string, status metav1.ConditionStatus) bool {
+	if p.Status == nil {
+		return false
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == conditionType && c.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+// updateCondition updates the given condition on the IP pool if it has changed, and updates the status of the pool if needed.
+// It mutates p, so p must be a copy the caller owns rather than an object from the informer cache.
+func updateCondition(ctx context.Context, cli clientset.Interface, p *v3.IPPool, condition metav1.Condition) error {
+	if !setConditionOnPool(p, condition) {
+		return nil
+	}
+
+	logrus.WithField("pool", p.Name).Infof("Updating condition %s to %s", condition.Type, condition.Status)
+	updated, err := cli.ProjectcalicoV3().IPPools().UpdateStatus(ctx, p, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("update status of IPPool %s: %w", p.Name, err)
+	}
+
+	// Take the accepted object so a later finalizer write on this pool does not conflict.
+	*p = *updated
+	return nil
+}
+
+// removeCondition drops the condition type from the IP pool and writes its status, if the pool carries it. It mutates p.
+func removeCondition(ctx context.Context, cli clientset.Interface, p *v3.IPPool, conditionType string) error {
+	if p.Status == nil || !meta.RemoveStatusCondition(&p.Status.Conditions, conditionType) {
+		return nil
+	}
+
+	logrus.WithField("pool", p.Name).Infof("Removing condition %s", conditionType)
+	updated, err := cli.ProjectcalicoV3().IPPools().UpdateStatus(ctx, p, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("update status of IPPool %s: %w", p.Name, err)
+	}
+	*p = *updated
+	return nil
+}
+
+// setConditionOnPool sets the given condition on the IP pool, replacing any existing condition of the same type.
+// Returns true if the condition was changed and needs to be updated in the API, or false if the condition was already in the desired state.
+func setConditionOnPool(p *v3.IPPool, condition metav1.Condition) bool {
+	if p.Status == nil {
+		p.Status = &v3.IPPoolStatus{}
+	}
+	return meta.SetStatusCondition(&p.Status.Conditions, condition)
+}

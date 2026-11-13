@@ -32,11 +32,18 @@ type Interface struct {
 // GetInterfaces returns a list of all interfaces, skipping any interfaces whose
 // name matches any of the exclusion list regexes, and including those on the
 // inclusion list.
-func GetInterfaces(getSystemInterfaces func() ([]net.Interface, error), includeRegexes []string, excludeRegexes []string, version int) ([]Interface, error) {
+func GetInterfaces(getSystemInterfaces func() ([]net.Interface, error), includeRegexes []string, excludeRegexes []string, versions ...int) ([]Interface, error) {
 	netIfaces, err := getSystemInterfaces()
 	if err != nil {
 		log.WithError(err).Warnf("Failed to enumerate interfaces")
 		return nil, err
+	}
+
+	// Single bulk address retrieval for all interfaces (Linux optimization)
+	addrsByIndex, err := getAllInterfaceAddrs()
+	if err != nil {
+		log.WithError(err).Debug("Failed to bulk-fetch addresses, falling back to per-interface queries")
+		addrsByIndex = nil // Fall back to i.Addrs() in convertInterface
 	}
 
 	var filteredIfaces []Interface
@@ -65,7 +72,14 @@ func GetInterfaces(getSystemInterfaces func() ([]net.Interface, error), includeR
 		include := (includeRegexp == nil) || includeRegexp.MatchString(iface.Name)
 		exclude := (excludeRegexp != nil) && excludeRegexp.MatchString(iface.Name)
 		if include && !exclude {
-			if i, err := convertInterface(&iface, version); err == nil {
+			// Look up pre-fetched addresses (or nil for fallback)
+			var addrs []net.Addr
+			if addrsByIndex != nil {
+				addrs = addrsByIndex[iface.Index]
+			}
+
+			// Convert with pre-fetched or fallback addresses
+			if i, err := convertInterface(&iface, addrs, versions); err == nil {
 				filteredIfaces = append(filteredIfaces, *i)
 			}
 		}
@@ -75,12 +89,19 @@ func GetInterfaces(getSystemInterfaces func() ([]net.Interface, error), includeR
 
 // convertInterface converts a net.Interface to our Interface type (which has
 // converted address types).
-func convertInterface(i *net.Interface, version int) (*Interface, error) {
+// If addrs is non-nil, uses them instead of calling i.Addrs() (optimization).
+// If addrs is nil, falls back to i.Addrs() (non-Linux or error case).
+func convertInterface(i *net.Interface, addrs []net.Addr, versions []int) (*Interface, error) {
 	log.WithField("Interface", i.Name).Debug("Querying interface addresses")
-	addrs, err := i.Addrs()
-	if err != nil {
-		log.Warnf("Cannot get interface address(es): %v", err)
-		return nil, err
+
+	var err error
+	if addrs == nil {
+		// Fallback to per-interface query
+		addrs, err = i.Addrs()
+		if err != nil {
+			log.Warnf("Cannot get interface address(es): %v", err)
+			return nil, err
+		}
 	}
 
 	iface := &Interface{Name: i.Name}
@@ -92,12 +113,14 @@ func convertInterface(i *net.Interface, version int) (*Interface, error) {
 			continue
 		}
 
-		if ip.Version() == version {
-			// Switch out the IP address in the network with the
-			// interface IP to get the CIDR (IP + network).
-			ipNet.IP = ip.IP
-			log.WithField("CIDR", ipNet).Debug("Found valid IP address and network")
-			iface.Cidrs = append(iface.Cidrs, *ipNet)
+		for _, version := range versions {
+			if ip.Version() == version {
+				// Switch out the IP address in the network with the
+				// interface IP to get the CIDR (IP + network).
+				ipNet.IP = ip.IP
+				log.WithField("CIDR", ipNet).Debug("Found valid IP address and network")
+				iface.Cidrs = append(iface.Cidrs, *ipNet)
+			}
 		}
 	}
 

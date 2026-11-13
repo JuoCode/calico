@@ -32,6 +32,9 @@ spec:
         - key: node-role.kubernetes.io/control-plane
           effect: NoSchedule
       serviceAccountName: calico-kube-controllers
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       priorityClassName: system-cluster-critical
 {{- if eq .Values.datastore "etcd" }}
       # The controllers must run in the host network namespace so that
@@ -39,8 +42,9 @@ spec:
       hostNetwork: true
       containers:
         - name: calico-kube-controllers
-          image: {{.Values.kubeControllers.image}}:{{ .Values.version }}
+          image: {{.Values.calico.registry}}/{{.Values.calico.image}}:{{ .Values.version }}
           imagePullPolicy: {{.Values.imagePullPolicy}}
+          args: ["component", "kube-controllers", "--health-port=9440"]
           env:
             # The location of the etcd cluster.
             - name: ETCD_ENDPOINTS
@@ -68,8 +72,13 @@ spec:
                   key: etcd_cert
             # Choose which controllers to run.
             - name: ENABLED_CONTROLLERS
-              value: policy,namespace,serviceaccount,workloadendpoint,node
-{{- if .Values.kubeControllers.env }}
+              value: policy,namespace,serviceaccount,workloadendpoint,node,loadbalancer
+{{- if ne (include "nodeName" .) "calico-node" }}
+            # Name of the DaemonSet whose rollout the policy name migrator waits for.
+            - name: CALICO_NODE_DAEMONSET_NAME
+              value: {{include "nodeName" .}}
+{{- end }}
+{{- if and .Values.kubeControllers .Values.kubeControllers.env }}
 {{ toYaml .Values.kubeControllers.env | indent 12 }}
 {{- end }}
           volumeMounts:
@@ -79,8 +88,10 @@ spec:
           livenessProbe:
             exec:
               command:
-              - /usr/bin/check-status
-              - -l
+                - /usr/bin/calico
+                - health
+                - --port=9440
+                - --type=liveness
             periodSeconds: 10
             initialDelaySeconds: 10
             failureThreshold: 6
@@ -88,9 +99,13 @@ spec:
           readinessProbe:
             exec:
               command:
-              - /usr/bin/check-status
-              - -r
+                - /usr/bin/calico
+                - health
+                - --port=9440
+                - --type=readiness
             periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
       volumes:
         # Mount in the etcd TLS secrets with mode 400.
         # See https://kubernetes.io/docs/concepts/configuration/secret/
@@ -101,19 +116,27 @@ spec:
 {{- else }}
       containers:
         - name: calico-kube-controllers
-          image: {{.Values.kubeControllers.image}}:{{ .Values.version }}
+          image: {{.Values.calico.registry}}/{{.Values.calico.image}}:{{ .Values.version }}
           imagePullPolicy: {{.Values.imagePullPolicy}}
+          args: ["component", "kube-controllers", "--health-port=9440"]
           env:
             # Choose which controllers to run.
             - name: ENABLED_CONTROLLERS
-              value: node
+              value: node,loadbalancer
             - name: DATASTORE_TYPE
               value: kubernetes
+{{- if ne (include "nodeName" .) "calico-node" }}
+            # Name of the DaemonSet whose rollout the policy name migrator waits for.
+            - name: CALICO_NODE_DAEMONSET_NAME
+              value: {{include "nodeName" .}}
+{{- end }}
           livenessProbe:
             exec:
               command:
-              - /usr/bin/check-status
-              - -l
+                - /usr/bin/calico
+                - health
+                - --port=9440
+                - --type=liveness
             periodSeconds: 10
             initialDelaySeconds: 10
             failureThreshold: 6
@@ -121,9 +144,13 @@ spec:
           readinessProbe:
             exec:
               command:
-              - /usr/bin/check-status
-              - -r
+                - /usr/bin/calico
+                - health
+                - --port=9440
+                - --type=readiness
             periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
 {{- end }}
 
 ---

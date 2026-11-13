@@ -15,28 +15,32 @@
 package intdataplane
 
 import (
+	"fmt"
+	"strings"
+
+	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/generictables"
 )
 
 type mockTable struct {
 	Table          string
-	currentChains  map[string]*iptables.Chain
-	expectedChains map[string]*iptables.Chain
+	currentChains  map[string]*generictables.Chain
+	expectedChains map[string]*generictables.Chain
 	UpdateCalled   bool
 }
 
 func newMockTable(table string) *mockTable {
 	return &mockTable{
 		Table:          table,
-		currentChains:  map[string]*iptables.Chain{},
-		expectedChains: map[string]*iptables.Chain{},
+		currentChains:  map[string]*generictables.Chain{},
+		expectedChains: map[string]*generictables.Chain{},
 	}
 }
 
-func logChains(message string, chains []*iptables.Chain) {
+func logChains(message string, chains []*generictables.Chain) {
 	if chains == nil {
 		log.Debug(message, " with nil chains")
 	} else {
@@ -47,11 +51,11 @@ func logChains(message string, chains []*iptables.Chain) {
 	}
 }
 
-func (t *mockTable) UpdateChain(chain *iptables.Chain) {
-	t.UpdateChains([]*iptables.Chain{chain})
+func (t *mockTable) UpdateChain(chain *generictables.Chain) {
+	t.UpdateChains([]*generictables.Chain{chain})
 }
 
-func (t *mockTable) UpdateChains(chains []*iptables.Chain) {
+func (t *mockTable) UpdateChains(chains []*generictables.Chain) {
 	t.UpdateCalled = true
 	logChains("UpdateChains", chains)
 	for _, chain := range chains {
@@ -59,7 +63,7 @@ func (t *mockTable) UpdateChains(chains []*iptables.Chain) {
 	}
 }
 
-func (t *mockTable) RemoveChains(chains []*iptables.Chain) {
+func (t *mockTable) RemoveChains(chains []*generictables.Chain) {
 	logChains("RemoveChains", chains)
 	for _, chain := range chains {
 		t.RemoveChainByName(chain.Name)
@@ -71,8 +75,8 @@ func (t *mockTable) RemoveChainByName(name string) {
 	delete(t.currentChains, name)
 }
 
-func (t *mockTable) checkChains(expecteds [][]*iptables.Chain) {
-	t.expectedChains = map[string]*iptables.Chain{}
+func (t *mockTable) checkChains(expecteds [][]*generictables.Chain) {
+	t.expectedChains = map[string]*generictables.Chain{}
 	for _, expected := range expecteds {
 		for _, chain := range expected {
 			t.expectedChains[chain.Name] = chain
@@ -82,9 +86,27 @@ func (t *mockTable) checkChains(expecteds [][]*iptables.Chain) {
 }
 
 func (t *mockTable) checkChainsSameAsBefore() {
-	log.Debug("Expected chains")
+	// Build a failure message in case of unexpected chains.
+	var msg strings.Builder
+	msg.WriteString("Unexpected chain:\n\n %+v\n\n Expected chains:\n\n")
 	for _, chain := range t.expectedChains {
 		log.WithField("chain", *chain).Debug("")
+		fmt.Fprintf(&msg, " %+v\n", *chain)
 	}
-	ExpectWithOffset(1, t.currentChains).To(Equal(t.expectedChains), t.Table+" chains incorrect")
+
+	// Check each current chain is as expected.
+	for _, chain := range t.currentChains {
+		expected, ok := t.expectedChains[chain.Name]
+		ExpectWithOffset(2, ok).To(BeTrue(), fmt.Sprintf(msg.String(), *chain))
+		ExpectWithOffset(2, *chain).To(Equal(*expected), cmp.Diff(expected, chain))
+	}
+
+	// Ensure no expected chains are missing.
+	for _, chain := range t.expectedChains {
+		_, ok := t.currentChains[chain.Name]
+		ExpectWithOffset(2, ok).To(BeTrue(), "Missing expected chain: %v", chain)
+	}
+
+	// Assert the whole map is as expected.
+	ExpectWithOffset(2, t.currentChains).To(Equal(t.expectedChains), t.Table+" chains incorrect")
 }

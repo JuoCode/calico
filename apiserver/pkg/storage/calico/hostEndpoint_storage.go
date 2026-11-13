@@ -3,22 +3,18 @@
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 // NewHostEndpointStorage creates a new libcalico-based storage.Interface implementation for HostEndpoints
@@ -55,10 +51,10 @@ func NewHostEndpointStorage(opts Options) (registry.DryRunnableStorage, factory.
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.HostEndpoint{}),
-		aapiListType:      reflect.TypeOf(aapi.HostEndpointList{}),
-		libCalicoType:     reflect.TypeOf(api.HostEndpoint{}),
-		libCalicoListType: reflect.TypeOf(api.HostEndpointList{}),
+		aapiType:          reflect.TypeFor[api.HostEndpoint](),
+		aapiListType:      reflect.TypeFor[api.HostEndpointList](),
+		libCalicoType:     reflect.TypeFor[api.HostEndpoint](),
+		libCalicoListType: reflect.TypeFor[api.HostEndpointList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -76,7 +72,7 @@ type HostEndpointConverter struct {
 }
 
 func (gc HostEndpointConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiHostEndpoint := aapiObj.(*aapi.HostEndpoint)
+	aapiHostEndpoint := aapiObj.(*api.HostEndpoint)
 	lcgHostEndpoint := &api.HostEndpoint{}
 	lcgHostEndpoint.TypeMeta = aapiHostEndpoint.TypeMeta
 	lcgHostEndpoint.ObjectMeta = aapiHostEndpoint.ObjectMeta
@@ -88,7 +84,7 @@ func (gc HostEndpointConverter) convertToLibcalico(aapiObj runtime.Object) resou
 
 func (gc HostEndpointConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgHostEndpoint := libcalicoObject.(*api.HostEndpoint)
-	aapiHostEndpoint := aapiObj.(*aapi.HostEndpoint)
+	aapiHostEndpoint := aapiObj.(*api.HostEndpoint)
 	aapiHostEndpoint.Spec = lcgHostEndpoint.Spec
 	aapiHostEndpoint.TypeMeta = lcgHostEndpoint.TypeMeta
 	aapiHostEndpoint.ObjectMeta = lcgHostEndpoint.ObjectMeta
@@ -96,15 +92,15 @@ func (gc HostEndpointConverter) convertToAAPI(libcalicoObject resourceObject, aa
 
 func (gc HostEndpointConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgHostEndpointList := libcalicoListObject.(*api.HostEndpointList)
-	aapiHostEndpointList := aapiListObj.(*aapi.HostEndpointList)
+	aapiHostEndpointList := aapiListObj.(*api.HostEndpointList)
 	if libcalicoListObject == nil {
-		aapiHostEndpointList.Items = []aapi.HostEndpoint{}
+		aapiHostEndpointList.Items = []api.HostEndpoint{}
 		return
 	}
 	aapiHostEndpointList.TypeMeta = lcgHostEndpointList.TypeMeta
 	aapiHostEndpointList.ListMeta = lcgHostEndpointList.ListMeta
 	for _, item := range lcgHostEndpointList.Items {
-		aapiHostEndpoint := aapi.HostEndpoint{}
+		aapiHostEndpoint := api.HostEndpoint{}
 		gc.convertToAAPI(&item, &aapiHostEndpoint)
 		if matched, err := pred.Matches(&aapiHostEndpoint); err == nil && matched {
 			aapiHostEndpointList.Items = append(aapiHostEndpointList.Items, aapiHostEndpoint)

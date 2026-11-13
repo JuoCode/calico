@@ -17,38 +17,39 @@ package proxy_test
 import (
 	"net"
 
-	"github.com/projectcalico/calico/felix/bpf/nat"
-	"github.com/projectcalico/calico/felix/logutils"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	k8sp "k8s.io/kubernetes/pkg/proxy"
 
+	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/proxy"
 	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/lib/logrusr"
 )
 
 func init() {
-	logutils.ConfigureEarlyLogging()
+	logrusr.ConfigureEarlyLoggingFromEnv("felix")
 	logrus.SetOutput(GinkgoWriter)
 	logrus.SetLevel(logrus.DebugLevel)
 }
 
-func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
+func testfn(makeIPs func(ips []net.IP) proxy.K8sServicePortOption) {
 	svcs := newMockNATMap()
 	eps := newMockNATBackendMap()
+	mglv := newMockMaglevMap()
 	aff := newMockAffinityMap()
 
 	nodeIPs := []net.IP{net.IPv4(192, 168, 0, 1), net.IPv4(10, 123, 0, 1)}
 	rt := proxy.NewRTCache()
 
-	externalIP := makeIPs([]string{"35.0.0.2"})
-	twoExternalIPs := makeIPs([]string{"35.0.0.2", "45.0.1.2"})
+	externalIP := makeIPs([]net.IP{net.IPv4(35, 0, 0, 2)})
+	twoExternalIPs := makeIPs([]net.IP{net.IPv4(35, 0, 0, 2), net.IPv4(45, 0, 1, 2)})
 
-	s, _ := proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
+	s, _ := proxy.NewSyncer(4, nodeIPs, svcs, eps, mglv, aff, rt, nil, maglevLUTSize, 0)
 
 	svcKey := k8sp.ServicePortName{
 		NamespacedName: types.NamespacedName{
@@ -57,6 +58,9 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 		},
 	}
 
+	ipnet1 := ip.MustParseCIDROrIP("35.0.1.2/24").ToIPNet()
+	ipnet2 := ip.MustParseCIDROrIP("33.0.1.2/16").ToIPNet()
+
 	state := proxy.DPSyncerState{
 		SvcMap: k8sp.ServicePortMap{
 			svcKey: proxy.NewK8sServicePort(
@@ -64,11 +68,11 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 				2222,
 				v1.ProtocolTCP,
 				externalIP,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{"35.0.1.2/24", "33.0.1.2/16"}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&ipnet1, &ipnet2}),
 			),
 		},
 		EpsMap: k8sp.EndpointsMap{
-			svcKey: []k8sp.Endpoint{&k8sp.BaseEndpointInfo{Endpoint: "10.1.0.1:5555"}},
+			svcKey: []k8sp.Endpoint{proxy.NewEndpointInfo("10.1.0.1", 5555)},
 		},
 	}
 	makestep := func(step func()) func() {
@@ -123,13 +127,15 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 		}))
 
 		By("updating LBSourceRangeIP for existing service", makestep(func() {
+			ipnet1 := ip.MustParseCIDROrIP("35.0.1.2/24").ToIPNet()
+			ipnet2 := ip.MustParseCIDROrIP("23.0.1.2/16").ToIPNet()
 			Expect(svcs.m).To(HaveLen(4))
 			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
 				externalIP,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{"35.0.1.2/24", "23.0.1.2/16"}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&ipnet1, &ipnet2}),
 			)
 
 			err := s.Apply(state)
@@ -143,12 +149,13 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 		}))
 
 		By("Deleting one LBSourceRangeIP for existing service", makestep(func() {
+			ipnet := ip.MustParseCIDROrIP("35.0.1.2/24").ToIPNet()
 			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
 				externalIP,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{"35.0.1.2/24"}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&ipnet}),
 			)
 
 			err := s.Apply(state)
@@ -166,7 +173,7 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 				2222,
 				v1.ProtocolTCP,
 				externalIP,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{}),
 			)
 
 			err := s.Apply(state)
@@ -179,12 +186,15 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 		}))
 
 		By("Adding new entries to the map with different source IPs", makestep(func() {
+			ipnet1 := ip.MustParseCIDROrIP("33.0.1.2/24").ToIPNet()
+			ipnet2 := ip.MustParseCIDROrIP("38.0.1.2/16").ToIPNet()
+			ipnet3 := ip.MustParseCIDROrIP("40.0.1.2/32").ToIPNet()
 			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
 				twoExternalIPs,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{"33.0.1.2/24", "38.0.1.2/16", "40.0.1.2/32"}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&ipnet1, &ipnet2, &ipnet3}),
 			)
 
 			err := s.Apply(state)
@@ -194,14 +204,15 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 		}))
 
 		By("Remove stale src range entries after syncer restarts", makestep(func() {
+			ipnet := ip.MustParseCIDROrIP("35.0.1.2/24").ToIPNet()
 			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
 				v1.ProtocolTCP,
 				externalIP,
-				proxy.K8sSvcWithLBSourceRangeIPs([]string{"35.0.1.2/24"}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&ipnet}),
 			)
-			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
+			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, mglv, aff, rt, nil, maglevLUTSize, 0)
 			err := s.Apply(state)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(svcs.m).To(HaveLen(3))
@@ -214,7 +225,7 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 				v1.ProtocolTCP,
 				externalIP,
 			)
-			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
+			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, mglv, aff, rt, nil, maglevLUTSize, 0)
 			err := s.Apply(state)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(svcs.m).To(HaveLen(2))
@@ -234,6 +245,85 @@ func testfn(makeIPs func(ips []string) proxy.K8sServicePortOption) {
 
 }
 
+func test0000SourceRange() {
+	svcs := newMockNATMap()
+	eps := newMockNATBackendMap()
+	mglv := newMockMaglevMap()
+	aff := newMockAffinityMap()
+
+	nodeIPs := []net.IP{net.IPv4(192, 168, 0, 1), net.IPv4(10, 123, 0, 1)}
+	rt := proxy.NewRTCache()
+
+	externalIP := net.IPv4(35, 0, 0, 2)
+
+	s, _ := proxy.NewSyncer(4, nodeIPs, svcs, eps, mglv, aff, rt, nil, maglevLUTSize, 0)
+
+	svcKey := k8sp.ServicePortName{
+		NamespacedName: types.NamespacedName{
+			Namespace: "default",
+			Name:      "test-service",
+		},
+	}
+
+	// Configure service with 0.0.0.0/0 source range
+	zeroSourceRange := ip.MustParseCIDROrIP("0.0.0.0/0").ToIPNet()
+
+	state := proxy.DPSyncerState{
+		SvcMap: k8sp.ServicePortMap{
+			svcKey: proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 2),
+				2222,
+				v1.ProtocolTCP,
+				proxy.K8sSvcWithLoadBalancerIPs([]net.IP{externalIP}),
+				proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&zeroSourceRange}),
+			),
+		},
+		EpsMap: k8sp.EndpointsMap{
+			svcKey: []k8sp.Endpoint{proxy.NewEndpointInfo("10.1.0.1", 5555, proxy.EndpointInfoOptIsReady(true))},
+		},
+	}
+
+	makestep := func(step func()) func() {
+		return func() {
+			defer func() {
+				log("svcs = %+v\n", svcs)
+				log("eps = %+v\n", eps)
+			}()
+
+			step()
+		}
+	}
+
+	extIP := net.IPv4(35, 0, 0, 2)
+	proto := proxy.ProtoV1ToIntPanic(v1.ProtocolTCP)
+	zeroSourceCIDR := ip.MustParseCIDROrIP("0.0.0.0/0").(ip.V4CIDR)
+	keyWithZeroSrc := nat.NewNATKeySrc(extIP, 2222, proto, zeroSourceCIDR)
+	keyWithExtIP := nat.NewNATKey(extIP, 2222, proto)
+
+	It("should have valid NAT entry for 0.0.0.0/0 source range", func() {
+
+		By("adding service with 0.0.0.0/0 source range", makestep(func() {
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify that NAT backend map has valid entries for the endpoint
+			Expect(eps.m).To(HaveLen(1), "Should have one backend entry for the endpoint")
+
+			// Check that frontend map has the expected entries
+			Expect(svcs.m).To(HaveKey(keyWithZeroSrc), "Should have entry for 0.0.0.0/0 source range")
+			Expect(svcs.m).To(HaveKey(keyWithExtIP), "Should have entry for main service key")
+
+			// Verify that the source-specific key (0.0.0.0/0) has a valid NAT value
+			srcVal, srcOk := svcs.m[keyWithZeroSrc]
+			Expect(srcOk).To(BeTrue(), "Source-specific key should exist")
+			Expect(srcVal.Count()).NotTo(Equal(nat.BlackHoleCount), "Source-specific entry should have valid count")
+		}))
+
+	})
+
+}
+
 var _ = Describe("BPF Load Balancer source range", func() {
 	Context("With external IP", func() {
 		testfn(proxy.K8sSvcWithExternalIPs)
@@ -241,5 +331,84 @@ var _ = Describe("BPF Load Balancer source range", func() {
 
 	Context("With LoadBalancer IP", func() {
 		testfn(proxy.K8sSvcWithLoadBalancerIPs)
+	})
+
+	Context("With 0.0.0.0/0 source range", func() {
+		test0000SourceRange()
+	})
+})
+
+// A frontend with source ranges is written by writeLBSrcRangeSvcNATKeys() rather
+// than writeSvc(), so it is the other place that has to tell the affinity map
+// cleanup that the frontend may hold entries.
+var _ = Describe("BPF Load Balancer source range session affinity", func() {
+	svcKey := k8sp.ServicePortName{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "sticky-service"},
+	}
+	clusterIP := net.IPv4(10, 0, 0, 2)
+	lbIP := net.IPv4(35, 0, 0, 2)
+	const svcPort = 2222
+	const backendPort = 5555
+	liveBackend := net.IPv4(10, 1, 0, 1)
+	clientIP := net.IPv4(35, 0, 1, 7)
+
+	var (
+		aff   *mockAffinityMap
+		s     *proxy.Syncer
+		state proxy.DPSyncerState
+	)
+
+	BeforeEach(func() {
+		aff = newMockAffinityMap()
+		var err error
+		s, err = proxy.NewSyncer(4, []net.IP{net.IPv4(192, 168, 0, 1)},
+			newMockNATMap(), newMockNATBackendMap(), newMockMaglevMap(), aff,
+			proxy.NewRTCache(), nil, maglevLUTSize, 0)
+		Expect(err).NotTo(HaveOccurred())
+
+		srcRange := ip.MustParseCIDROrIP("35.0.1.2/24").ToIPNet()
+		state = proxy.DPSyncerState{
+			SvcMap: k8sp.ServicePortMap{
+				svcKey: proxy.NewK8sServicePort(clusterIP, svcPort, v1.ProtocolTCP,
+					proxy.K8sSvcWithLoadBalancerIPs([]net.IP{lbIP}),
+					proxy.K8sSvcWithLBSourceRangeIPs([]*net.IPNet{&srcRange}),
+					proxy.K8sSvcWithStickyClientIP(60),
+				),
+			},
+			EpsMap: k8sp.EndpointsMap{
+				svcKey: []k8sp.Endpoint{
+					proxy.NewEndpointInfo(liveBackend.String(), backendPort,
+						proxy.EndpointInfoOptIsReady(true)),
+				},
+			},
+		}
+		Expect(s.Apply(state)).NotTo(HaveOccurred())
+	})
+
+	// addAffEntry writes the affinity entry that the TC programs would have written
+	// for a connection to the load balancer IP.
+	addAffEntry := func(backend net.IP) {
+		err := aff.Update(
+			nat.NewAffinityKey(clientIP,
+				nat.NewNATKey(lbIP, svcPort, proxy.ProtoV1ToIntPanic(v1.ProtocolTCP)),
+			).AsBytes(),
+			nat.NewAffinityValue(uint64(bpf.KTimeNanos()),
+				nat.NewNATBackendValue(backend, backendPort),
+			).AsBytes(),
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(aff.m).To(HaveLen(1))
+	}
+
+	It("should keep a fresh affinity entry for a source-range frontend", func() {
+		addAffEntry(liveBackend)
+		Expect(s.Apply(state)).NotTo(HaveOccurred())
+		Expect(aff.m).To(HaveLen(1), "affinity entry must survive cleanup")
+	})
+
+	It("should still clean up an affinity entry whose backend is gone", func() {
+		addAffEntry(net.IPv4(10, 9, 9, 9))
+		Expect(s.Apply(state)).NotTo(HaveOccurred())
+		Expect(aff.m).To(BeEmpty())
 	})
 })

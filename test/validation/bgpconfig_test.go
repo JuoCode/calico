@@ -1,0 +1,233 @@
+// Copyright (c) 2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validation_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// The complement of the FelixConfiguration default: BIRD takes the unencapsulated cluster routes
+// that Felix leaves alone.
+func TestBGPConfiguration_ProgramClusterRoutesDefault(t *testing.T) {
+	defaulted := uniqueName("bgpconfig-cluster-routes")
+	mustCreate(t, &v3.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: defaulted},
+		Spec:       v3.BGPConfigurationSpec{},
+	})
+
+	got := &v3.BGPConfiguration{}
+	if err := testClient.Get(context.Background(), client.ObjectKey{Name: defaulted}, got); err != nil {
+		t.Fatalf("failed to get config: %v", err)
+	}
+	if got.Spec.ProgramClusterRoutes == nil || *got.Spec.ProgramClusterRoutes != v3.EnabledNoEncapOnly {
+		t.Errorf("expected spec.programClusterRoutes=%q, got %v", v3.EnabledNoEncapOnly, got.Spec.ProgramClusterRoutes)
+	}
+
+	explicit := uniqueName("bgpconfig-cluster-routes")
+	mustCreate(t, &v3.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: explicit},
+		Spec:       v3.BGPConfigurationSpec{ProgramClusterRoutes: ptr.To(v3.Enabled)},
+	})
+
+	got = &v3.BGPConfiguration{}
+	if err := testClient.Get(context.Background(), client.ObjectKey{Name: explicit}, got); err != nil {
+		t.Fatalf("failed to get config: %v", err)
+	}
+	if got.Spec.ProgramClusterRoutes == nil || *got.Spec.ProgramClusterRoutes != v3.Enabled {
+		t.Errorf("expected spec.programClusterRoutes=%q, got %v", v3.Enabled, got.Spec.ProgramClusterRoutes)
+	}
+}
+
+func TestBGPConfiguration_Validation(t *testing.T) {
+	dur := metav1.Duration{Duration: 120 * time.Second}
+	tests := []struct {
+		name    string
+		obj     client.Object
+		wantErr string
+	}{
+		{
+			name: "nodeMeshPassword with mesh disabled is rejected",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					NodeToNodeMeshEnabled: ptr.To(false),
+					NodeMeshPassword: &v3.BGPPassword{
+						SecretKeyRef: nil,
+					},
+				},
+			},
+			wantErr: "nodeMeshPassword cannot be set when nodeToNodeMeshEnabled is false",
+		},
+		{
+			name: "nodeMeshMaxRestartTime with mesh disabled is rejected",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					NodeToNodeMeshEnabled:  ptr.To(false),
+					NodeMeshMaxRestartTime: &dur,
+				},
+			},
+			wantErr: "nodeMeshMaxRestartTime cannot be set when nodeToNodeMeshEnabled is false",
+		},
+		{
+			name: "nodeMeshPassword with mesh enabled is accepted",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					NodeToNodeMeshEnabled: ptr.To(true),
+					NodeMeshPassword: &v3.BGPPassword{
+						SecretKeyRef: nil,
+					},
+				},
+			},
+		},
+		{
+			name: "nodeMeshMaxRestartTime with mesh enabled is accepted",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					NodeToNodeMeshEnabled:  ptr.To(true),
+					NodeMeshMaxRestartTime: &dur,
+				},
+			},
+		},
+		{
+			name: "communities without prefixAdvertisements is rejected",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					Communities: []v3.Community{
+						{Name: "my-community", Value: "65001:100"},
+					},
+				},
+			},
+			wantErr: "communities are defined but not used in prefixAdvertisements",
+		},
+		{
+			name: "communities with prefixAdvertisements is accepted",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					Communities: []v3.Community{
+						{Name: "my-community", Value: "65001:100"},
+					},
+					PrefixAdvertisements: []v3.PrefixAdvertisement{
+						{CIDR: "10.0.0.0/24", Communities: []string{"my-community"}},
+					},
+				},
+			},
+		},
+		{
+			name: "prefixAdvertisement using inline community value is accepted",
+			obj: &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					PrefixAdvertisements: []v3.PrefixAdvertisement{
+						{CIDR: "10.0.0.0/24", Communities: []string{"65001:100"}},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantErr != "" {
+				expectCreateFails(t, tt.obj, tt.wantErr)
+			} else {
+				expectCreateSucceeds(t, tt.obj)
+			}
+		})
+	}
+}
+
+// confd writes community values into the BIRD config verbatim, so each part has
+// to fit the 16-bit or 32-bit field BIRD expects.
+func TestBGPConfiguration_CommunityValueRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{name: "standard community at the 16-bit limit is accepted", value: "65535:65535"},
+		{name: "leading zeros are accepted", value: "0065535:01"},
+		{name: "standard community above 16 bits is rejected", value: "65536:1", wantErr: "standard community values must be 16-bit numbers"},
+		{name: "part too long to convert to an int is rejected with the range message", value: "99999999999999999999:1", wantErr: "standard community values must be 16-bit numbers"},
+		{name: "large community at the 32-bit limit is accepted", value: "4294967295:1:4294967295"},
+		{name: "large community above 32 bits is rejected", value: "4294967296:1:1", wantErr: "large community values 32-bit numbers"},
+		{name: "malformed community is rejected", value: "1:2:3:4", wantErr: "spec.communities[0].value: Invalid value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := &v3.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: uniqueName("bgpconfig")},
+				Spec: v3.BGPConfigurationSpec{
+					Communities: []v3.Community{{Name: "my-community", Value: tt.value}},
+					PrefixAdvertisements: []v3.PrefixAdvertisement{
+						{CIDR: "192.168.0.0/24", Communities: []string{"my-community"}},
+					},
+				},
+			}
+			if tt.wantErr != "" {
+				expectCreateFails(t, obj, tt.wantErr)
+			} else {
+				expectCreateSucceeds(t, obj)
+			}
+		})
+	}
+}
+
+// TestBGPConfiguration_ASNumberBounds covers the 4-byte AS number space defined
+// by RFC 4893. AS numbers above INT32_MAX used to be rejected by the generated
+// CRD schema, which rendered the uint32 ASNumber type as "format: int32".
+func TestBGPConfiguration_ASNumberBounds(t *testing.T) {
+	// An asNumber outside the uint32 range cannot be expressed through the typed
+	// API, so build the object the way a raw manifest would.
+	newConfig := func(asNumber int64) *unstructured.Unstructured {
+		return &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "projectcalico.org/v3",
+				"kind":       "BGPConfiguration",
+				"metadata":   map[string]interface{}{"name": uniqueName("bgpconfig")},
+				"spec": map[string]interface{}{
+					"asNumber": asNumber,
+				},
+			},
+		}
+	}
+
+	t.Run("below minimum", func(t *testing.T) {
+		expectCreateFails(t, newConfig(-1), "asNumber")
+	})
+	t.Run("above maximum", func(t *testing.T) {
+		expectCreateFails(t, newConfig(4294967296), "asNumber")
+	})
+	t.Run("4-byte AS number above INT32_MAX", func(t *testing.T) {
+		expectCreateSucceeds(t, newConfig(4200000001))
+	})
+	t.Run("at the bounds", func(t *testing.T) {
+		expectCreateSucceeds(t, newConfig(0))
+		expectCreateSucceeds(t, newConfig(4294967295))
+	})
+}

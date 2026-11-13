@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,44 +34,47 @@ const (
 	MaxRuleIDs           = 32
 )
 
-//	struct cali_tc_state {
-//	   __be32 ip_src;
-//	   __be32 ip_src1;
-//	   __be32 ip_src2;
-//	   __be32 ip_src3;
-//	   __be32 ip_dst;
-//	   __be32 ip_dst1;
-//	   __be32 ip_dst2;
-//	   __be32 ip_dst3;
-//	   __be32 pre_nat_ip_dst;
-//	   __be32 pre_nat_ip_dst1;
-//	   __be32 pre_nat_ip_dst2;
-//	   __be32 pre_nat_ip_dst3;
-//	   __be32 post_nat_ip_dst;
-//	   __be32 post_nat_ip_dst1;
-//	   __be32 post_nat_ip_dst2;
-//	   __be32 post_nat_ip_dst3;
-//	   __be32 tun_ip;
-//	   __be32 tun_ip1;
-//	   __be32 tun_ip2;
-//	   __be32 tun_ip3;
-//	   __u32 unused;
-//	   __s32 pol_rc;
-//	   __u16 sport;
-//	   __u16 dport;
-//	   __u16 pre_nat_dport;
-//	   __u16 post_nat_dport;
-//	   __u8 ip_proto;
-//	   __u8 __pad;
-//	   __be16 ip_size;
-//	   __u32 rules_hit;
-//	   __u64 rule_ids[MAX_RULE_IDS];
-//	   struct calico_ct_result ct_result;
-//	   struct calico_nat_dest nat_dest;
-//	   __u64 prog_start_time;
-//	   __u64 flags;
-//	};
+// struct cali_tc_state {
+//    struct event_header eventhdr;  // 64 bits
+//    __be32 ip_src;
+//    __be32 ip_src1;
+//    __be32 ip_src2;
+//    __be32 ip_src3;
+//    __be32 ip_dst;
+//    __be32 ip_dst1;
+//    __be32 ip_dst2;
+//    __be32 ip_dst3;
+//    __be32 pre_nat_ip_dst;
+//    __be32 pre_nat_ip_dst1;
+//    __be32 pre_nat_ip_dst2;
+//    __be32 pre_nat_ip_dst3;
+//    __be32 post_nat_ip_dst;
+//    __be32 post_nat_ip_dst1;
+//    __be32 post_nat_ip_dst2;
+//    __be32 post_nat_ip_dst3;
+//    __be32 tun_ip;
+//    __be32 tun_ip1;
+//    __be32 tun_ip2;
+//    __be32 tun_ip3;
+//    __u32 unused;
+//    __s32 pol_rc;
+//    __u16 sport;
+//    __u16 dport;
+//    __u16 pre_nat_dport;
+//    __u16 post_nat_dport;
+//    __u8 ip_proto;
+//    __u8 __pad;
+//    __be16 ip_size;
+//    __u32 rules_hit;
+//    __u64 rule_ids[MAX_RULE_IDS];
+//    struct calico_ct_result ct_result;
+//    struct calico_nat_dest nat_dest;
+//    __u64 prog_start_time;
+//    __u64 flags;
+// };
+
 type State struct {
+	eventHeader         uint64
 	SrcAddr             uint32
 	SrcAddr1            uint32
 	SrcAddr2            uint32
@@ -105,8 +108,8 @@ type State struct {
 	RulesHit            uint32
 	RuleIDs             [MaxRuleIDs]uint64
 	Flags               uint64
-	ConntrackRCFlags    uint32
-	_                   uint32
+	ConntrackRCPadding  uint32
+	ConntrackFlags      uint32
 	ConntrackNATIPPort  uint64
 	ConntrackTunIP      uint32
 	ConntrackIfIndexFwd uint32
@@ -118,10 +121,13 @@ type State struct {
 	SrcAddrMasq1        uint32
 	SrcAddrMasq2        uint32
 	SrcAddrMasq3        uint32
-	_                   [48]byte // ipv6 padding
+	NATSvcID            uint32
+	_                   uint32
+	_                   [44]byte // ipv6 padding
 }
 
-const expectedSize = 480
+const expectedSize = 496
+const entrySize = 512
 
 func (s *State) AsBytes() []byte {
 	bPtr := (*[expectedSize]byte)(unsafe.Pointer(s))
@@ -140,10 +146,10 @@ func StateFromBytes(bytes []byte) State {
 var MapParameters = maps.MapParameters{
 	Type:       "percpu_array",
 	KeySize:    4,
-	ValueSize:  expectedSize,
+	ValueSize:  entrySize,
 	MaxEntries: 2,
 	Name:       "cali_state",
-	Version:    4,
+	Version:    6,
 }
 
 func Map() maps.Map {
@@ -154,7 +160,7 @@ func MapForTest() maps.Map {
 	return maps.NewPinnedMap(maps.MapParameters{
 		Type:       "array",
 		KeySize:    4,
-		ValueSize:  expectedSize,
+		ValueSize:  entrySize,
 		MaxEntries: 2,
 		Name:       "test_state",
 	})

@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package libbpf
 
 import (
 	"runtime"
-	"time"
 )
 
 type Obj struct {
@@ -28,6 +27,9 @@ type Map struct {
 }
 
 type Link struct {
+}
+
+type Program struct {
 }
 
 func (m *Map) Name() string {
@@ -58,11 +60,35 @@ func (o *Obj) Load() error {
 	panic("LIBBPF syscall stub")
 }
 
+func (o *Obj) SetProgramAutoload(progName string, autoload bool) {
+	panic("LIBBPF syscall stub")
+}
+
 func (o *Obj) FirstMap() (*Map, error) {
 	panic("LIBBPF syscall stub")
 }
 
+func (o *Obj) Filename() string {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) SetAttachType(progName string, attachType uint32) error {
+	panic("LIBBPF syscall stub")
+}
+
 func (m *Map) NextMap() (*Map, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (p *Program) NextProgram() (*Program, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) FirstProgram() (*Program, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (p *Program) Name() string {
 	panic("LIBBPF syscall stub")
 }
 
@@ -74,7 +100,7 @@ func DetachClassifier(ifindex, handle, pref int, ingress bool) error {
 	panic("LIBBPF syscall stub")
 }
 
-func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, int, error) {
+func (o *Obj) AttachClassifier(secName, ifName string, ingress bool, prio int, handle uint32) error {
 	panic("LIBBPF syscall stub")
 }
 
@@ -91,6 +117,10 @@ func GetXDPProgramID(ifName string) (int, error) {
 }
 
 func (o *Obj) AttachCGroup(_, _ string) (*Link, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) UpdateLink(_, _ string) error {
 	panic("LIBBPF syscall stub")
 }
 
@@ -118,6 +148,30 @@ func RemoveQDisc(ifName string) error {
 	panic("LIBBPF syscall stub")
 }
 
+func DetachLink(_ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (l *Link) Pin(_ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (l *Link) Update(obj *Obj, progName string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (l *Link) Close() error {
+	panic("LIBBPF syscall stub")
+}
+
+func OpenLink(path string) (*Link, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (l *Link) Detach() error {
+	panic("LIBBPF syscall stub")
+}
+
 func (o *Obj) UpdateJumpMap(mapName, progName string, mapIndex int) error {
 	panic("LIBBPF syscall stub")
 }
@@ -131,24 +185,27 @@ func (m *Map) IsMapInternal() bool {
 }
 
 const (
-	GlobalsIPv6Enabled      uint32 = 1
-	GlobalsRPFOptionEnabled uint32 = 16
-	GlobalsRPFOptionStrict  uint32 = 32
-	GlobalsNoDSRCidrs       uint32 = 12345
-	GlobalsLoUDPOnly        uint32 = 12345
+	GlobalsIfaceEncaps                   uint32 = 1
+	GlobalsRPFOptionEnabled              uint32 = 16
+	GlobalsRPFOptionStrict               uint32 = 32
+	GlobalsNoDSRCidrs                    uint32 = 12345
+	GlobalsLoUDPOnly                     uint32 = 12345
+	GlobalsRedirectPeer                  uint32 = 12345
+	GlobalsFlowLogsEnabled               uint32 = 12345
+	GlobalsNATOutgoingExcludeHosts       uint32 = 12345
+	GlobalsSkipEgressRedirect            uint32 = 12345
+	GlobalsIngressPacketRateConfigured   uint32 = 12345
+	GlobalsEgressPacketRateConfigured    uint32 = 12345
+	GlobalsWorkloadSrcSpoofingConfigured uint32 = 12345
+	GlobalsUDPGSOLinearize               uint32 = 12345
+	GlobalsIngressConnLimitConfigured    uint32 = 12345
+	GlobalsEgressConnLimitConfigured     uint32 = 12345
+	AttachTypeTcxIngress                 uint32 = 12345
+	AttachTypeTcxEgress                  uint32 = 12345
+	AttachTypeXDP                        uint32 = 12345
+	AttachTypeNetkitPrimary              uint32 = 12345
+	AttachTypeNetkitPeer                 uint32 = 12345
 )
-
-func TcSetGlobals(_ *Map, globalData *TcGlobalData) error {
-	panic("LIBBPF syscall stub")
-}
-
-func CTLBSetGlobals(_ *Map, _ time.Duration, _ bool) error {
-	panic("LIBBPF syscall stub")
-}
-
-func XDPSetGlobals(_ *Map, _ *XDPGlobalData) error {
-	panic("LIBBPF syscall stub")
-}
 
 func (m *Map) SetSize(size int) error {
 	panic("LIBBPF syscall stub")
@@ -163,5 +220,61 @@ func ObjPin(_ int, _ string) error {
 }
 
 func ObjGet(_ string) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func MapUpdateBatch(fd int, k, v []byte, count int, flags uint64) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func MapDeleteBatch(fd int, k []byte, count int, flags uint64) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *TcGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *XDPGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *CTCleanupGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *CTLBGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) SetProgFlags(noTracePrintk bool) error {
+	panic("LIBBPF syscall stub")
+}
+
+func ProgQueryTcx(ifindex int, ingress bool) ([64]uint32, [64]uint32, uint32, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func ProgQueryNetkit(ifindex int, peer bool) ([64]uint32, [64]uint32, uint32, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func ProgName(id uint32) (string, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) AttachTCX(secName, ifName string) (*Link, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) AttachNetkit(secName, ifName string) (*Link, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func OpenObjectWithLogBuffer(filename string, buf []byte) (*Obj, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func CreateBPFMap(mapType string, keySize int, valueSize int, maxEntries int, flags int, name string) (int, error) {
 	panic("LIBBPF syscall stub")
 }

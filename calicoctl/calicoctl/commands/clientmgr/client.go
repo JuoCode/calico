@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,12 @@ import (
 	"os"
 
 	log "github.com/sirupsen/logrus"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
 
@@ -34,7 +37,20 @@ func NewClient(cf string) (client.Interface, error) {
 		log.Info("Error loading config")
 		return nil, err
 	}
-	log.Infof("Loaded client config: %#v", cfg.Spec)
+	// Do not log cfg.Spec directly (e.g. %#v / %+v / %v).
+	// It embeds K8sAPIToken, KubeconfigInline, EtcdPassword, EtcdKey, and EtcdCert.
+	log.WithFields(log.Fields{
+		"datastoreType":       cfg.Spec.DatastoreType,
+		"etcdEndpoints":       cfg.Spec.EtcdEndpoints,
+		"k8sAPIEndpoint":      cfg.Spec.K8sAPIEndpoint,
+		"kubeconfig":          cfg.Spec.Kubeconfig,
+		"kubeconfigInlineSet": cfg.Spec.KubeconfigInline != "",
+		"etcdUsernameSet":     cfg.Spec.EtcdUsername != "",
+		"etcdPasswordSet":     cfg.Spec.EtcdPassword != "",
+		"etcdKeyInlineSet":    cfg.Spec.EtcdKey != "",
+		"etcdCertInlineSet":   cfg.Spec.EtcdCert != "",
+		"k8sAPITokenSet":      cfg.Spec.K8sAPIToken != "",
+	}).Info("Loaded client config")
 	return NewClientFromConfig(cfg)
 }
 
@@ -60,4 +76,25 @@ func LoadClientConfig(cf string) (*apiconfig.CalicoAPIConfig, error) {
 	}
 
 	return apiconfig.LoadClientConfig(cf)
+}
+
+func GetClients(cf string) (kubeClient kubernetes.Interface, calicoClient client.Interface, bc bapi.Client, err error) {
+	calicoClient, err = NewClient(cf)
+	if err != nil {
+		return
+	}
+
+	// Get the backend client.
+	bc = calicoClient.(bapi.BackendAccessor).Backend()
+
+	// Get a kube-client. If this is a kdd cluster, we can pull this from the backend.
+	// Otherwise, we need to build one ourselves.
+	if kc, ok := bc.(*k8s.KubeClient); ok {
+		// Pull from the kdd client.
+		kubeClient = kc.ClientSet
+	}
+	// TODO: Support etcd mode. For now, this is OK since we don't actually
+	// use the kubeClient yet. But we will do so eventually.
+
+	return
 }

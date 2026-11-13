@@ -1,4 +1,4 @@
-// Copyright (c) 2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,12 @@
 package updateprocessors_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	"net/netip"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -40,10 +40,10 @@ var _ = Describe("Test the IPPool update processor", func() {
 	cidr1str := "1.2.3.0/24"
 	cidr2str := "aa:bb:cc::/120"
 	v1PoolKeyCidr1 := model.IPPoolKey{
-		CIDR: net.MustParseCIDR(cidr1str),
+		CIDR: netip.MustParsePrefix(cidr1str),
 	}
 	v1PoolKeyCidr2 := model.IPPoolKey{
-		CIDR: net.MustParseCIDR(cidr2str),
+		CIDR: netip.MustParsePrefix(cidr2str),
 	}
 
 	It("should handle conversion of valid IPPools", func() {
@@ -64,12 +64,13 @@ var _ = Describe("Test the IPPool update processor", func() {
 		Expect(kvps[0]).To(Equal(&model.KVPair{
 			Key: v1PoolKeyCidr1,
 			Value: &model.IPPool{
-				CIDR:             v1PoolKeyCidr1.CIDR,
-				IPIPMode:         encap.Undefined,
+				CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr1.CIDR),
+				IPIPMode:         encap.Never,
 				Masquerade:       false,
 				IPAM:             true,
 				Disabled:         false,
 				DisableBGPExport: false,
+				AssignmentMode:   apiv3.Automatic,
 			},
 			Revision: "abcde",
 		}))
@@ -103,26 +104,28 @@ var _ = Describe("Test the IPPool update processor", func() {
 			{
 				Key: v1PoolKeyCidr1,
 				Value: &model.IPPool{
-					CIDR:             v1PoolKeyCidr1.CIDR,
+					CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr1.CIDR),
 					IPIPInterface:    "tunl0",
 					IPIPMode:         encap.Always,
 					Masquerade:       true,
 					IPAM:             false,
 					Disabled:         true,
 					DisableBGPExport: false,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "1234",
 			},
 			{
 				Key: v1PoolKeyCidr2,
 				Value: &model.IPPool{
-					CIDR:             v1PoolKeyCidr2.CIDR,
+					CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr2.CIDR),
 					IPIPInterface:    "",
-					IPIPMode:         encap.Undefined,
+					IPIPMode:         encap.Never,
 					Masquerade:       false,
 					IPAM:             true,
 					Disabled:         false,
 					DisableBGPExport: false,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "abcdef",
 			},
@@ -143,15 +146,46 @@ var _ = Describe("Test the IPPool update processor", func() {
 			{
 				Key: v1PoolKeyCidr2,
 				Value: &model.IPPool{
-					CIDR:             v1PoolKeyCidr2.CIDR,
+					CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr2.CIDR),
 					IPIPInterface:    "",
-					IPIPMode:         encap.Undefined,
+					IPIPMode:         encap.Never,
 					Masquerade:       false,
 					IPAM:             true,
 					Disabled:         false,
 					DisableBGPExport: true,
+					AssignmentMode:   apiv3.Automatic,
 				},
 				Revision: "abcdefg",
+			},
+		}))
+
+		By("updating only the first IPPool's nodeSelector - expect an update that carries it")
+		res = apiv3.NewIPPool()
+		res.Name = v3PoolKey1.Name
+		res.Spec.CIDR = cidr2str
+		res.Spec.DisableBGPExport = true
+		res.Spec.NodeSelector = "!all()"
+		kvps, err = up.Process(&model.KVPair{
+			Key:      v3PoolKey1,
+			Value:    res,
+			Revision: "abcdefgh",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvps).To(Equal([]*model.KVPair{
+			{
+				Key: v1PoolKeyCidr2,
+				Value: &model.IPPool{
+					CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr2.CIDR),
+					IPIPInterface:    "",
+					IPIPMode:         encap.Never,
+					Masquerade:       false,
+					IPAM:             true,
+					Disabled:         false,
+					DisableBGPExport: true,
+					AssignmentMode:   apiv3.Automatic,
+					NodeSelector:     "!all()",
+				},
+				Revision: "abcdefgh",
 			},
 		}))
 
@@ -200,13 +234,14 @@ var _ = Describe("Test the IPPool update processor", func() {
 		Expect(kvps[0]).To(Equal(&model.KVPair{
 			Key: v1PoolKeyCidr1,
 			Value: &model.IPPool{
-				CIDR:             v1PoolKeyCidr1.CIDR,
-				IPIPMode:         encap.Undefined,
+				CIDR:             model.IPNetFromPrefix(v1PoolKeyCidr1.CIDR),
+				IPIPMode:         encap.Never,
 				Masquerade:       false,
 				IPAM:             true,
 				Disabled:         false,
 				DisableBGPExport: false,
 				VXLANMode:        encap.CrossSubnet,
+				AssignmentMode:   apiv3.Automatic,
 			},
 			Revision: "abcde",
 		}))
@@ -221,7 +256,7 @@ var _ = Describe("Test the IPPool update processor", func() {
 
 		_, err := up.Process(&model.KVPair{
 			Key: model.GlobalBGPPeerKey{
-				PeerIP: net.MustParseIP("1.2.3.4"),
+				PeerIP: model.AddrFromIP(net.MustParseIP("1.2.3.4")),
 			},
 			Value:    res,
 			Revision: "abcde",

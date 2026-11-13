@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/felix/iputils"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/dataplane/windows/hns"
+	"github.com/projectcalico/calico/felix/iputils"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
@@ -61,7 +61,7 @@ func NewPolicySets(hns HNSAPI, ipsets []IPSetCache, reader StaticRulesReader) *P
 
 // AddOrReplacePolicySet is responsible for the creation (or replacement) of a Policy set
 // and it is capable of processing either Profiles or Policies from the datastore.
-func (s *PolicySets) AddOrReplacePolicySet(setId string, policy interface{}) {
+func (s *PolicySets) AddOrReplacePolicySet(setId string, policy any) {
 	log.WithField("setID", setId).Info("Processing add/replace of Policy set")
 
 	// Process the policy/profile from the datastore and convert it into
@@ -114,7 +114,7 @@ func (s *PolicySets) RemovePolicySet(setId string) {
 // GetPolicySetRules receives a list of Policy set ids and it computes the complete
 // set of resultant HNS rules that are needed to enforce all of the Policy sets for the
 // specified direction.
-func (s *PolicySets) GetPolicySetRules(setIds []string, isInbound bool) (rules []*hns.ACLPolicy) {
+func (s *PolicySets) GetPolicySetRules(setIds []string, isInbound, endOfTierDrop bool) (rules []*hns.ACLPolicy) {
 	// Rules from the first set will receive the default rule priority
 	currentPriority := PolicyRuleBasePriority
 
@@ -171,14 +171,13 @@ func (s *PolicySets) GetPolicySetRules(setIds []string, isInbound bool) (rules [
 		}
 	}
 
-	// Apply a default block rule for this direction at the end of the policy
+	// Apply a default block or pass rule for this direction at the end of the policy
 	currentPriority++
-	rules = append(rules, s.NewRule(isInbound, currentPriority))
-
-	// Finally, for RS3 only, add default allow rule with a host-scope to allow traffic through
-	// the host windows firewall
-	rules = append(rules, s.NewHostRule(isInbound))
-
+	endOfTierRule := s.NewRule(isInbound, currentPriority)
+	if !endOfTierDrop {
+		endOfTierRule.Action = ActionPass
+	}
+	rules = append(rules, endOfTierRule)
 	return
 }
 
@@ -200,7 +199,7 @@ func (s *PolicySets) ProcessIpSetUpdate(ipSetId string) []string {
 			log.WithFields(log.Fields{"IPSetId": ipSetId, "Policy": policyId}).Error("Unable to find Policy set, this set will be skipped")
 			continue
 		}
-		s.AddOrReplacePolicySet(policySet.PolicySetMetadata.SetId, policySet.Policy)
+		s.AddOrReplacePolicySet(policySet.SetId, policySet.Policy)
 	}
 
 	// Return the policies which were recalculated as a result of this update
@@ -210,12 +209,11 @@ func (s *PolicySets) ProcessIpSetUpdate(ipSetId string) []string {
 // getPoliciesByIpSetId locates any Policy set(s) which reference the provided IP set
 func (s *PolicySets) getPoliciesByIpSetId(ipSetId string) (policies []string) {
 	for policySetId, policySet := range s.policySetIdToPolicySet {
-		policySet.IpSetIds.Iter(func(id string) error {
+		for id := range policySet.IpSetIds.All() {
 			if id == ipSetId {
 				policies = append(policies, policySetId)
 			}
-			return nil
-		})
+		}
 	}
 	return
 }
@@ -315,7 +313,7 @@ func (s *PolicySets) protoRuleToHnsRules(policyId string, pRule *proto.Rule, isI
 
 	// Filter the Src and Dst CIDRs to only the IP version that we're rendering
 	var filteredAll bool
-	ruleCopy := *pRule
+	ruleCopy := googleproto.Clone(pRule).(*proto.Rule)
 
 	ruleCopy.SrcNet, filteredAll = filterNets(pRule.SrcNet, ipVersion)
 	if filteredAll {
@@ -352,7 +350,9 @@ func (s *PolicySets) protoRuleToHnsRules(policyId string, pRule *proto.Rule, isI
 		aclPolicy.Action = hns.Allow
 	case "deny":
 		aclPolicy.Action = hns.Block
-	case "next-tier", "pass", "log":
+	case "next-tier", "pass":
+		aclPolicy.Action = ActionPass
+	case "log":
 		logCxt.WithField("action", ruleCopy.Action).Info("This rule action is not supported, rule will be skipped")
 		return nil, ErrNotSupported
 	default:
@@ -593,16 +593,11 @@ func protoPortToHCSPort(port *proto.PortRange) string {
 
 // This function will create chunks of ports/ports range with chunksize
 func SplitPortList(ports []*proto.PortRange, chunkSize int) (splits [][]*proto.PortRange) {
-
 	if len(ports) == 0 {
 		splits = append(splits, []*proto.PortRange{})
 	}
 	for i := 0; i < len(ports); i += chunkSize {
-		last := i + chunkSize
-
-		if last > len(ports) {
-			last = len(ports)
-		}
+		last := min(i+chunkSize, len(ports))
 
 		splits = append(splits, ports[i:last])
 	}
@@ -611,16 +606,11 @@ func SplitPortList(ports []*proto.PortRange, chunkSize int) (splits [][]*proto.P
 
 // This function will create chunks of IP addresses/Cidr with chunksize
 func SplitIPList(ipAddrs []string, chunkSize int) (splits [][]string) {
-
 	if len(ipAddrs) == 0 {
 		splits = append(splits, []string{})
 	}
 	for i := 0; i < len(ipAddrs); i += chunkSize {
-		last := i + chunkSize
-
-		if last > len(ipAddrs) {
-			last = len(ipAddrs)
-		}
+		last := min(i+chunkSize, len(ipAddrs))
 
 		splits = append(splits, ipAddrs[i:last])
 	}

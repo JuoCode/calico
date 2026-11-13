@@ -7,15 +7,13 @@ import (
 	"fmt"
 	"reflect"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 type apiServerStrategy struct {
@@ -42,11 +40,11 @@ func (apiServerStrategy) Validate(ctx context.Context, obj runtime.Object) field
 	return field.ErrorList{}
 }
 
-func (apiServerStrategy) AllowCreateOnUpdate() bool {
+func (apiServerStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (apiServerStrategy) AllowUnconditionalUpdate() bool {
+func (apiServerStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -70,7 +68,7 @@ func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	if !ok {
 		return nil, nil, fmt.Errorf("given object (type: %v) is not a Host Endpoint", reflect.TypeOf(obj))
 	}
-	return labels.Set(apiserver.ObjectMeta.Labels), HostEndpointToSelectableFields(apiserver), nil
+	return labels.Set(apiserver.Labels), HostEndpointToSelectableFields(apiserver), nil
 }
 
 // MatchHostEndpoint is the filter used by the generic etcd backend to watch events
@@ -85,5 +83,8 @@ func MatchHostEndpoint(label labels.Selector, field fields.Selector) storage.Sel
 
 // HostEndpointToSelectableFields returns a field set that represents the object.
 func HostEndpointToSelectableFields(obj *calico.HostEndpoint) fields.Set {
-	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, false)
+	return fields.Set{
+		"metadata.name": obj.Name,
+		"spec.node":     obj.Spec.Node,
+	}
 }

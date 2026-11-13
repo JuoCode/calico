@@ -315,7 +315,7 @@ func (leg Leg) AsBytes() []byte {
 	setBit(&bits, 4, leg.Approved)
 	setBit(&bits, 5, leg.Opener)
 
-	binary.LittleEndian.PutUint32(bytes[legExtra+0:legExtra+4], leg.Seqno)
+	binary.BigEndian.PutUint32(bytes[legExtra+0:legExtra+4], leg.Seqno)
 	binary.LittleEndian.PutUint32(bytes[legExtra+4:legExtra+8], bits)
 	binary.LittleEndian.PutUint32(bytes[legExtra+8:legExtra+12], leg.Ifindex)
 
@@ -464,7 +464,7 @@ func (e Value) Upgrade() maps.Upgradable {
 	var val3 v3.Value
 
 	ctType := e.Type()
-	copy(val3[v3.VoCreated:v3.VoFlags2+1], e[voCreated:voFlags2+1])
+	copy(val3[v3.VoLastSeen:v3.VoFlags2+1], e[voLastSeen:voFlags2+1]) // Do not copy Created
 
 	switch ctType {
 	case TypeNormal, TypeNATReverse:

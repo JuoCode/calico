@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ func PortString() string {
 	return strconv.Itoa(Port)
 }
 
-func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) (out string, err error) {
+func GetRawMetrics(ip string, port int, caFile, certFile, keyFile string) (out string, err error) {
 	httpClient := http.Client{Timeout: time.Second}
 	defer httpClient.CloseIdleConnections()
 	method := "http"
@@ -88,7 +88,7 @@ func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) 
 			ok := transport.TLSClientConfig.RootCAs.AppendCertsFromPEM(caPEMBlock)
 			if !ok {
 				log.Error("Failed to add CA data to pool")
-				return "", errors.New("Failed to add CA data to pool")
+				return "", errors.New("failed to add CA data to pool")
 			}
 			transport.TLSClientConfig.VerifyPeerCertificate = tlsutils.CertificateVerifier(
 				log.WithField("caFile", caFile),
@@ -106,7 +106,7 @@ func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) 
 		httpClient.Transport = &http.Transport{}
 	}
 	var resp *http.Response
-	resp, err = httpClient.Get(fmt.Sprintf("%v://%v:%v/metrics", method, ip, port))
+	resp, err = httpClient.Get(fmt.Sprintf("%s://%s/metrics", method, net.JoinHostPort(ip, strconv.Itoa(port))))
 	if err != nil {
 		return
 	}
@@ -114,7 +114,7 @@ func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		err = fmt.Errorf("Bad response (%v) from metrics server", resp.StatusCode)
+		err = fmt.Errorf("bad response (%v) from metrics server", resp.StatusCode)
 		return
 	}
 
@@ -126,7 +126,7 @@ func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) 
 }
 
 func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (metric string, err error) {
-	metrics, err := GetRawMetrics(ip, port, name, caFile, certFile, keyFile)
+	metrics, err := GetRawMetrics(ip, port, caFile, certFile, keyFile)
 	if err != nil {
 		return "", fmt.Errorf("failed to load metrics: %w", err)
 	}

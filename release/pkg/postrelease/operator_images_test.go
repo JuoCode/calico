@@ -1,0 +1,78 @@
+// Copyright (c) 2026 Tigera, Inc. All rights reserved.
+
+package postrelease
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/projectcalico/calico/release/internal/command"
+	"github.com/projectcalico/calico/release/internal/registry"
+)
+
+func fqOperatorImage(t testing.TB) string {
+	t.Helper()
+	checkVersion(t, operatorVersion)
+	return fmt.Sprintf("%s/%s:%s", registry.DefaultOperatorRegistry, registry.OperatorImage, operatorVersion)
+}
+
+func TestOperatorPrintedImagesInExpectedList(t *testing.T) {
+	t.Parallel()
+
+	checkVersion(t, operatorVersion)
+	checkImages(t, images)
+
+	fqOperatorImage := fqOperatorImage(t)
+
+	// Pull the operator image.
+	t.Logf("Pulling operator image %s", fqOperatorImage)
+	if _, err := command.Runner(commandRunner).Run("docker", []string{"pull", fqOperatorImage}); err != nil {
+		t.Fatalf("failed to pull operator image %s: %v", fqOperatorImage, err)
+	}
+
+	t.Logf("Running operator image %s with --print-images=listcalico", fqOperatorImage)
+	out, err := command.Runner(commandRunner).Run("docker", []string{"run", "--rm", fqOperatorImage, "--print-images=listcalico"})
+	if err != nil {
+		t.Fatalf("failed to run operator image %s with --print-images=listcalico: %v\n%s", fqOperatorImage, err, string(out))
+	}
+
+	// Build a set of expected image names from the images flag.
+	expectedImages := make(map[string]bool)
+	for image := range strings.SplitSeq(images, " ") {
+		if image != "" {
+			expectedImages[image] = true
+		}
+	}
+
+	// Parse the output and check that every calico image is in our expected list.
+	calicoPrefix := registry.DefaultProductRegistry + "/"
+	var missing []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, registry.OperatorImage) {
+			continue
+		}
+		// Extract the image name from the fully qualified image reference.
+		// e.g. "quay.io/calico/node:v3.31.1" -> "node"
+		withoutRegistry := strings.TrimPrefix(line, calicoPrefix)
+		imageName, _, _ := strings.Cut(withoutRegistry, ":")
+		if imageName == "" {
+			continue
+		}
+
+		if !expectedImages[imageName] {
+			missing = append(missing, fmt.Sprintf("%s (from %s)", imageName, line))
+		}
+	}
+
+	if len(missing) > 0 {
+		t.Fatalf("The following calico images printed by the operator are not in the expected images list:\n  %s\nExpected images: %s",
+			strings.Join(missing, "\n  "),
+			images)
+	}
+	t.Logf("All calico images from operator --print-images=list are in the expected images list")
+}

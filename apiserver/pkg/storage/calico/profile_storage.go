@@ -3,22 +3,18 @@
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 // NewProfileStorage creates a new libcalico-based storage.Interface implementation for Profiles
@@ -55,10 +51,10 @@ func NewProfileStorage(opts Options) (registry.DryRunnableStorage, factory.Destr
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.Profile{}),
-		aapiListType:      reflect.TypeOf(aapi.ProfileList{}),
-		libCalicoType:     reflect.TypeOf(api.Profile{}),
-		libCalicoListType: reflect.TypeOf(api.ProfileList{}),
+		aapiType:          reflect.TypeFor[api.Profile](),
+		aapiListType:      reflect.TypeFor[api.ProfileList](),
+		libCalicoType:     reflect.TypeFor[api.Profile](),
+		libCalicoListType: reflect.TypeFor[api.ProfileList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -76,7 +72,7 @@ type ProfileConverter struct {
 }
 
 func (gc ProfileConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiProfile := aapiObj.(*aapi.Profile)
+	aapiProfile := aapiObj.(*api.Profile)
 	lcgProfile := &api.Profile{}
 	lcgProfile.TypeMeta = aapiProfile.TypeMeta
 	lcgProfile.ObjectMeta = aapiProfile.ObjectMeta
@@ -88,7 +84,7 @@ func (gc ProfileConverter) convertToLibcalico(aapiObj runtime.Object) resourceOb
 
 func (gc ProfileConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgProfile := libcalicoObject.(*api.Profile)
-	aapiProfile := aapiObj.(*aapi.Profile)
+	aapiProfile := aapiObj.(*api.Profile)
 	aapiProfile.Spec = lcgProfile.Spec
 	aapiProfile.TypeMeta = lcgProfile.TypeMeta
 	aapiProfile.ObjectMeta = lcgProfile.ObjectMeta
@@ -96,15 +92,15 @@ func (gc ProfileConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj
 
 func (gc ProfileConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgProfileList := libcalicoListObject.(*api.ProfileList)
-	aapiProfileList := aapiListObj.(*aapi.ProfileList)
+	aapiProfileList := aapiListObj.(*api.ProfileList)
 	if libcalicoListObject == nil {
-		aapiProfileList.Items = []aapi.Profile{}
+		aapiProfileList.Items = []api.Profile{}
 		return
 	}
 	aapiProfileList.TypeMeta = lcgProfileList.TypeMeta
 	aapiProfileList.ListMeta = lcgProfileList.ListMeta
 	for _, item := range lcgProfileList.Items {
-		aapiProfile := aapi.Profile{}
+		aapiProfile := api.Profile{}
 		gc.convertToAAPI(&item, &aapiProfile)
 		if matched, err := pred.Matches(&aapiProfile); err == nil && matched {
 			aapiProfileList.Items = append(aapiProfileList.Items, aapiProfile)

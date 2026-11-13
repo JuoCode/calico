@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,46 +16,119 @@ package conntrack
 
 import (
 	"net"
+	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	"github.com/projectcalico/calico/felix/bpf/conntrack/timeouts"
+	v4 "github.com/projectcalico/calico/felix/bpf/conntrack/v4"
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/timeshim"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
-type Timeouts struct {
-	CreationGracePeriod time.Duration
+var (
+	conntrackGaugeExpired = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_expired",
+		Help: "Number of entries cleaned during a conntrack table sweep due to expiration",
+	}, []string{"ip_version"})
+	conntrackCountersExpired = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "felix_bpf_conntrack_expired_total",
+		Help: "Total number of entries cleaned during conntrack table sweep due to expiration - by reason",
+	}, []string{"reason", "ip_version"})
+	conntrackGaugeStaleNAT = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_stale_nat",
+		Help: "Number of entries cleaned during a conntrack table sweep due to stale NAT",
+	}, []string{"ip_version"})
+	conntrackCounterStaleNAT = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "felix_bpf_conntrack_stale_nat_total",
+		Help: "Total number of entries cleaned during conntrack table sweeps due to stale NAT",
+	}, []string{"ip_version"})
+)
 
-	TCPPreEstablished time.Duration
-	TCPEstablished    time.Duration
-	TCPFinsSeen       time.Duration
-	TCPResetSeen      time.Duration
-
-	UDPLastSeen time.Duration
-
-	// GenericIPLastSeen is the timeout for IP protocols that we don't know.
-	GenericIPLastSeen time.Duration
-
-	ICMPLastSeen time.Duration
+func init() {
+	prometheus.MustRegister(conntrackGaugeExpired)
+	prometheus.MustRegister(conntrackCountersExpired)
+	prometheus.MustRegister(conntrackGaugeStaleNAT)
+	prometheus.MustRegister(conntrackCounterStaleNAT)
 }
 
-func DefaultTimeouts() Timeouts {
-	return Timeouts{
-		CreationGracePeriod: 10 * time.Second,
-		TCPPreEstablished:   20 * time.Second,
-		TCPEstablished:      time.Hour,
-		TCPFinsSeen:         30 * time.Second,
-		TCPResetSeen:        40 * time.Second,
-		UDPLastSeen:         60 * time.Second,
-		GenericIPLastSeen:   600 * time.Second,
-		ICMPLastSeen:        5 * time.Second,
+type WorkloadRemoveScannerTCP struct {
+	mutex      sync.Mutex
+	ips        set.Set[string]
+	removedIPs set.Set[string]
+	ipCh       chan string
+	done       chan struct{}
+}
+
+func NewWorkloadRemoveScannerTCP(ipCh chan string) *WorkloadRemoveScannerTCP {
+	wrs := &WorkloadRemoveScannerTCP{
+		ips:        set.New[string](),
+		removedIPs: set.New[string](),
+		ipCh:       ipCh,
+		done:       make(chan struct{}),
+	}
+	go wrs.run()
+	return wrs
+}
+
+func (w *WorkloadRemoveScannerTCP) run() {
+	defer close(w.done)
+	for {
+		ip, ok := <-w.ipCh
+		if !ok {
+			return
+		}
+		w.mutex.Lock()
+		w.ips.Add(ip)
+		log.Debugf("WorkloadRemoveScanner added %s to IPs to check", ip)
+		w.mutex.Unlock()
 	}
 }
 
+func (w *WorkloadRemoveScannerTCP) IterationStart() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.removedIPs = w.ips.Copy()
+	w.ips = set.New[string]()
+}
+
+// IterationEnd satisfies EntryScannerSynced
+func (w *WorkloadRemoveScannerTCP) IterationEnd() {
+	w.mutex.Lock()
+	w.removedIPs = set.New[string]()
+	w.mutex.Unlock()
+}
+
+func (w *WorkloadRemoveScannerTCP) Stop() {
+	close(w.ipCh) // This breaks the 'for range' loop in run()
+	<-w.done      // Wait for the goroutine to actually finish
+}
+
+func (w *WorkloadRemoveScannerTCP) Check(ctKey KeyInterface, ctVal ValueInterface, get EntryGet) (ScanVerdict, int64) {
+	srcIP := ctKey.AddrA().String()
+	dstIP := ctKey.AddrB().String()
+	if ctKey.Proto() == ProtoTCP &&
+		(w.removedIPs.Contains(srcIP) || w.removedIPs.Contains(dstIP)) {
+		log.WithField("key", ctKey).Debug("Marking conntrack entry for sending RST due to workload removal")
+		// We found a conntrack entry that has the workload IP as source or destination.
+		// Mark it for RST sending.
+		return ScanVerdictSendRST, ctVal.LastSeen()
+	}
+	return ScanVerdictOK, ctVal.LastSeen()
+}
+
+func (w *WorkloadRemoveScannerTCP) NumIPsPending() int {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	return w.ips.Len()
+}
+
 type LivenessScanner struct {
-	timeouts Timeouts
+	timeouts timeouts.Timeouts
 	dsr      bool
 	time     timeshim.Interface
 
@@ -64,13 +137,27 @@ type LivenessScanner struct {
 	goTimeOfLastKTimeLookup time.Time
 	// cachedKTime is the most recent kernel time.
 	cachedKTime int64
+	cleaned     int
+
+	ipFamily       string
+	expiredGauge   prometheus.Gauge
+	reasonCounters map[string]prometheus.Counter
+
+	// linuxHolds, when set, keeps an RST'd connlimit entry whose flow Linux
+	// conntrack still carries.
+	linuxHolds     func(k KeyInterface, v ValueInterface) (bool, error)
+	linuxErrLogged bool
 }
 
-func NewLivenessScanner(timeouts Timeouts, dsr bool, opts ...LivenessScannerOpt) *LivenessScanner {
+func NewLivenessScanner(timeouts timeouts.Timeouts, dsr bool, ipFamily int, opts ...LivenessScannerOpt) *LivenessScanner {
+	family := ipFamilyLabel(ipFamily)
 	ls := &LivenessScanner{
-		timeouts: timeouts,
-		dsr:      dsr,
-		time:     timeshim.RealTime(),
+		timeouts:       timeouts,
+		dsr:            dsr,
+		time:           timeshim.RealTime(),
+		ipFamily:       family,
+		expiredGauge:   conntrackGaugeExpired.WithLabelValues(family),
+		reasonCounters: make(map[string]prometheus.Counter),
 	}
 	for _, opt := range opts {
 		opt(ls)
@@ -86,7 +173,29 @@ func WithTimeShim(shim timeshim.Interface) LivenessScannerOpt {
 	}
 }
 
-func (l *LivenessScanner) Check(ctKey KeyInterface, ctVal ValueInterface, get EntryGet) ScanVerdict {
+// WithLinuxConntrack makes the scanner keep an RST'd connlimit entry while
+// Linux conntrack carries its flow.
+func WithLinuxConntrack(holds func(k KeyInterface, v ValueInterface) (bool, error)) LivenessScannerOpt {
+	return func(ls *LivenessScanner) {
+		ls.linuxHolds = holds
+	}
+}
+
+func (l *LivenessScanner) reasonCounterInc(reason string) {
+	c, ok := l.reasonCounters[reason]
+	if !ok {
+		var err error
+		c, err = conntrackCountersExpired.GetMetricWithLabelValues(reason, l.ipFamily)
+		if err != nil {
+			log.WithError(err).Panicf("Failed to get conntrackCountersExpired counter for reason%q", reason)
+		}
+		l.reasonCounters[reason] = c
+	}
+	c.Inc()
+	l.cleaned++
+}
+
+func (l *LivenessScanner) Check(ctKey KeyInterface, ctVal ValueInterface, get EntryGet) (ScanVerdict, int64) {
 	if l.cachedKTime == 0 || l.time.Since(l.goTimeOfLastKTimeLookup) > time.Second {
 		l.cachedKTime = l.time.KTimeNanos()
 		l.goTimeOfLastKTimeLookup = l.time.Now()
@@ -95,100 +204,131 @@ func (l *LivenessScanner) Check(ctKey KeyInterface, ctVal ValueInterface, get En
 
 	debug := log.GetLevel() >= log.DebugLevel
 
+	lastSeen := ctVal.LastSeen()
 	switch ctVal.Type() {
 	case TypeNATForward:
-		// Look up the reverse entry, where we do the book-keeping.
+		// Look up the reverse entry, where we do the bookkeeping.
 		revEntry, err := get(ctVal.ReverseNATKey())
 		if err != nil && maps.IsNotExists(err) {
 			// Forward entry exists but no reverse entry. We might have come across the reverse
 			// entry first and removed it. It is useless on its own, so delete it now.
-			//
-			// N.B. BPF code always creates REV entry before FWD entry, therefore if the REV
-			// entry does not exist now, we are not racing with the BPF code, we must have
-			// removed the entry or there is some external inconsistency. In either case, the
-			// FWD entry should be removed.
-			log.Debug("Found a forward NAT conntrack entry with no reverse entry, removing...")
-			return ScanVerdictDelete
-		} else if err != nil {
-			log.WithError(err).Warn("Failed to look up conntrack entry.")
-			return ScanVerdictOK
-		}
-		if reason, expired := l.timeouts.EntryExpired(now, ctKey.Proto(), revEntry); expired {
+			l.reasonCounterInc("no reverse for forward")
 			if debug {
-				log.WithField("reason", reason).Debug("Deleting expired conntrack forward-NAT entry")
+				log.WithField("k", ctKey).Debug("Deleting forward NAT conntrack entry with no reverse entry.")
 			}
-			return ScanVerdictDelete
+			return ScanVerdictDelete, lastSeen
+		} else if err != nil {
+			log.WithFields(log.Fields{
+				"fwdKey": ctKey,
+				"revKey": ctVal.ReverseNATKey(),
+			}).WithError(err).Warn("Failed to look up reverse conntrack entry.")
+
+			return ScanVerdictOK, lastSeen
+		}
+		if revEntry.Type() != TypeNATReverse || !fwdMatchesRev(ctKey, revEntry) {
+			// Another flow now owns the reverse key. Returning our own lastSeen
+			// deletes only this entry, not that flow's.
+			l.reasonCounterInc("no reverse for forward")
+			if debug {
+				log.WithField("k", ctKey).Debug("Deleting forward NAT conntrack entry whose reverse key belongs to another flow.")
+			}
+			return ScanVerdictDelete, lastSeen
+		}
+		if reason, expired := l.expired(now, ctVal.ReverseNATKey(), revEntry); expired {
+			if debug {
+				log.WithFields(log.Fields{
+					"reason": reason,
+					"key":    ctKey,
+				}).Debug("Deleting expired conntrack forward-NAT entry")
+			}
+			l.reasonCounterInc(reason)
+			return ScanVerdictDelete, revEntry.LastSeen()
 			// do not delete the reverse entry yet to avoid breaking the iterating
 			// over the map.  We must not delete other than the current key. We remove
 			// it once we come across it again.
 		}
 	case TypeNATReverse:
-		if reason, expired := l.timeouts.EntryExpired(now, ctKey.Proto(), ctVal); expired {
+		if reason, expired := l.expired(now, ctKey, ctVal); expired {
 			if debug {
-				log.WithField("reason", reason).Debug("Deleting expired conntrack reverse-NAT entry")
+				log.WithFields(log.Fields{
+					"reason": reason,
+					"key":    ctKey,
+				}).Debug("Deleting expired conntrack reverse-NAT entry")
 			}
-			return ScanVerdictDelete
+			l.reasonCounterInc(reason)
+			return ScanVerdictDelete, lastSeen
 		}
 	case TypeNormal:
-		if reason, expired := l.timeouts.EntryExpired(now, ctKey.Proto(), ctVal); expired {
+		if reason, expired := l.expired(now, ctKey, ctVal); expired {
 			if debug {
-				log.WithField("reason", reason).Debug("Deleting expired normal conntrack entry")
+				log.WithFields(log.Fields{
+					"reason": reason,
+					"key":    ctKey,
+				}).Debug("Deleting expired normal conntrack entry")
 			}
-			return ScanVerdictDelete
+			l.reasonCounterInc(reason)
+			return ScanVerdictDelete, lastSeen
 		}
 	default:
-		log.WithField("type", ctVal.Type()).Warn("Unknown conntrack entry type!")
+		log.WithFields(log.Fields{
+			"type": ctVal.Type(),
+			"key":  ctKey,
+		}).Warn("Unknown conntrack entry type!")
 	}
-
-	return ScanVerdictOK
+	return ScanVerdictOK, lastSeen
 }
 
-// EntryExpired checks whether a given conntrack table entry for a given
-// protocol and time, is expired.
-func (t *Timeouts) EntryExpired(nowNanos int64, proto uint8, entry ValueInterface) (reason string, expired bool) {
-	sinceCreation := time.Duration(nowNanos - entry.Created())
-	if sinceCreation < t.CreationGracePeriod {
-		log.Debug("Conntrack entry in creation grace period. Ignoring.")
-		return
+// fwdMatchesRev reports whether fwdKey is rev's original client and service. Keep in sync with ct_fwd_matches_rev.
+func fwdMatchesRev(fwdKey KeyInterface, rev ValueInterface) bool {
+	origIP, origPort := rev.OrigIP(), rev.OrigPort()
+	clientMatches := func(ip net.IP, port uint16) bool {
+		return (rev.OrigSrcIP().IsUnspecified() || ip.Equal(rev.OrigSrcIP())) &&
+			(rev.OrigSPort() == 0 || port == 0 || port == rev.OrigSPort())
 	}
-	age := time.Duration(nowNanos - entry.LastSeen())
-	switch proto {
-	case ProtoTCP:
-		dsr := entry.IsForwardDSR()
-		data := entry.Data()
-		rstSeen := data.RSTSeen()
-		if rstSeen && age > t.TCPResetSeen {
-			return "RST seen", true
-		}
-		finsSeen := (dsr && data.FINsSeenDSR()) || data.FINsSeen()
-		if finsSeen && age > t.TCPFinsSeen {
-			// Both legs have been finished, tear down.
-			return "FINs seen", true
-		}
-		if data.Established() || dsr {
-			if age > t.TCPEstablished {
-				return "no traffic on established flow for too long", true
-			}
-		} else {
-			if age > t.TCPPreEstablished {
-				return "no traffic on pre-established flow for too long", true
-			}
+	if fwdKey.AddrA().Equal(origIP) && fwdKey.PortA() == origPort {
+		return clientMatches(fwdKey.AddrB(), fwdKey.PortB())
+	}
+	if fwdKey.AddrB().Equal(origIP) && fwdKey.PortB() == origPort {
+		return clientMatches(fwdKey.AddrA(), fwdKey.PortA())
+	}
+	return false
+}
+
+// expired is EntryExpired, except that an RST reap of a connlimit entry waits
+// while Linux conntrack carries its flow.
+func (l *LivenessScanner) expired(now int64, k KeyInterface, v ValueInterface) (string, bool) {
+	reason, expired := EntryExpired(l.timeouts, now, k.Proto(), v)
+	if !expired || l.linuxHolds == nil || (reason != reasonRSTSeen && reason != reasonRSTResidual) ||
+		v.Flags()&(v4.FlagConnLimitIn|v4.FlagConnLimitOut) == 0 {
+		return reason, expired
+	}
+	// An idle flow is reaped at TCPEstablished whatever Linux holds.
+	if time.Duration(now-v.LastSeen()) > l.timeouts.TCPEstablished {
+		return reasonEstablishedIdle, true
+	}
+	held, err := l.linuxHolds(k, v)
+	if err != nil {
+		if !l.linuxErrLogged {
+			log.WithError(err).Warn("Failed to look up Linux conntrack; keeping RST'd connlimit entries.")
+			l.linuxErrLogged = true
 		}
 		return "", false
-	case ProtoICMP, ProtoICMP6:
-		if age > t.ICMPLastSeen {
-			return "no traffic on ICMP flow for too long", true
-		}
-	case ProtoUDP:
-		if age > t.UDPLastSeen {
-			return "no traffic on UDP flow for too long", true
-		}
-	default:
-		if age > t.GenericIPLastSeen {
-			return "no traffic on generic IP flow for too long", true
-		}
 	}
-	return "", false
+	if held {
+		return "", false
+	}
+	return reason, true
+}
+
+// IterationStart satisfies EntryScannerSynced
+func (l *LivenessScanner) IterationStart() {
+	l.linuxErrLogged = false
+}
+
+// IterationEnd satisfies EntryScannerSynced
+func (l *LivenessScanner) IterationEnd() {
+	l.expiredGauge.Set(float64(l.cleaned))
+	l.cleaned = 0
 }
 
 // NATChecker returns true a given combination of frontend-backend exists
@@ -196,31 +336,73 @@ type NATChecker interface {
 	ConntrackScanStart()
 	ConntrackScanEnd()
 	ConntrackFrontendHasBackend(ip net.IP, port uint16, backendIP net.IP, backendPort uint16, proto uint8) bool
+	ConntrackDestIsService(ip net.IP, port uint16, proto uint8) bool
 }
 
 // StaleNATScanner removes any entries to frontend that do not have the backend anymore.
 type StaleNATScanner struct {
 	natChecker NATChecker
+	cleaned    int
+
+	staleNATGauge   prometheus.Gauge
+	staleNATCounter prometheus.Counter
 }
 
 // NewStaleNATScanner returns an EntryScanner that checks if entries have
 // existing NAT entries using the provided NATChecker and if not, it deletes
 // them.
-func NewStaleNATScanner(frontendHasBackend NATChecker) *StaleNATScanner {
+func NewStaleNATScanner(frontendHasBackend NATChecker, ipFamily int) *StaleNATScanner {
+	family := ipFamilyLabel(ipFamily)
 	return &StaleNATScanner{
-		natChecker: frontendHasBackend,
+		natChecker:      frontendHasBackend,
+		staleNATGauge:   conntrackGaugeStaleNAT.WithLabelValues(family),
+		staleNATCounter: conntrackCounterStaleNAT.WithLabelValues(family),
 	}
 }
 
 // Check checks the conntrack entry
-func (sns *StaleNATScanner) Check(k KeyInterface, v ValueInterface, get EntryGet) ScanVerdict {
+func (sns *StaleNATScanner) Check(k KeyInterface, v ValueInterface, get EntryGet) (ScanVerdict, int64) {
 	debug := log.GetLevel() >= log.DebugLevel
+
+	lastSeen := v.LastSeen()
+	if k.Proto() == ProtoTCP {
+		// we do not handle TCP for the below reasons.
+		// sns.natChecker.ConntrackFrontendHasBackend returns false if the service gets deleted
+		// or there are no backends. For TCP, we can still let the connection flow even if the service
+		// gets deleted as long as the backend is alive. When the backend is removed, We add a flag to the
+		// conntrack entry to send a RST, so the connection will be closed properly.
+		return ScanVerdictOK, lastSeen
+	}
 
 again:
 
 	switch v.Type() {
 	case TypeNormal:
-		// skip non-NAT entry
+		proto := k.Proto()
+		// Check if we have an entry to a service IP:port without it being
+		// NATed. Remove such entry as it was created when the service wasn't
+		// programmed yet and there was a NAT miss.
+		//
+		// When CTLB is used, we should not see service ip:port on the wire at
+		// all.
+
+		var (
+			ip   net.IP
+			port uint16
+		)
+
+		if v.Flags()&v4.FlagSrcDstBA != 0 {
+			ip = k.AddrA()
+			port = k.PortA()
+		} else {
+			ip = k.AddrB()
+			port = k.PortB()
+		}
+
+		if sns.natChecker.ConntrackDestIsService(ip, port, proto) {
+			log.WithField("key", k).Debugf("TypeNormal to UDP service IP is stale")
+			return ScanVerdictDeleteImmediate, lastSeen
+		}
 
 	case TypeNATReverse:
 
@@ -242,7 +424,9 @@ again:
 			if debug {
 				log.WithField("key", k).Debugf("TypeNATReverse is stale")
 			}
-			return ScanVerdictDelete
+			sns.cleaned++
+			sns.staleNATCounter.Inc()
+			return ScanVerdictDeleteImmediate, lastSeen
 		}
 		if debug {
 			log.WithField("key", k).Debugf("TypeNATReverse still active")
@@ -303,7 +487,7 @@ again:
 								Debug("Mismatch between key and rev key - " +
 									"deleting entry because reverse key does not exist.")
 						}
-						return ScanVerdictDelete
+						return ScanVerdictDelete, lastSeen
 					} else {
 						if debug {
 							// In the worst case, the entry will timeout
@@ -311,7 +495,7 @@ again:
 								Debug("Mismatch between key and rev key - " +
 									"keeping entry, failed to retrieve reverse entry. Will try again.")
 						}
-						return ScanVerdictOK
+						return ScanVerdictOK, lastSeen
 					}
 				}
 				k = revKey
@@ -354,7 +538,7 @@ again:
 								Debug("Mismatch between key and rev key - " +
 									"deleting entry because reverse key does not exist.")
 						}
-						return ScanVerdictDelete
+						return ScanVerdictDelete, lastSeen
 					} else {
 						if debug {
 							// In the worst case, the entry will timeout
@@ -362,7 +546,7 @@ again:
 								Debug("Mismatch between key and rev key - " +
 									"keeping entry, failed to retrieve reverse entry. Will try again.")
 						}
-						return ScanVerdictOK
+						return ScanVerdictOK, lastSeen
 					}
 				}
 				k = revKey
@@ -375,7 +559,9 @@ again:
 			if debug {
 				log.WithField("key", k).Debugf("TypeNATForward is stale")
 			}
-			return ScanVerdictDelete
+			sns.cleaned++
+			sns.staleNATCounter.Inc()
+			return ScanVerdictDeleteImmediate, lastSeen
 		}
 		if debug {
 			log.WithField("key", k).Debugf("TypeNATForward still active")
@@ -385,7 +571,7 @@ again:
 		log.WithField("conntrack.Value.Type()", v.Type()).Warn("Unknown type")
 	}
 
-	return ScanVerdictOK
+	return ScanVerdictOK, lastSeen
 
 reverse:
 	if v.Type() == TypeNATReverse {
@@ -398,7 +584,7 @@ reverse:
 				"deleting entry because reverse key does not point to a reverse entry.")
 	}
 
-	return ScanVerdictDelete
+	return ScanVerdictDelete, lastSeen
 }
 
 // IterationStart satisfies EntryScannerSynced
@@ -409,4 +595,73 @@ func (sns *StaleNATScanner) IterationStart() {
 // IterationEnd satisfies EntryScannerSynced
 func (sns *StaleNATScanner) IterationEnd() {
 	sns.natChecker.ConntrackScanEnd()
+	sns.staleNATGauge.Set(float64(sns.cleaned))
+	sns.cleaned = 0
+}
+
+const (
+	reasonRSTSeen         = "RST seen"
+	reasonRSTResidual     = "no traffic on conn with RST with residual traffic for too long"
+	reasonEstablishedIdle = "no traffic on established flow for too long"
+)
+
+func entryDone(t timeouts.Timeouts, nowNanos int64, proto uint8, entry ValueInterface, finishedOnly bool) (string, bool) {
+	age := time.Duration(nowNanos - entry.LastSeen())
+	switch proto {
+	case ProtoTCP:
+		dsr := entry.IsForwardDSR()
+		data := entry.Data()
+		rstSeen := data.RSTSeen()
+		if rstSeen && age > t.TCPResetSeen {
+			return reasonRSTSeen, true
+		}
+		finsSeen := (dsr && data.FINsSeenDSR()) || data.FINsSeen()
+		if finsSeen && (finishedOnly || age > t.TCPFinsSeen) {
+			// Both legs have been finished, tear down.
+			return "FINs seen", true
+		}
+		if data.Established() || dsr {
+			if entry.RSTSeen() != 0 && age > 2*60*time.Second {
+				return reasonRSTResidual, true
+			}
+			if age > t.TCPEstablished {
+				return reasonEstablishedIdle, true
+			}
+		} else {
+			if age > t.TCPSynSent {
+				return "no traffic on pre-established flow for too long", true
+			}
+		}
+		return "", false
+	case ProtoICMP, ProtoICMP6:
+		if age > t.ICMPTimeout {
+			return "no traffic on ICMP flow for too long", true
+		}
+	case ProtoUDP:
+		if age > t.UDPTimeout {
+			return "no traffic on UDP flow for too long", true
+		}
+	default:
+		if age > t.GenericTimeout {
+			return "no traffic on generic IP flow for too long", true
+		}
+	}
+	return "", false
+}
+
+// EntryExpired checks whether a given conntrack table entry for a given
+// protocol and time, is expired and can be deleted. If it returns true,
+// EntryFinished would also return true.
+//
+// WARNING: this implementation is duplicated in the conntrack_cleanup.c BPF
+// program.
+func EntryExpired(t timeouts.Timeouts, nowNanos int64, proto uint8, entry ValueInterface) (string, bool) {
+	return entryDone(t, nowNanos, proto, entry, false)
+}
+
+// EntryFinished checks whether a given conntrack table entry for a given
+// protocol and time, represents a finished/done connection. Not necessarily
+// expired and to be deleted. Just finished from apps point of view.
+func EntryFinished(t timeouts.Timeouts, nowNanos int64, proto uint8, entry ValueInterface) (string, bool) {
+	return entryDone(t, nowNanos, proto, entry, true)
 }

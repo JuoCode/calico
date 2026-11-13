@@ -15,13 +15,13 @@
 package config_test
 
 import (
-	"github.com/projectcalico/calico/felix/config"
-
 	"path"
 	"runtime"
 
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/felix/config"
 )
 
 const confFileSingleParamNoNewLine = `[ignored]
@@ -35,6 +35,10 @@ FelixHostname=hostname
 [logging]
 LogSeverityScreen=INFO
 LogSeveritySys=DEBUG`
+
+const confEmptyString = `[default]
+EndpointStatusPathPrefix=none
+`
 
 var _ = DescribeTable("File parameter parsing",
 	func(fileContent string, expected map[string]string) {
@@ -53,6 +57,9 @@ var _ = DescribeTable("File parameter parsing",
 		"FelixHostname":     "hostname",
 		"LogSeverityScreen": "INFO",
 		"LogSeveritySys":    "DEBUG",
+	}),
+	Entry("Setting 'none' value", confEmptyString, map[string]string{
+		"EndpointStatusPathPrefix": "none",
 	}),
 )
 

@@ -79,7 +79,7 @@ func (b *RestoreInputBuilder) EndTransaction() {
 }
 
 // writeFormattedLine writes a line to the internal buffer, appending a new line.
-func (b *RestoreInputBuilder) writeFormattedLine(format string, args ...interface{}) {
+func (b *RestoreInputBuilder) writeFormattedLine(format string, args ...any) {
 	_, err := fmt.Fprintf(&b.buf, format, args...)
 	if err != nil {
 		log.WithError(err).Panic("Failed to write to in-memory buffer")
@@ -114,7 +114,7 @@ func (b *RestoreInputBuilder) WriteForwardReference(chainName string) {
 // Panics if there is no open transaction.
 func (b *RestoreInputBuilder) WriteLine(line string) {
 	b.maybeWriteTransactionOpener()
-	b.writeFormattedLine(line)
+	b.writeFormattedLine("%s", line)
 }
 
 // GetBytesAndReset returns the contents of the buffer and, as a side effect, resets the buffer.  For performance,

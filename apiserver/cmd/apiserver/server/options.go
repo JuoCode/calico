@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,27 +19,29 @@ limitations under the License.
 package server
 
 import (
-	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 
+	"github.com/projectcalico/api/pkg/openapi"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
-
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	k8sopenapi "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
-	"k8s.io/klog/v2"
-
-	"github.com/projectcalico/api/pkg/openapi"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
+	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 )
+
+// watchTerminationGracePeriod is how long graceful shutdown gives open watches to end. Without it, watches are never
+// told to end, and shutdown waits out the 60s HTTP server shutdown timeout, past kubelet's 30s grace.
+const watchTerminationGracePeriod = 5 * time.Second
 
 // CalicoServerOptions contains the aggregation of configuration structs for
 // the calico server. It contains everything needed to configure a basic API server.
@@ -54,24 +56,24 @@ type CalicoServerOptions struct {
 	PrintSwagger    bool
 	SwaggerFilePath string
 
-	// Enable Admission Controller support.
-	EnableAdmissionController bool
+	// This Kubernetes feature was made default in k8s 1.30, but may not be enabled prior.
+	EnableValidatingAdmissionPolicy bool
 
 	StopCh <-chan struct{}
 }
 
-func (s *CalicoServerOptions) addFlags(flags *pflag.FlagSet) {
-	s.RecommendedOptions.AddFlags(flags)
+func (o *CalicoServerOptions) addFlags(flags *pflag.FlagSet) {
+	o.RecommendedOptions.AddFlags(flags)
 
-	flags.BoolVar(&s.EnableAdmissionController, "enable-admission-controller-support", s.EnableAdmissionController,
-		"If true, admission controller hooks will be enabled.")
-	flags.BoolVar(&s.PrintSwagger, "print-swagger", false,
+	flags.BoolVar(&o.PrintSwagger, "print-swagger", false,
 		"If true, prints swagger to stdout and exits.")
-	flags.StringVar(&s.SwaggerFilePath, "swagger-file-path", "./",
+	flags.StringVar(&o.SwaggerFilePath, "swagger-file-path", "./",
 		"If print-swagger is set true, then write swagger.json to location specified. Default is current directory.")
+	flags.BoolVar(&o.EnableValidatingAdmissionPolicy, "enable-validating-admission-policy", true,
+		"If true, establishes watches for ValidatingAdmissionPolicy at startup.")
 }
 
-func (o CalicoServerOptions) Validate(args []string) error {
+func (o *CalicoServerOptions) Validate(args []string) error {
 	errors := []error{}
 	errors = append(errors, o.RecommendedOptions.Validate()...)
 	return utilerrors.NewAggregate(errors)
@@ -90,8 +92,8 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
 	namer := k8sopenapi.NewDefinitionNamer(apiserver.Scheme)
 	version := "unversioned"
-	if serverConfig.Version != nil {
-		version = strings.Split(serverConfig.Version.String(), "-")[0]
+	if serverConfig.EffectiveVersion != nil {
+		version = serverConfig.EffectiveVersion.EmulationVersion().String()
 	}
 	serverConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapi.GetOpenAPIDefinitions, namer)
 	if serverConfig.OpenAPIConfig.Info.Version == "" {
@@ -118,18 +120,22 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 		return nil, err
 	}
 
-	// Explicitly setting cipher suites in order to remove deprecated ones
-	// The list is taken from https://github.com/golang/go/blob/dev.boringcrypto.go1.13/src/crypto/tls/boring.go#L54
-	cipherSuites := []uint16{
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	// We now build the APIServer against >= k8s v1.29.
+	// FlowControl API resources graduated to v1 in this version,
+	// so if we run this APIServer on a backlevel (<v1.29) cluster,
+	// it will never go ready, due to a failed fetch of the v1 resources.
+	o.RecommendedOptions.Features.EnablePriorityAndFairness = false
+
+	tlsCipherSuites, err := calicotls.ParseTLSCiphers(os.Getenv("TLS_CIPHER_SUITES"))
+	if err != nil {
+		return nil, err
 	}
-	serverConfig.SecureServing.CipherSuites = cipherSuites
-	serverConfig.SecureServing.MinTLSVersion = tls.VersionTLS12
+
+	serverConfig.SecureServing.CipherSuites = tlsCipherSuites
+	serverConfig.SecureServing.MinTLSVersion, err = calicotls.ParseTLSVersion(os.Getenv("TLS_MIN_VERSION"))
+	if err != nil {
+		return nil, err
+	}
 
 	if o.PrintSwagger {
 		o.DisableAuth = true
@@ -152,14 +158,17 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 			return nil, err
 		}
 	} else {
+		// Validating Admission Policy is generally available in k8s 1.30 [1].
+		// The admission plugin "ValidatingAdmissionPolicy" fails to initialize due to
+		// a missing authorizer. When DisableAuth=true, we need a always allow authorizer
+		// to pass ValidateInitialization checks.
+		// [1] https://kubernetes.io/blog/2024/04/24/validating-admission-policy-ga/
+		serverConfig.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
 		// always warn when auth is disabled, since this should only be used for testing
-		klog.Infof("Authentication and authorization disabled for testing purposes")
+		logrus.Info("Authentication and authorization disabled for testing purposes")
 	}
 
 	if err := o.RecommendedOptions.Audit.ApplyTo(&serverConfig.Config); err != nil {
-		return nil, err
-	}
-	if err := o.RecommendedOptions.Features.ApplyTo(&serverConfig.Config); err != nil {
 		return nil, err
 	}
 
@@ -171,8 +180,13 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	dynamicClient, err := dynamic.NewForConfig(serverConfig.ClientConfig)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := o.RecommendedOptions.Features.ApplyTo(&serverConfig.Config, kubeClient, serverConfig.SharedInformerFactory); err != nil {
 		return nil, err
 	}
 
@@ -184,6 +198,7 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 		kubeClient,
 		dynamicClient,
 		o.RecommendedOptions.FeatureGate,
+		serverConfig.EffectiveVersion,
 		initializers...); err != nil {
 		return nil, err
 	}
@@ -192,6 +207,8 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 	serverConfig.EnableContentionProfiling = false
 	serverConfig.EnableMetrics = false
 	serverConfig.EnableProfiling = false
+
+	serverConfig.ShutdownWatchTerminationGracePeriod = watchTerminationGracePeriod
 
 	minResourceRefreshInterval := 5 * time.Second
 	if env := os.Getenv("MIN_RESOURCE_REFRESH_INTERVAL"); env != "" {

@@ -18,12 +18,10 @@ import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -93,7 +91,7 @@ var _ = testutils.E2eDatastoreDescribe("GlobalNetworkSet tests", testutils.Datas
 				Spec:       spec2,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("resource already exists: GlobalNetworkSet(" + name1 + ")"))
+			Expect(outError.Error()).To(ContainSubstring("resource already exists: GlobalNetworkSet(" + name1 + ") with error:"))
 
 			By("Getting GlobalNetworkSet (name1) and comparing the output against spec1")
 			res, outError := c.GlobalNetworkSets().Get(ctx, name1, options.GetOptions{})
@@ -223,13 +221,13 @@ var _ = testutils.E2eDatastoreDescribe("GlobalNetworkSet tests", testutils.Datas
 				By("Updating GlobalNetworkSet name2 with a 2s TTL and waiting for the entry to be deleted")
 				_, outError = c.GlobalNetworkSets().Update(ctx, res2, options.SetOptions{TTL: 2 * time.Second})
 				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(1 * time.Second)
-				_, outError = c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(2 * time.Second)
-				_, outError = c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).To(HaveOccurred())
-				Expect(outError.Error()).To(ContainSubstring("resource does not exist: GlobalNetworkSet(" + name2 + ") with error:"))
+				Eventually(func() string {
+					_, err := c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("resource does not exist: GlobalNetworkSet(" + name2 + ") with error:"))
 
 				By("Creating GlobalNetworkSet name2 with a 2s TTL and waiting for the entry to be deleted")
 				_, outError = c.GlobalNetworkSets().Create(ctx, &apiv3.GlobalNetworkSet{
@@ -237,13 +235,13 @@ var _ = testutils.E2eDatastoreDescribe("GlobalNetworkSet tests", testutils.Datas
 					Spec:       spec2,
 				}, options.SetOptions{TTL: 2 * time.Second})
 				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(1 * time.Second)
-				_, outError = c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).NotTo(HaveOccurred())
-				time.Sleep(2 * time.Second)
-				_, outError = c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
-				Expect(outError).To(HaveOccurred())
-				Expect(outError.Error()).To(ContainSubstring("resource does not exist: GlobalNetworkSet(" + name2 + ") with error:"))
+				Eventually(func() string {
+					_, err := c.GlobalNetworkSets().Get(ctx, name2, options.GetOptions{})
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("resource does not exist: GlobalNetworkSet(" + name2 + ") with error:"))
 			}
 
 			if config.Spec.DatastoreType == apiconfig.Kubernetes {
@@ -425,7 +423,7 @@ var _ = testutils.E2eDatastoreDescribe("GlobalNetworkSet tests", testutils.Datas
 
 			By("Cleaning the datastore and expecting deletion events for each configured resource (tests prefix deletes results in individual events for each key)")
 			be.Clean()
-			testWatcher4.ExpectEvents(apiv3.KindGlobalNetworkSet, []watch.Event{
+			testWatcher4.ExpectEventsAnyOrder(apiv3.KindGlobalNetworkSet, []watch.Event{
 				{
 					Type:     watch.Deleted,
 					Previous: outRes1,

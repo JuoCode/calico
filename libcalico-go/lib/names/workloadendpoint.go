@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"strings"
 
-	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
@@ -260,6 +260,9 @@ func ParseWorkloadEndpointName(wepName string) (WorkloadEndpointIdentifiers, err
 			orchFlds = otherFields
 		}
 		if pl > 2 {
+			if len(parts[2:]) > len(orchFlds) {
+				return WorkloadEndpointIdentifiers{}, fmt.Errorf("Error parsing %s, verify that WorkloadEndpoint name is correct", wepName)
+			}
 			weidR := reflect.ValueOf(&weid)
 			weidStruct := weidR.Elem()
 			for i, part := range parts[2:] {
@@ -284,7 +287,7 @@ func ConvertWorkloadEndpointV3KeyToV1Key(v3key model.ResourceKey) (model.Workloa
 	}, nil
 }
 
-func IdentifiersForV3WorkloadEndpoint(res *v3.WorkloadEndpoint) WorkloadEndpointIdentifiers {
+func IdentifiersForV3WorkloadEndpoint(res *internalapi.WorkloadEndpoint) WorkloadEndpointIdentifiers {
 	wepids := WorkloadEndpointIdentifiers{
 		Node:         res.Spec.Node,
 		Orchestrator: res.Spec.Orchestrator,

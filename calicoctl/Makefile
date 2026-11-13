@@ -5,16 +5,6 @@ PACKAGE_NAME = github.com/projectcalico/calico/calicoctl
 KUBE_APISERVER_PORT?=6443
 KUBE_MOCK_NODE_MANIFEST?=mock-node.yaml
 
-# Name of the images.
-# e.g., <registry>/<name>:<tag>
-CALICOCTL_IMAGE       ?=ctl
-BUILD_IMAGES          ?=$(CALICOCTL_IMAGE)
-RELEASE_BRANCH_PREFIX ?= release
-DEV_TAG_SUFFIX        ?= 0.dev
-
-# Remove any excluded architectures since for calicoctl we want to build everything.
-EXCLUDEARCH?=
-
 ###############################################################################
 # Download and include ../lib.Makefile
 #   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
@@ -22,33 +12,21 @@ EXCLUDEARCH?=
 ###############################################################################
 include ../lib.Makefile
 
-###############################################################################
-
-CALICOCTL_DIR=calicoctl
-CTL_CONTAINER_CREATED=$(CALICOCTL_DIR)/.calico_ctl.created-$(ARCH)
-SRC_FILES=$(shell find $(CALICOCTL_DIR) -name '*.go') $(shell find ../libcalico-go -name '*.go')
-
-TEST_CONTAINER_NAME ?= calico/test
-
-CALICOCTL_GIT_REVISION?=$(shell git rev-parse --short HEAD)
-
-LDFLAGS=-X $(PACKAGE_NAME)/calicoctl/commands.VERSION=$(GIT_VERSION) \
-	-X $(PACKAGE_NAME)/calicoctl/commands.GIT_REVISION=$(CALICOCTL_GIT_REVISION) \
-	-X $(PACKAGE_NAME)/calicoctl/commands/common.VERSION=$(GIT_VERSION) \
-	-X main.VERSION=$(GIT_VERSION)
+## SRC_FILES is auto-populated from deps.txt by lib.Makefile.
 
 .PHONY: clean
 ## Clean enough that a new release build will be clean
 clean:
-	# Clean .created files which indicate images / releases have been built.
 	find . -name '.*.created*' -type f -delete
 	find . -name '.*.published*' -type f -delete
 	rm -rf bin build certs *.tar calicoctl/commands/report $(CALICO_VERSION_HELPER_DIR)/bin
-	-docker image rm -f $$(docker images $(CALICOCTL_IMAGE) -a -q)
 
 ###############################################################################
 # Building the binary
 ###############################################################################
+# The calicoctl CLI is still published as a standalone binary for operators
+# running it outside a cluster. In-cluster usage runs `calico ctl` from the
+# calico/calico image.
 .PHONY: build-all
 ## Build the binaries for all architectures and platforms
 build-all: $(addprefix bin/calicoctl-linux-,$(VALIDARCHES)) bin/calicoctl-windows-amd64.exe bin/calicoctl-darwin-amd64 bin/calicoctl-darwin-arm64
@@ -78,29 +56,6 @@ bin/calicoctl: bin/calicoctl-linux-amd64
 bin/calicoctl-windows-amd64.exe: bin/calicoctl-windows-amd64
 	mv $< $@
 
-gen-crds:
-	$(DOCKER_RUN) \
-	  $(CALICO_BUILD) \
-	  sh -c 'cd /go/src/$(PACKAGE_NAME)/calicoctl/commands/crds && go generate'
-	$(MAKE) go-fmt
-
-###############################################################################
-# Building the image
-###############################################################################
-.PHONY: image $(CALICOCTL_IMAGE)
-image: $(CALICOCTL_IMAGE)
-$(CALICOCTL_IMAGE): $(CTL_CONTAINER_CREATED)
-$(CTL_CONTAINER_CREATED): Dockerfile bin/calicoctl-linux-$(ARCH)
-	$(DOCKER_BUILD) -t $(CALICOCTL_IMAGE):latest-$(ARCH) -f Dockerfile .
-	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
-	touch $@
-
-# by default, build the image for the target architecture
-.PHONY: image-all
-image-all: $(addprefix sub-image-,$(VALIDARCHES))
-sub-image-%:
-	$(MAKE) image ARCH=$*
-
 CALICO_VERSION_HELPER_DIR=tests/fv/helper
 CALICO_VERSION_HELPER_BIN=$(CALICO_VERSION_HELPER_DIR)/bin/calico_version_helper
 CALICO_VERSION_HELPER_SRC=$(CALICO_VERSION_HELPER_DIR)/calico_version_helper.go
@@ -116,7 +71,8 @@ $(CALICO_VERSION_HELPER_BIN): $(CALICO_VERSION_HELPER_SRC)
 .PHONY: ut
 ## Run the tests in a container. Useful for CI, Mac dev.
 ut: bin/calicoctl-linux-$(ARCH)
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -cover -r $(GINKGO_ARGS) calicoctl/*'
+	mkdir -p report
+	$(DOCKER_RUN) -e CALICO_API_GROUP=$(CALICO_API_GROUP) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -cover -r --junit-report=calicoctl_ut.xml --output-dir=report/ $(GINKGO_ARGS) calicoctl/*'
 
 ###############################################################################
 # FVs
@@ -127,18 +83,19 @@ fv: bin/calicoctl-linux-$(ARCH) version-helper
 	$(MAKE) run-etcd
 
 	# We start two API servers in order to test multiple kubeconfig support
-	$(MAKE) run-kubernetes-master KUBE_APISERVER_PORT=6443 KUBE_MOCK_NODE_MANIFEST=mock-node.yaml
-	$(MAKE) run-kubernetes-master KUBE_APISERVER_PORT=6444 KUBE_MOCK_NODE_MANIFEST=mock-node-second.yaml
+	$(MAKE) run-kubernetes-control-plane KUBE_APISERVER_PORT=6443 KUBE_MOCK_NODE_MANIFEST=mock-node.yaml
+	$(MAKE) run-kubernetes-control-plane KUBE_APISERVER_PORT=6444 KUBE_MOCK_NODE_MANIFEST=mock-node-second.yaml
 
 	# Ensure anonymous is permitted to be admin.
 	while ! docker exec st-apiserver-6443 kubectl --server=https://127.0.0.1:6443 create clusterrolebinding anonymous-admin --clusterrole=cluster-admin --user=system:anonymous; do sleep 2; done
 
 	# Run the tests
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && go test $(GO_TEST_ARGS) ./tests/fv'
+	mkdir -p report
+	$(DOCKER_RUN) -e CALICO_API_GROUP=$(CALICO_API_GROUP) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && gotestsum --junitfile report/calicoctl_fv.xml -- $(GO_TEST_ARGS) -count=1 ./tests/fv'
 	# Cleanup
 	$(MAKE) stop-etcd
-	$(MAKE) stop-kubernetes-master KUBE_APISERVER_PORT=6443
-	$(MAKE) stop-kubernetes-master KUBE_APISERVER_PORT=6444
+	$(MAKE) stop-kubernetes-control-plane KUBE_APISERVER_PORT=6443
+	$(MAKE) stop-kubernetes-control-plane KUBE_APISERVER_PORT=6444
 
 ###############################################################################
 # STs
@@ -152,8 +109,9 @@ ST_OPTIONS?=
 .PHONY: st
 ## Run the STs in a container
 st: bin/calicoctl-linux-$(ARCH) version-helper
+	$(MAKE) -C ../node test_image
 	$(MAKE) run-etcd
-	$(MAKE) run-kubernetes-master
+	$(MAKE) run-kubernetes-control-plane
 	# Use the host, PID and network namespaces from the host.
 	# Privileged is needed since 'calico node' write to /proc (to enable ip_forwarding)
 	# Map the docker socket in so docker can be used from inside the container
@@ -161,20 +119,21 @@ st: bin/calicoctl-linux-$(ARCH) version-helper
 	#   - This also provides access to calicoctl and the docker client
 	docker run --net=host --privileged \
 		   -e MY_IP=$(LOCAL_IP_ENV) \
+		   -e PYTHONDONTWRITEBYTECODE=1 \
 		   --rm -t \
 		   -v $(CERTS_PATH):/home/user/certs \
 		   -v $(CURDIR):/code \
 		   -v /var/run/docker.sock:/var/run/docker.sock \
 		   $(TEST_CONTAINER_NAME) \
-		   sh -c 'nosetests $(ST_TO_RUN) -sv --nologcapture  --with-xunit --xunit-file="/code/report/nosetests.xml" --with-timer $(ST_OPTIONS)'
+		   sh -c 'pytest $(ST_TO_RUN) -sv --junit-xml="/code/report/nosetests.xml" $(ST_OPTIONS)'
 	$(MAKE) stop-etcd
-	$(MAKE) stop-kubernetes-master
+	$(MAKE) stop-kubernetes-control-plane
 
-## Run a local kubernetes master with API
-# TODO: Commonize this with the functions in lib.Makefile. 
+## Run a local kubernetes control plane.
+# TODO: Commonize this with the functions in lib.Makefile.
 # For now, these tests do something special and launch two apiserver on different ports, so it makes sense
 # to keep them separate.
-run-kubernetes-master: stop-kubernetes-master
+run-kubernetes-control-plane: stop-kubernetes-control-plane
 	# Run a Kubernetes apiserver using Docker.
 	docker run --net=host --detach \
 		--name st-apiserver-${KUBE_APISERVER_PORT} \
@@ -218,80 +177,32 @@ run-kubernetes-master: stop-kubernetes-master
             --root-ca-file=/home/user/certs/ca.pem
 
 	# Create a Node in the API for the tests to use.
-	while ! docker exec -ti st-apiserver-${KUBE_APISERVER_PORT} kubectl \
+	while ! docker exec st-apiserver-${KUBE_APISERVER_PORT} kubectl \
 		--server=https://127.0.0.1:${KUBE_APISERVER_PORT} \
 		apply -f /code/tests/st/manifests/${KUBE_MOCK_NODE_MANIFEST}; \
 		do echo "Waiting for node to apply successfully..."; sleep 2; done
 
 	# Apply CRDs because the tests require them.
-	while ! docker exec -ti st-apiserver-${KUBE_APISERVER_PORT} kubectl \
+	while ! docker exec st-apiserver-${KUBE_APISERVER_PORT} kubectl \
 		--server=https://127.0.0.1:${KUBE_APISERVER_PORT} \
-		apply -f /go/src/github.com/projectcalico/calico/libcalico-go/config/crd; \
-		do echo "Waiting for ClusterInformation CRD to apply successfully..."; sleep 2; done
+		apply -f /go/src/github.com/projectcalico/calico/$(CALICO_CRD_PATH); \
+		do echo "Waiting for Calico CRDs to apply successfully..."; sleep 2; done
 
 	# Create a namespace in the API for the tests to use.
-	-docker exec -ti st-apiserver-${KUBE_APISERVER_PORT} kubectl \
+	-docker exec st-apiserver-${KUBE_APISERVER_PORT} kubectl \
 		--server=https://127.0.0.1:${KUBE_APISERVER_PORT} \
 		create namespace test
-	
-## Stop the local kubernetes master
-stop-kubernetes-master:
+
+## Stop the local kubernetes control plane.
+stop-kubernetes-control-plane:
 	# Delete the cluster role binding.
 	-docker exec st-apiserver-${KUBE_APISERVER_PORT} kubectl delete clusterrolebinding anonymous-admin
 
-	# Stop master components.
+	# Stop control plane components.
 	-docker rm -f st-apiserver-${KUBE_APISERVER_PORT} st-controller-manager-${KUBE_APISERVER_PORT}
 
 ###############################################################################
 # CI
 ###############################################################################
 .PHONY: ci
-ci: mod-download build-all static-checks test
-
-###############################################################################
-# CD
-###############################################################################
-.PHONY: cd
-## Deploys images to registry
-cd: image-all cd-common
-
-###############################################################################
-# Release
-###############################################################################
-## Produces a clean build of release artifacts at the specified version.
-release-build: .release-$(VERSION).created 
-.release-$(VERSION).created:
-	$(MAKE) clean build-all image-all RELEASE=true
-	$(MAKE) retag-build-images-with-registries IMAGETAG=$(VERSION) RELEASE=true
-	$(MAKE) retag-build-images-with-registries IMAGETAG=latest RELEASE=true
-	touch $@
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	if ! docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version | grep 'Version:\s*$(VERSION)$$'; then \
-	  echo "Reported version:" `docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version` "\nExpected version: $(VERSION)"; \
-	  false; \
-	else \
-	  echo "Version check passed\n"; \
-	fi
-
-## Pushes a github release and release artifacts produced by `make release-build`.
-release-publish: release-prereqs .release-$(VERSION).published
-.release-$(VERSION).published:
-	$(MAKE) push-images-to-registries push-manifests IMAGETAG=$(VERSION) RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
-	touch $@
-
-# WARNING: Only run this target if this release is the latest stable release. Do NOT
-# run this target for alpha / beta / release candidate builds, or patches to earlier Calico versions.
-## Pushes `latest` release images. WARNING: Only run this for latest stable releases.
-release-publish-latest: release-prereqs
-	# Check latest versions match.
-	if ! docker run $(CALICOCTL_IMAGE):latest-$(ARCH) version | grep 'Version:\s*$(VERSION)$$'; then \
-	  echo "Reported version:" `docker run $(CALICOCTL_IMAGE):latest-$(ARCH) version` "\nExpected version: $(VERSION)"; \
-	  false; \
-	else \
-	  echo "Version check passed\n"; \
-	fi
-
-	$(MAKE) push-images-to-registries push-manifests IMAGETAG=latest RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
+ci: mod-download build static-checks test

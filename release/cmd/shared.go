@@ -1,0 +1,268 @@
+// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"path"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/snowzach/rotatefilehook"
+	cli "github.com/urfave/cli/v3"
+
+	"github.com/projectcalico/calico/release/internal/command"
+	"github.com/projectcalico/calico/release/internal/manifests"
+	"github.com/projectcalico/calico/release/internal/outputs"
+	"github.com/projectcalico/calico/release/internal/pinnedversion"
+	"github.com/projectcalico/calico/release/internal/registry"
+	"github.com/projectcalico/calico/release/internal/slack"
+	"github.com/projectcalico/calico/release/internal/utils"
+	"github.com/projectcalico/calico/release/internal/version"
+)
+
+var (
+	// debug controls whether or not to emit debug level logging.
+	debug bool
+
+	// releaseOutputPath is the directory where all outputs are stored
+	// relative to the repo root
+	releaseOutputPath = []string{utils.ReleaseFolderName, "_output"}
+
+	commandRunner          command.CommandRunner = command.RealRunner
+	registryDigestResolver                       = registry.ResolveDigest
+)
+
+func logPrettifier(f *runtime.Frame) (string, string) {
+	filename := path.Base(f.File)
+	funcSegments := strings.Split(f.Function, "/")
+	return fmt.Sprintf("%s()", funcSegments[len(funcSegments)-1]), fmt.Sprintf("%s:%d", filename, f.Line)
+}
+
+// configureLogging sets up logging to both stdout and a file.
+func configureLogging(filename string) {
+	if debug {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
+
+	logrus.SetFormatter(&logrus.TextFormatter{
+		DisableLevelTruncation: true,
+		CallerPrettyfier:       logPrettifier,
+	})
+
+	rotateFileHook, err := rotatefilehook.NewRotateFileHook(rotatefilehook.RotateFileConfig{
+		Filename:   filename,
+		MaxSize:    100,
+		MaxAge:     30,
+		MaxBackups: 10,
+		Level:      logrus.DebugLevel,
+		Formatter: &logrus.TextFormatter{
+			DisableColors:          true,
+			DisableLevelTruncation: true,
+			CallerPrettyfier:       logPrettifier,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	logrus.AddHook(rotateFileHook)
+}
+
+// withLogging wraps a cli.ActionFunc with automatic log file configuration
+// derived from the command's full name (e.g. "release prep" -> "release-prep.log").
+func withLogging(action cli.ActionFunc) cli.ActionFunc {
+	return func(ctx context.Context, c *cli.Command) error {
+		cmdName := strings.TrimSpace(strings.TrimPrefix(c.FullName(), c.Root().Name))
+		logFileName := strings.ReplaceAll(cmdName, " ", "-") + ".log"
+		configureLogging(logFileName)
+		return action(ctx, c)
+	}
+}
+
+// SummaryAction is a command action that returns a version string,
+// structured outputs, and an error. The version identifies the summary
+// file path. Outputs are included in the summary YAML.
+type SummaryAction func(context.Context, *cli.Command) (string, map[string]any, error)
+
+// withSummary wraps a SummaryAction with timing, status, and summary file
+// emission. The step name identifies the summary file (e.g. "release-prep").
+// Summary write failures are logged but never mask the action error.
+func withSummary(cfg *Config, step string, action SummaryAction) cli.ActionFunc {
+	return func(ctx context.Context, c *cli.Command) error {
+		started := time.Now()
+		ver, outputsMap, actionErr := action(ctx, c)
+
+		status := "success"
+		if actionErr != nil {
+			status = "failure"
+		}
+		if ver == "" {
+			ver = "unknown"
+		}
+		summary := outputs.StepSummary{
+			Status:    status,
+			Started:   started,
+			Completed: time.Now(),
+			Outputs:   outputsMap,
+		}
+		outputDir := outputs.SummaryOutputDir(cfg.RepoRootDir)
+		if err := outputs.WriteSummary(outputDir, ver, step, summary); err != nil {
+			logrus.WithError(err).Warn("Failed to write summary file")
+		}
+		return actionErr
+	}
+}
+
+// slackConfig returns a config for slack based on the CLI context.
+func slackConfig(c *cli.Command) *slack.Config {
+	return &slack.Config{
+		Token:   c.String(slackTokenFlag.Name),
+		Channel: c.String(slackChannelFlag.Name),
+	}
+}
+
+type pinned func(cfg *Config, c *cli.Command) (*pinnedversion.Pin, error)
+
+// oncePin memoizes a pin source so several callers in one command share it.
+func oncePin(pin pinned) pinned {
+	var (
+		once sync.Once
+		p    *pinnedversion.Pin
+		err  error
+	)
+	return func(cfg *Config, c *cli.Command) (*pinnedversion.Pin, error) {
+		once.Do(func() { p, err = pin(cfg, c) })
+		return p, err
+	}
+}
+
+var (
+	loadPin pinned = func(cfg *Config, c *cli.Command) (*pinnedversion.Pin, error) {
+		pin, err := pinnedversion.Load(pinLoader(pinConfig(cfg, c), c))
+		if err != nil {
+			return nil, fmt.Errorf("load pin: %w", err)
+		}
+		return pin, nil
+	}
+	pinForBuild        = loadPin
+	builtPin    pinned = func(cfg *Config, c *cli.Command) (*pinnedversion.Pin, error) {
+		pin, err := pinnedversion.Load(pinnedversion.FileLoader{Dir: cfg.TmpDir, RootDir: cfg.RepoRootDir, Runner: commandRunner})
+		// A planned build writes no pin, so a plan of build then publish has none to load.
+		if errors.Is(err, fs.ErrNotExist) && c != nil && c.Bool(planFlag.Name) {
+			logrus.WithError(err).Warn("No built pin, planning against the pin a build would write")
+			return loadPin(cfg, c)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load built pin: %w", err)
+		}
+		return pin, nil
+	}
+	pinForPublish = builtPin
+)
+
+func pinLoader(pc pinnedversion.Config, c *cli.Command) pinnedversion.Loader {
+	l := localPinLoader(pc)
+	if c.Bool(planFlag.Name) {
+		return pinnedversion.PreviewLoader{LocalLoader: l}
+	}
+	return l
+}
+
+// A generated pin versions the operator like the product; a release takes the
+// operator's own version from the manifests.
+func pinForRelease(cfg *Config, c *cli.Command) (*pinnedversion.Pin, error) {
+	pin, err := loadPin(cfg, c)
+	if err != nil {
+		return nil, err
+	}
+	_, operatorVer, err := manifests.Versions(cfg.RepoRootDir)
+	if err != nil {
+		return nil, fmt.Errorf("operator version from manifests: %w", err)
+	}
+	pin.Operator.Version = operatorVer.String()
+	return pin, nil
+}
+
+// releaseVersion is the version being released. A hashrelease is versioned from git.
+var releaseVersion = func(cfg *Config, c *cli.Command) (*version.Version, error) {
+	if c.Bool(hashreleaseFlag.Name) {
+		v, err := command.Git(commandRunner).In(cfg.RepoRootDir).Version(true)
+		if err != nil {
+			return nil, fmt.Errorf("git version: %w", err)
+		}
+		ver, err := version.New(v)
+		if err != nil {
+			return nil, err
+		}
+		return &ver, nil
+	}
+	ver, _, err := manifests.Versions(cfg.RepoRootDir)
+	if err != nil {
+		return nil, fmt.Errorf("version from manifest: %w", err)
+	}
+	return &ver, nil
+}
+
+// outputDir is where a release's artifacts are gathered.
+var outputDir = func(cfg *Config, c *cli.Command, version string) (string, error) {
+	if c.Bool(hashreleaseFlag.Name) {
+		pin := oncePin(pinForBuild)
+		p, err := pin(cfg, c)
+		if err != nil {
+			return "", err
+		}
+		h, err := p.Hashrelease(baseHashreleaseOutputDir(cfg.RepoRootDir), false)
+		if err != nil {
+			return "", err
+		}
+		return h.Source, nil
+	}
+	return releaseOutputDir(cfg.RepoRootDir, version), nil
+}
+
+// recordsDir is keyed like outputDir, so a step run on its own records into the
+// same release as the manager.
+func recordsDir(cfg *Config, c *cli.Command, pin pinned, version string) (string, error) {
+	if !c.Bool(hashreleaseFlag.Name) {
+		return outputs.RecordsDir(cfg.OutputDir, version), nil
+	}
+	p, err := pin(cfg, c)
+	if err != nil {
+		return "", err
+	}
+	return outputs.RecordsDir(cfg.OutputDir, p.Hash), nil
+}
+
+func publishRecord(recordsDir, step string, confirm bool) ([]string, *outputs.RefsWriter, error) {
+	published, err := outputs.ReadRefs(recordsDir, step)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !confirm {
+		return published, nil, nil
+	}
+	w, err := outputs.NewRefsWriter(recordsDir, step)
+	if err != nil {
+		return nil, nil, err
+	}
+	return published, w, nil
+}

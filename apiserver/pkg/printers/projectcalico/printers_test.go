@@ -19,12 +19,10 @@ import (
 	"testing"
 	"time"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/kubernetes/pkg/printers"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 func TestPrintCalicoNodeStatus(t *testing.T) {
@@ -155,13 +153,13 @@ func TestPrintCalicoNodeStatus(t *testing.T) {
 		{
 			status: status,
 			option: printers.GenerateOptions{},
-			expected: []metav1.TableRow{{Cells: []interface{}{"mystatus",
+			expected: []metav1.TableRow{{Cells: []any{"mystatus",
 				"node0", "Agent,BGP,Routes", "10s", "3m", "3m ago"}}},
 		},
 		{
 			status: status,
 			option: printers.GenerateOptions{Wide: true},
-			expected: []metav1.TableRow{{Cells: []interface{}{"mystatus",
+			expected: []metav1.TableRow{{Cells: []any{"mystatus",
 				"node0", "Agent,BGP,Routes", "10s", "3m", "3m ago",
 				"v4(Ready) v6(Ready)", "2/3", "1/1", "2", "1",
 			}}},
@@ -177,7 +175,7 @@ func TestPrintCalicoNodeStatus(t *testing.T) {
 			rows[i].Object.Object = nil
 		}
 		if !reflect.DeepEqual(test.expected, rows) {
-			t.Errorf("%d mismatch: %s", i, diff.ObjectReflectDiff(test.expected, rows))
+			t.Errorf("%d mismatch: %s", i, diff.Diff(test.expected, rows))
 		}
 	}
 }

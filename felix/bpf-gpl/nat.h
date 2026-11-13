@@ -1,25 +1,52 @@
 // Project Calico BPF dataplane programs.
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
 #ifndef __CALI_NAT_H__
 #define __CALI_NAT_H__
 
-#ifndef CALI_VXLAN_VNI
-#define CALI_VXLAN_VNI 0xca11c0
-#endif
+#include <linux/if_ether.h>
+#include <linux/in.h>
 
-#define vxlan_udp_csum_ok(udp) ((udp)->check == 0)
-
+#include "arp.h"
+#include "cali_bpf.h"
+#include "counters.h"
+#include "globals.h"
+#include "ip_addr.h"
+#include "log.h"
+#include "nat_types.h"
+#include "reasons.h"
+#include "routes.h"
+#include "skb.h"
+#include "types.h"
 #ifdef IPVER6
 #include "nat6.h"
 #else
 #include "nat4.h"
 #endif
 
-#define dnat_should_encap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
-#define dnat_return_should_encap() (CALI_F_FROM_WEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
-#define dnat_should_decap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
+/* An encapsulating device never adds another layer of its own. */
+#define dnat_on_plain_dev() (!CALI_F_L3_DEV && !CALI_F_NAT_IF && !IFACE_ENCAPS)
+
+#define dnat_should_encap() (CALI_F_FROM_HEP && dnat_on_plain_dev())
+#define dnat_return_should_encap() (CALI_F_FROM_WEP && dnat_on_plain_dev())
+#define dnat_should_decap() (CALI_F_FROM_HEP && dnat_on_plain_dev())
+
+static CALI_BPF_INLINE __u16 vxlan_select_src_port(struct cali_tc_ctx *ctx)
+{
+	/* Keep the hash stable for each flow direction. ICMP has no ports, but
+	 * does not require ordering with the related flow.
+	 */
+	__u16 port = STATE->sport ^ STATE->dport;
+
+	if (VXLAN_SRC_PORT_MIN != 0 && VXLAN_SRC_PORT_MAX != 0) {
+		/* Include the upper bound, as the kernel VXLAN device does. */
+		__u16 range = (__u16)(VXLAN_SRC_PORT_MAX - VXLAN_SRC_PORT_MIN) + 1;
+		port = VXLAN_SRC_PORT_MIN + (port % range);
+	}
+
+	return port;
+}
 
 static CALI_BPF_INLINE int is_vxlan_tunnel(struct cali_tc_ctx *ctx, __u16 vxlanport)
 {
@@ -37,7 +64,7 @@ static CALI_BPF_INLINE bool vxlan_encap_too_big(struct cali_tc_ctx *ctx)
 	 * IP data, and does not include any lower-level headers.
 	 */
 	if (ctx->skb->len > sizeof(struct ethhdr) + mtu) {
-		CALI_DEBUG("SKB too long (len=%d) vs limit=%d\n", ctx->skb->len, mtu);
+		CALI_DEBUG("SKB too long (len=%d) vs limit=%d", ctx->skb->len, mtu);
 		return true;
 	}
 	return false;
@@ -62,14 +89,14 @@ static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
 			if (ctx->state->ip_proto == IPPROTO_TCP) {
 				if (skb_refresh_validate_ptrs(ctx, TCP_SIZE)) {
 					deny_reason(ctx, CALI_REASON_SHORT);
-					CALI_DEBUG("Too short\n");
+					CALI_DEBUG("Too short");
 					return -EFAULT;
 				}
 				__builtin_memcpy(((void*)ip_hdr(ctx))+IP_SIZE, ctx->scratch->l4, TCP_SIZE);
 			} else {
 				if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
 					deny_reason(ctx, CALI_REASON_SHORT);
-					CALI_DEBUG("Too short\n");
+					CALI_DEBUG("Too short");
 					return -EFAULT;
 				}
 				__builtin_memcpy(((void*)ip_hdr(ctx))+IP_SIZE, ctx->scratch->l4, UDP_SIZE);
@@ -79,11 +106,11 @@ static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
 			int offset = skb_l4hdr_offset(ctx);
 
 			if (size == 0) {
-				CALI_DEBUG("Bad L4 proto\n");
+				CALI_DEBUG("Bad L4 proto");
 				return -EFAULT;
 			}
 			if (bpf_skb_store_bytes(ctx->skb, offset, ctx->scratch->l4, size, 0)) {
-				CALI_DEBUG("Too short\n");
+				CALI_DEBUG("Too short");
 				return -EFAULT;
 			}
 		}
@@ -102,23 +129,28 @@ static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
 	bool csum_update = false;
 
 	if (!ip_equal(ip_src_from, ip_src_to)) {
-		CALI_DEBUG("L4 checksum update src IP from %x to %x\n",
+		CALI_DEBUG("L4 checksum update src IP from " IP_FMT " to " IP_FMT "",
 				debug_ip(ip_src_from), debug_ip(ip_src_to));
 
 		csum = bpf_csum_diff((__u32*)&ip_src_from, sizeof(ip_src_from), (__u32*)&ip_src_to, sizeof(ip_src_to), csum);
-		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x\n", csum);
+		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x", csum);
 		csum_update = true;
 	}
 	if (!ip_equal(ip_dst_from, ip_dst_to)) {
-		CALI_DEBUG("L4 checksum update dst IP from %x to %x\n",
+		CALI_DEBUG("L4 checksum update dst IP from " IP_FMT " to " IP_FMT "",
 				debug_ip(ip_dst_from), debug_ip(ip_dst_to));
 		csum = bpf_csum_diff((__u32*)&ip_dst_from, sizeof(ip_dst_from), (__u32*)&ip_dst_to, sizeof(ip_dst_to), csum);
-		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x\n", csum);
+		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x", csum);
 		csum_update = true;
 	}
 
 	/* If the IPs have changed we must replace it as part of the pseudo header that is
 	 * used to calculate L4 csum.
+	 *
+	 * If we are fixing inner ICMP payload, we do not change L4 csum for the payload
+	 * (no need for that, it is just a fraction of the packet), but the L4 here is the
+	 * ICMP itself since its payload has changed. ICMPv4 does not include the pseudo
+	 * header in the csum and v6 had it already fixed when we modified the outer IP.
 	 */
 	if (csum_update) {
 		ret = bpf_l4_csum_replace(skb, off, 0, csum, flags | (inner_icmp ? 0 : BPF_F_PSEUDO_HDR));
@@ -126,17 +158,17 @@ static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
 
 	/* We can use replace for ports in both v4/6 as they are the same size of 2 bytes. */
 	if (sport_from != sport_to) {
-		CALI_DEBUG("L4 checksum update sport from %d to %d\n",
+		CALI_DEBUG("L4 checksum update sport from %d to %d",
 				bpf_ntohs(sport_from), bpf_ntohs(sport_to));
 		int rc = bpf_l4_csum_replace(skb, off, sport_from, sport_to, flags | 2);
-		CALI_DEBUG("bpf_l4_csum_replace(sport): %d\n", rc);
+		CALI_DEBUG("bpf_l4_csum_replace(sport): %d", rc);
 		ret |= rc;
 	}
 	if (dport_from != dport_to) {
-		CALI_DEBUG("L4 checksum update dport from %d to %d\n",
+		CALI_DEBUG("L4 checksum update dport from %d to %d",
 				bpf_ntohs(dport_from), bpf_ntohs(dport_to));
 		int rc = bpf_l4_csum_replace(skb, off, dport_from, dport_to, flags | 2);
-		CALI_DEBUG("bpf_l4_csum_replace(dport): %d\n", rc);
+		CALI_DEBUG("bpf_l4_csum_replace(dport): %d", rc);
 		ret |= rc;
 	}
 
@@ -153,13 +185,8 @@ static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
 static CALI_BPF_INLINE int vxlan_attempt_decap(struct cali_tc_ctx *ctx)
 {
 	/* decap on host ep only if directly for the node */
-	CALI_DEBUG("VXLAN tunnel packet to %x (host IP=%x)\n",
-#ifdef IPVER6
-		bpf_ntohl(ip_hdr(ctx)->daddr.in6_u.u6_addr32[3]),
-#else
-		bpf_ntohl(ip_hdr(ctx)->daddr),
-#endif
-		debug_ip(HOST_IP));
+	CALI_DEBUG("VXLAN tunnel packet to " IP_FMT " (host IP=" IP_FMT ")",
+		&ip_hdr(ctx)->daddr, debug_ip(HOST_IP));
 
 	if (!rt_addr_is_local_host((ipv46_addr_t *)&ip_hdr(ctx)->daddr)) {
 		goto fall_through;
@@ -167,33 +194,39 @@ static CALI_BPF_INLINE int vxlan_attempt_decap(struct cali_tc_ctx *ctx)
 	if (!vxlan_size_ok(ctx)) {
 		/* UDP header said VXLAN but packet wasn't long enough. */
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short\n");
+		CALI_DEBUG("Too short");
 		goto deny;
 	}
 	if (!vxlan_vni_is_valid(ctx) ) {
-		CALI_DEBUG("VXLAN: Invalid VNI\n");
+		CALI_DEBUG("VXLAN: Invalid VNI");
 		goto fall_through;
 	}
-	if (vxlan_vni(ctx) != CALI_VXLAN_VNI) {
+	if (vxlan_vni(ctx) == OVERLAY_TUNNEL_ID) {
 		if (rt_addr_is_remote_host((ipv46_addr_t *)&ip_hdr(ctx)->saddr)) {
 			/* Not BPF-generated VXLAN packet but it was from a Calico host to this node. */
-			CALI_DEBUG("VXLAN: non-tunnel calico\n");
+			CALI_DEBUG("VXLAN: non-tunnel calico");
 			goto auto_allow;
 		}
-		/* Not our VNI, not from Calico host. Fall through to policy. */
-		CALI_DEBUG("VXLAN: Not our VNI\n");
+		/* Our VNI, but not from a Calico host. Fall through to policy. */
+		CALI_DEBUG("VXLAN with our VNI (0x%x) from non-calico source.", vxlan_vni(ctx));
+		/* N.B. we defer dropping to policy */
 		goto fall_through;
-	}
-	if (!rt_addr_is_remote_host((ipv46_addr_t *)&ip_hdr(ctx)->saddr)) {
-		CALI_DEBUG("VXLAN with our VNI from unexpected source.\n");
-		deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
-		goto deny;
-	}
-	if (!vxlan_udp_csum_ok(udp_hdr(ctx))) {
-		/* Our VNI but checksum is incorrect (we always use check=0). */
-		CALI_DEBUG("VXLAN with our VNI but incorrect checksum.\n");
-		deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
-		goto deny;
+	} else if (vxlan_vni(ctx) == CALI_VXLAN_VNI) {
+		if (!rt_addr_is_remote_host((ipv46_addr_t *)&ip_hdr(ctx)->saddr)) {
+			CALI_DEBUG("VXLAN with our VNI (0x%x) from unexpected source.", vxlan_vni(ctx));
+			deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
+			goto deny;
+		}
+		if (!vxlan_udp_csum_ok(udp_hdr(ctx))) {
+			/* Our VNI but checksum is incorrect (we always use check=0). */
+			CALI_DEBUG("VXLAN with our VNI but incorrect checksum.");
+			deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
+			goto deny;
+		}
+	} else {
+		/* Not our VNI, not from Calico host. Fall through to policy. */
+		CALI_DEBUG("VXLAN: Not our VNI 0x%x", vxlan_vni(ctx));
+		goto fall_through;
 	}
 
 	/* We update the map straight with the packet data, eth header is
@@ -209,27 +242,27 @@ static CALI_BPF_INLINE int vxlan_attempt_decap(struct cali_tc_ctx *ctx)
 	arpk.ip = ip_hdr(ctx)->saddr;
 #endif
 	cali_arp_update_elem(&arpk, eth_hdr(ctx), 0);
-	CALI_DEBUG("ARP update for ifindex %d ip %x\n", arpk.ifindex, debug_ip(arpk.ip));
+	CALI_DEBUG("ARP update for ifindex %d ip " IP_FMT "", arpk.ifindex, debug_ip(arpk.ip));
 
 #ifdef IPVER6
 	ipv6hdr_ip_to_ipv6_addr_t(&ctx->state->tun_ip, &ip_hdr(ctx)->saddr);
 #else
 	ctx->state->tun_ip = ip_hdr(ctx)->saddr;
 #endif
-	CALI_DEBUG("vxlan decap\n");
+	CALI_DEBUG("vxlan decap");
 	if (vxlan_decap(ctx->skb)) {
 		deny_reason(ctx, CALI_REASON_DECAP_FAIL);
 		goto deny;
 	}
 
 	/* Revalidate the packet after the decap. */
-	if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
+	if (skb_refresh_validate_ptrs_l4(ctx)) {
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short\n");
+		CALI_DEBUG("Too short");
 		goto deny;
 	}
 
-	CALI_DEBUG("vxlan decap origin %x\n", debug_ip(ctx->state->tun_ip));
+	CALI_DEBUG("vxlan decap origin " IP_FMT "", debug_ip(ctx->state->tun_ip));
 
 fall_through:
 	return 0;
@@ -238,7 +271,7 @@ auto_allow:
 	return -2;
 
 deny:
-	ctx->fwd.res = TC_ACT_SHOT;
+	ctx->state->fwd.res = TC_ACT_SHOT;
 	return -1;
 }
 

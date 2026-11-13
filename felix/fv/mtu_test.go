@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -21,9 +19,8 @@ import (
 	"fmt"
 	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
@@ -32,7 +29,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
-var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs to IP sets", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
+var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ VXLAN topology before adding host IPs to IP sets", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
 	var (
 		infra  infrastructure.DatastoreInfra
 		tc     infrastructure.TopologyContainers
@@ -46,6 +43,20 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 				return strings.TrimSpace(out)
 			}, "60s", "500ms").Should(Equal(fmt.Sprint(mtu)))
 		}
+		if BPFMode() {
+			// Check the MTU on bpfin/bpfout devices.  Use a longer
+			// timeout since after a Felix restart the devices may not
+			// exist yet.
+			felix := tc.Felixes[0]
+			EventuallyWithOffset(1, func() string {
+				out, _ := felix.ExecOutput("ip", "link", "show", "dev", "bpfin.cali")
+				return out
+			}, "10s", "500ms").Should(ContainSubstring(fmt.Sprintf("mtu %d", mtu)))
+			EventuallyWithOffset(1, func() string {
+				out, _ := felix.ExecOutput("ip", "link", "show", "dev", "bpfout.cali")
+				return out
+			}, "5s", "500ms").Should(ContainSubstring(fmt.Sprintf("mtu %d", mtu)))
+		}
 	}
 
 	vxlanOverhead := func(ipv6 bool) int {
@@ -54,17 +65,6 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 		}
 		return 50
 	}
-
-	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			for _, felix := range tc.Felixes {
-				felix.Exec("ip", "link")
-			}
-			infra.DumpErrorData()
-		}
-		tc.Stop()
-		infra.Stop()
-	})
 
 	for _, ipv6 := range []bool{true, false} {
 		enableIPv6 := ipv6
@@ -75,7 +75,8 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 					topologyOptions := infrastructure.DefaultTopologyOptions()
 					topologyOptions.DelayFelixStart = true
 					topologyOptions.VXLANMode = api.VXLANModeAlways
-					topologyOptions.IPIPEnabled = false
+					topologyOptions.VXLANStrategy = infrastructure.NewDefaultTunnelStrategy(topologyOptions.IPPoolCIDR, topologyOptions.IPv6PoolCIDR)
+					topologyOptions.IPIPMode = api.IPIPModeNever
 					topologyOptions.EnableIPv6 = enableIPv6
 
 					// Need n>1 or the infra won't set up IP pools!
@@ -85,15 +86,17 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 				It("should get the MTU from the main interface", func() {
 					// Set a distinctive MTU on the main interface.
 					for _, f := range tc.Felixes {
-						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1312")
+						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1362")
 					}
 					tc.TriggerDelayedStart()
-					expectMTU(1312 - vxlanOverhead(enableIPv6))
+					expectMTU(1362 - vxlanOverhead(enableIPv6))
 				})
 
 				addDummyNIC := func(f *infrastructure.Felix, up bool) {
 					f.Exec("ip", "link", "add", "type", "dummy")
-					f.Exec("ip", "link", "set", "dev", "dummy0", "mtu", "1300")
+					// MTU must be high enough that after VXLAN overhead (70 bytes
+					// for IPv6), the BPF device MTU stays >= 1280 (IPv6 minimum).
+					f.Exec("ip", "link", "set", "dev", "dummy0", "mtu", "1350")
 					f.Exec("ip", "link", "set", "name", "eth1", "dummy0")
 					if up {
 						f.Exec("ip", "link", "set", "dev", "eth1", "up")
@@ -102,20 +105,20 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 				It("should ignore a secondary interface that is down", func() {
 					// Set a distinctive MTU on the main interface.
 					for _, f := range tc.Felixes {
-						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1312")
+						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1362")
 						addDummyNIC(f, false)
 					}
 					tc.TriggerDelayedStart()
-					expectMTU(1312 - vxlanOverhead(enableIPv6))
+					expectMTU(1362 - vxlanOverhead(enableIPv6))
 				})
 				It("should consider a secondary interface that is up", func() {
 					// Set a distinctive MTU on the main interface.
 					for _, f := range tc.Felixes {
-						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1312")
+						f.Exec("ip", "link", "set", "dev", "eth0", "mtu", "1362")
 						addDummyNIC(f, true)
 					}
 					tc.TriggerDelayedStart()
-					expectMTU(1300 - vxlanOverhead(enableIPv6))
+					expectMTU(1350 - vxlanOverhead(enableIPv6))
 				})
 			})
 
@@ -124,7 +127,8 @@ var _ = infrastructure.DatastoreDescribe("VXLAN topology before adding host IPs 
 					infra = getInfra()
 					topologyOptions := infrastructure.DefaultTopologyOptions()
 					topologyOptions.VXLANMode = api.VXLANModeAlways
-					topologyOptions.IPIPEnabled = false
+					topologyOptions.VXLANStrategy = infrastructure.NewDefaultTunnelStrategy(topologyOptions.IPPoolCIDR, topologyOptions.IPv6PoolCIDR)
+					topologyOptions.IPIPMode = api.IPIPModeNever
 					topologyOptions.EnableIPv6 = enableIPv6
 
 					// Configure the interface pattern so that it doesn't match any host interfaces.

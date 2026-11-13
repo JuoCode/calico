@@ -19,6 +19,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -90,10 +91,9 @@ func (s *IPSets) AddMembers(setID string, newMembers []string) {
 		"setID":           setID,
 		"filteredMembers": filteredMembers,
 	}).Debug("Adding new members to IP set")
-	filteredMembers.Iter(func(m string) error {
+	for m := range filteredMembers.All() {
 		ipSet.Members.Add(m)
-		return nil
-	})
+	}
 	s.callbackOnUpdate(setID)
 }
 
@@ -113,10 +113,9 @@ func (s *IPSets) RemoveMembers(setID string, removedMembers []string) {
 		"filteredMembers": filteredMembers,
 	}).Debug("Removing members from IP set")
 
-	filteredMembers.Iter(func(m string) error {
+	for m := range filteredMembers.All() {
 		ipSet.Members.Discard(m)
-		return nil
-	})
+	}
 	s.callbackOnUpdate(setID)
 }
 
@@ -129,10 +128,9 @@ func (s *IPSets) GetIPSetMembers(setID string) []string {
 		return nil
 	}
 
-	ipSet.Members.Iter(func(member string) error {
+	for member := range ipSet.Members.All() {
 		retVal = append(retVal, member)
-		return nil
-	})
+	}
 
 	// Note: It is very important that nil is returned if there is no ip in an ipset
 	// so that policy rules related to this ipset won't be populated.
@@ -186,7 +184,7 @@ func (m *IPSets) GetDesiredMembers(setID string) (set.Set[string], error) {
 	panic("Not implemented")
 }
 
-func (m *IPSets) ApplyUpdates() {
+func (m *IPSets) ApplyUpdates(_ ipsets.UpdateListener) {
 }
 
 func (m *IPSets) ApplyDeletions() bool {

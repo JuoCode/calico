@@ -19,13 +19,12 @@ import (
 	"net"
 	"os/exec"
 
+	docopt "github.com/docopt/docopt-go"
 	log "github.com/sirupsen/logrus"
 
-	docopt "github.com/docopt/docopt-go"
-
 	"github.com/projectcalico/calico/felix/bpf"
-	"github.com/projectcalico/calico/felix/buildinfo"
-	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 )
 
 const usage = `felix-xdp, dumping xdp state for Calico.
@@ -44,10 +43,10 @@ func populate() {
 	cmdVethPairArgs := []string{"-c", "ip link add eth42 type veth peer name eth43 || true"}
 	_, _ = exec.Command("/bin/sh", cmdVethPairArgs...).CombinedOutput()
 	_, _ = bpfLib.NewFailsafeMap()
-	_ = bpfLib.UpdateFailsafeMap(uint8(labelindex.ProtocolTCP), 53)
-	_ = bpfLib.UpdateFailsafeMap(uint8(labelindex.ProtocolTCP), 80)
-	_ = bpfLib.UpdateFailsafeMap(uint8(labelindex.ProtocolTCP), 22)
-	_ = bpfLib.UpdateFailsafeMap(uint8(labelindex.ProtocolUDP), 53)
+	_ = bpfLib.UpdateFailsafeMap(uint8(ipsetmember.ProtocolTCP), 53)
+	_ = bpfLib.UpdateFailsafeMap(uint8(ipsetmember.ProtocolTCP), 80)
+	_ = bpfLib.UpdateFailsafeMap(uint8(ipsetmember.ProtocolTCP), 22)
+	_ = bpfLib.UpdateFailsafeMap(uint8(ipsetmember.ProtocolUDP), 53)
 
 	_ = bpfLib.RemoveXDP("eth42", bpf.XDPGeneric)
 	_, _ = bpfLib.NewCIDRMap("eth42", bpf.IPFamilyV4)
@@ -65,11 +64,11 @@ func dump() {
 	for _, entry := range pp {
 		proto := "<unknown>"
 		switch entry.Proto {
-		case labelindex.ProtocolTCP:
+		case ipsetmember.ProtocolTCP:
 			proto = "TCP"
-		case labelindex.ProtocolUDP:
+		case ipsetmember.ProtocolUDP:
 			proto = "UDP"
-		case labelindex.ProtocolSCTP:
+		case ipsetmember.ProtocolSCTP:
 			proto = "SCTP"
 		}
 		fmt.Printf("  %s: %d\n", proto, entry.Port)
@@ -98,7 +97,7 @@ func dump() {
 // main is the entry point to the binary.
 func main() {
 	// Parse command-line args.
-	version := "Version:            " + buildinfo.GitVersion + "\n" +
+	version := "Version:            " + buildinfo.Version + "\n" +
 		"Full git commit ID: " + buildinfo.GitRevision + "\n" +
 		"Build date:         " + buildinfo.BuildDate + "\n"
 

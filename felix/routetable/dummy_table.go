@@ -1,28 +1,54 @@
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package routetable
 
 import (
 	"github.com/projectcalico/calico/felix/ifacemonitor"
-	"github.com/projectcalico/calico/felix/ip"
 )
 
-type DummyTable struct {
+type DummyTable struct{}
+
+func (*DummyTable) OnIfaceStateChanged(_ string, _ int, _ ifacemonitor.State) {
 }
 
-func (_ *DummyTable) OnIfaceStateChanged(_ string, _ ifacemonitor.State) {
+func (*DummyTable) QueueResync() {
 }
 
-func (_ *DummyTable) QueueResync() {
+func (*DummyTable) QueueResyncIface(string) {
 }
 
-func (_ *DummyTable) Apply() error {
+func (*DummyTable) Apply() error {
 	return nil
 }
 
-func (_ *DummyTable) SetRoutes(_ string, _ []Target) {
+func (*DummyTable) SetRoutes(routeClass RouteClass, ifaceName string, targets []Target) {
 }
 
-func (_ *DummyTable) RouteRemove(_ string, _ ip.CIDR) {
+func (*DummyTable) RouteRemove(routeClass RouteClass, ifaceName string, routeKey RouteKey) {
 }
 
-func (_ *DummyTable) RouteUpdate(_ string, _ Target) {
+func (*DummyTable) RouteUpdate(routeClass RouteClass, ifaceName string, target Target) {
+}
+
+func (*DummyTable) Index() int {
+	return 0
+}
+
+func (*DummyTable) ReadRoutesFromKernel(ifaceName string) ([]Target, error) {
+	return nil, nil
+}
+
+func (*DummyTable) SetRemoveExternalRoutes(b bool) {
 }

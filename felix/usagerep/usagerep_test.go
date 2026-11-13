@@ -22,12 +22,12 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/felix/buildinfo"
 	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 )
 
 const expectedNumberOfURLParams = 13
@@ -63,7 +63,7 @@ var _ = Describe("UsageReporter with mocked URL and short interval", func() {
 		configUpdateC = make(chan map[string]string)
 
 		// Create a usage reporter and override its base URL and initial interval.
-		u = New(StaticItems{KubernetesVersion: "v1.23.2"}, 500*time.Millisecond, 1*time.Second, statsUpdateC, configUpdateC)
+		u = New(StaticItems{KubernetesVersion: "v1.23.2", NFTablesEnabled: true}, 500*time.Millisecond, 1*time.Second, statsUpdateC, configUpdateC)
 		port := tcpListener.Addr().(*net.TCPAddr).Port
 		u.BaseURL = fmt.Sprintf("http://localhost:%d/UsageCheck/calicoVersionCheck?", port)
 
@@ -129,7 +129,7 @@ var _ = Describe("UsageReporter with mocked URL and short interval", func() {
 				q := url.Query()
 				Expect(q).To(HaveLen(expectedNumberOfURLParams), "unexpected number of URL parameters")
 				Expect(q.Get("guid")).To(Equal("someguid"))
-				Expect(q.Get("type")).To(Equal("openstack,k8s,kdd"))
+				Expect(q.Get("type")).To(Equal("openstack,k8s,kdd,nft"))
 				Expect(q.Get("cal_ver")).To(Equal("v2.6.3"))
 				Expect(q.Get("k8s_ver")).To(Equal("v1.23.2"))
 				Expect(q.Get("alp")).To(Equal("false"))
@@ -190,7 +190,7 @@ var _ = Describe("UsageReporter with mocked URL and short interval", func() {
 					q := url.Query()
 					Expect(q).To(HaveLen(expectedNumberOfURLParams), "unexpected number of URL parameters")
 					Expect(q.Get("guid")).To(Equal("someguid2"))
-					Expect(q.Get("type")).To(Equal("openstack,k8s,kdd,typha,bpf"))
+					Expect(q.Get("type")).To(Equal("openstack,k8s,kdd,typha,bpf,nft"))
 					Expect(q.Get("cal_ver")).To(Equal("v3.0.0"))
 					Expect(q.Get("k8s_ver")).To(Equal("v1.23.2"))
 					Expect(q.Get("alp")).To(Equal("true"))
@@ -238,7 +238,7 @@ var _ = Describe("UsageReporter with default URL", func() {
 	})
 
 	It("should calculate correct URL mainline", func() {
-		rawURL := u.calculateURL("theguid", "atype", "testVer", true, false, calc.StatsUpdate{
+		rawURL := u.calculateURL("theguid", "atype", "testVer", true, false, false, calc.StatsUpdate{
 			NumHostEndpoints:     123,
 			NumWorkloadEndpoints: 234,
 			NumHosts:             10,
@@ -255,7 +255,7 @@ var _ = Describe("UsageReporter with default URL", func() {
 		Expect(q.Get("size")).To(Equal("10"))
 		Expect(q.Get("weps")).To(Equal("234"))
 		Expect(q.Get("heps")).To(Equal("123"))
-		Expect(q.Get("version")).To(Equal(buildinfo.GitVersion))
+		Expect(q.Get("version")).To(Equal(buildinfo.Version))
 		Expect(q.Get("rev")).To(Equal(buildinfo.GitRevision))
 
 		Expect(url.Host).To(Equal("usage.projectcalico.org"))
@@ -263,7 +263,7 @@ var _ = Describe("UsageReporter with default URL", func() {
 		Expect(url.Path).To(Equal("/UsageCheck/calicoVersionCheck"))
 	})
 	It("should default cluster type, GUID, and Calico Version", func() {
-		rawURL := u.calculateURL("", "", "", false, false, calc.StatsUpdate{
+		rawURL := u.calculateURL("", "", "", false, false, false, calc.StatsUpdate{
 			NumHostEndpoints:     123,
 			NumWorkloadEndpoints: 234,
 			NumHosts:             10,
@@ -291,7 +291,7 @@ var _ = Describe("UsageReporter with default URL", func() {
 	})
 	It("should have a random component", func() {
 		firstDelay := u.calculateInitialDelay(1000)
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			if u.calculateInitialDelay(1000) != firstDelay {
 				return // Success
 			}
@@ -301,7 +301,7 @@ var _ = Describe("UsageReporter with default URL", func() {
 	It("should have an average close to expected value", func() {
 		var total time.Duration
 		// Give it a high but bounded number of iterations to converge.
-		for i := int64(0); i < 100000; i++ {
+		for i := range int64(100000) {
 			total += u.calculateInitialDelay(60)
 			if i > 100 {
 				average := time.Duration(int64(total) / (i + 1))

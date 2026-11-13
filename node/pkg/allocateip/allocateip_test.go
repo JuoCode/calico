@@ -1,4 +1,4 @@
-// Copyright (c) 2018,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,39 +19,40 @@ import (
 	"errors"
 	"fmt"
 	gnet "net"
+	"sync/atomic"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	felixconfig "github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/resources"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-	"github.com/projectcalico/calico/node/pkg/calicoclient"
+	"github.com/projectcalico/calico/libcalico-go/lib/watch"
 )
 
-func setTunnelAddressForNode(tunnelType string, n *libapi.Node, addr string) {
-	if tunnelType == ipam.AttributeTypeIPIP {
+func setTunnelAddressForNode(tunnelType string, n *internalapi.Node, addr string) {
+	switch tunnelType {
+	case ipam.AttributeTypeIPIP:
 		n.Spec.BGP.IPv4IPIPTunnelAddr = addr
-	} else if tunnelType == ipam.AttributeTypeVXLAN {
+	case ipam.AttributeTypeVXLAN:
 		n.Spec.IPv4VXLANTunnelAddr = addr
-	} else if tunnelType == ipam.AttributeTypeVXLANV6 {
+	case ipam.AttributeTypeVXLANV6:
 		n.Spec.IPv6VXLANTunnelAddr = addr
-	} else if tunnelType == ipam.AttributeTypeWireguard {
+	case ipam.AttributeTypeWireguard:
 		if addr != "" {
 			if n.Spec.Wireguard == nil {
-				n.Spec.Wireguard = &libapi.NodeWireguardSpec{}
+				n.Spec.Wireguard = &internalapi.NodeWireguardSpec{}
 			}
 			n.Spec.Wireguard.InterfaceIPv4Address = addr
 		} else if n.Spec.Wireguard != nil {
@@ -60,10 +61,10 @@ func setTunnelAddressForNode(tunnelType string, n *libapi.Node, addr string) {
 				n.Spec.Wireguard = nil
 			}
 		}
-	} else if tunnelType == ipam.AttributeTypeWireguardV6 {
+	case ipam.AttributeTypeWireguardV6:
 		if addr != "" {
 			if n.Spec.Wireguard == nil {
-				n.Spec.Wireguard = &libapi.NodeWireguardSpec{}
+				n.Spec.Wireguard = &internalapi.NodeWireguardSpec{}
 			}
 			n.Spec.Wireguard.InterfaceIPv6Address = addr
 		} else if n.Spec.Wireguard != nil {
@@ -72,7 +73,7 @@ func setTunnelAddressForNode(tunnelType string, n *libapi.Node, addr string) {
 				n.Spec.Wireguard = nil
 			}
 		}
-	} else {
+	default:
 		panic(fmt.Errorf("Unknown tunnelType, %s", tunnelType))
 	}
 }
@@ -148,31 +149,38 @@ func getRemoveCIDRAndAddrForTunnelType(tunnelType string) (poolCIDR, expectedAdd
 	}
 }
 
-func expectTunnelAddressEmpty(c client.Interface, tunnelType string, nodeName string) {
-	Expect(checkTunnelAddressEmpty(c, tunnelType, nodeName)).NotTo(HaveOccurred())
+func expectTunnelAddressEmptyForNodeName(c client.Interface, nodeName string, tunnelType string) {
+	Expect(checkTunnelAddressEmptyForNodeName(c, nodeName, tunnelType)).NotTo(HaveOccurred())
 }
 
-func checkTunnelAddressEmpty(c client.Interface, tunnelType string, nodeName string) error {
-	ctx := context.Background()
-	n, err := c.Nodes().Get(ctx, nodeName, options.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
+func expectTunnelAddressEmpty(n *internalapi.Node, tunnelType string) {
+	Expect(checkTunnelAddressEmpty(n, tunnelType)).NotTo(HaveOccurred())
+}
 
+func checkTunnelAddressEmptyForNodeName(c client.Interface, nodeName string, tunnelType string) error {
+	n, err := c.Nodes().Get(context.Background(), nodeName, options.GetOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	return checkTunnelAddressEmpty(n, tunnelType)
+}
+
+func checkTunnelAddressEmpty(n *internalapi.Node, tunnelType string) error {
 	var addr string
-	if tunnelType == ipam.AttributeTypeIPIP {
+	switch tunnelType {
+	case ipam.AttributeTypeIPIP:
 		addr = n.Spec.BGP.IPv4IPIPTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeVXLAN {
+	case ipam.AttributeTypeVXLAN:
 		addr = n.Spec.IPv4VXLANTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeVXLANV6 {
+	case ipam.AttributeTypeVXLANV6:
 		addr = n.Spec.IPv6VXLANTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeWireguard {
+	case ipam.AttributeTypeWireguard:
 		if n.Spec.Wireguard != nil {
 			addr = n.Spec.Wireguard.InterfaceIPv4Address
 		}
-	} else if tunnelType == ipam.AttributeTypeWireguardV6 {
+	case ipam.AttributeTypeWireguardV6:
 		if n.Spec.Wireguard != nil {
 			addr = n.Spec.Wireguard.InterfaceIPv6Address
 		}
-	} else {
+	default:
 		panic(fmt.Errorf("Unknown tunnelType, %s", tunnelType))
 	}
 	if addr != "" {
@@ -181,32 +189,41 @@ func checkTunnelAddressEmpty(c client.Interface, tunnelType string, nodeName str
 	return nil
 }
 
-func expectTunnelAddressForNode(c client.Interface, tunnelType string, nodeName string, addr string) {
-	Expect(checkTunnelAddressForNode(c, tunnelType, nodeName, addr)).NotTo(HaveOccurred())
+func expectTunnelAddressForNodeName(c client.Interface, nodeName string, tunnelType string, addr string) {
+	Expect(checkTunnelAddressForNodeName(c, nodeName, tunnelType, addr)).NotTo(HaveOccurred())
 }
 
-func checkTunnelAddressForNode(c client.Interface, tunnelType string, nodeName string, expected string) error {
-	ctx := context.Background()
-	n, err := c.Nodes().Get(ctx, nodeName, options.GetOptions{})
+func expectTunnelAddressForNode(c client.Interface, n *internalapi.Node, tunnelType string, addr string) {
+	Expect(checkTunnelAddressForNode(c, n, tunnelType, addr)).NotTo(HaveOccurred())
+}
+
+func checkTunnelAddressForNodeName(c client.Interface, nodeName string, tunnelType string, expected string) error {
+	n, err := c.Nodes().Get(context.Background(), nodeName, options.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
+	return checkTunnelAddressForNode(c, n, tunnelType, expected)
+}
+
+func checkTunnelAddressForNode(c client.Interface, n *internalapi.Node, tunnelType string, expected string) error {
+	ctx := context.Background()
 
 	// Check the address in the node is as expected.
 	var addr string
-	if tunnelType == ipam.AttributeTypeIPIP {
+	switch tunnelType {
+	case ipam.AttributeTypeIPIP:
 		addr = n.Spec.BGP.IPv4IPIPTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeVXLAN {
+	case ipam.AttributeTypeVXLAN:
 		addr = n.Spec.IPv4VXLANTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeVXLANV6 {
+	case ipam.AttributeTypeVXLANV6:
 		addr = n.Spec.IPv6VXLANTunnelAddr
-	} else if tunnelType == ipam.AttributeTypeWireguard {
+	case ipam.AttributeTypeWireguard:
 		if n.Spec.Wireguard != nil {
 			addr = n.Spec.Wireguard.InterfaceIPv4Address
 		}
-	} else if tunnelType == ipam.AttributeTypeWireguardV6 {
+	case ipam.AttributeTypeWireguardV6:
 		if n.Spec.Wireguard != nil {
 			addr = n.Spec.Wireguard.InterfaceIPv6Address
 		}
-	} else {
+	default:
 		panic(fmt.Errorf("Unknown tunnelType, %s", tunnelType))
 	}
 	if addr != expected {
@@ -214,13 +231,13 @@ func checkTunnelAddressForNode(c client.Interface, tunnelType string, nodeName s
 	}
 
 	// Also check the assignment attributes for this IP match.
-	attr, _, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expected)})
+	allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expected)})
 	if err != nil {
 		return err
-	} else if attr[ipam.AttributeNode] != nodeName {
-		return fmt.Errorf("Unexpected node attribute %s, expected %s", attr[ipam.AttributeNode], nodeName)
-	} else if attr[ipam.AttributeType] != tunnelType {
-		return fmt.Errorf("Unexpected ipam type attribute %s, expected %s", attr[ipam.AttributeType], tunnelType)
+	} else if allocAttr.ActiveOwnerAttrs[ipam.AttributeNode] != n.Name {
+		return fmt.Errorf("Unexpected node attribute %s, expected %s", allocAttr.ActiveOwnerAttrs[ipam.AttributeNode], n.Name)
+	} else if allocAttr.ActiveOwnerAttrs[ipam.AttributeType] != tunnelType {
+		return fmt.Errorf("Unexpected ipam type attribute %s, expected %s", allocAttr.ActiveOwnerAttrs[ipam.AttributeType], tunnelType)
 	}
 
 	return nil
@@ -265,8 +282,8 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Run the allocateip code.
-		cfg, c := calicoclient.CreateClient()
-		reconcileTunnelAddrs(nodename, cfg, c, felixconfig.New())
+		err = reconcileTunnelAddrs(context.Background(), nodename, c, felixconfig.New())
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the node has the same IP on it.
 		newNode, err := c.Nodes().Get(ctx, nodename, options.GetOptions{})
@@ -275,11 +292,11 @@ var _ = Describe("FV tests", func() {
 		Expect(newNode.Spec.BGP.IPv4IPIPTunnelAddr).To(Equal("172.16.0.1"))
 
 		// Assert that the IPAM allocation has been updated to include a handle and attributes.
-		attrs, handle, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
+		allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(len(attrs)).To(Equal(2))
-		Expect(handle).NotTo(BeNil())
-		Expect(*handle).To(Equal("ipip-tunnel-addr-my-test-node"))
+		Expect(len(allocAttr.ActiveOwnerAttrs)).To(Equal(2))
+		Expect(allocAttr.HandleID).NotTo(BeNil())
+		Expect(*allocAttr.HandleID).To(Equal("ipip-tunnel-addr-my-test-node"))
 	})
 
 	It("should not claim an address that has a handle but no attributes", func() {
@@ -309,8 +326,8 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Run the allocateip code.
-		cfg, c := calicoclient.CreateClient()
-		reconcileTunnelAddrs(nodename, cfg, c, felixconfig.New())
+		err = reconcileTunnelAddrs(context.Background(), nodename, c, felixconfig.New())
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the node no longer has the same IP on it.
 		newNode, err := c.Nodes().Get(ctx, nodename, options.GetOptions{})
@@ -323,10 +340,10 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the IPAM allocation for the original address is still intact.
-		_, handle, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
+		allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(handle).NotTo(BeNil())
-		Expect(*handle).To(Equal("some-wep-handle"))
+		Expect(allocAttr.HandleID).NotTo(BeNil())
+		Expect(*allocAttr.HandleID).To(Equal("some-wep-handle"))
 	})
 
 	It("should release old IPAM addresses if they exist and the node has none", func() {
@@ -353,8 +370,8 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Run the allocateip code.
-		cfg, c := calicoclient.CreateClient()
-		reconcileTunnelAddrs(nodename, cfg, c, felixconfig.New())
+		err = reconcileTunnelAddrs(context.Background(), nodename, c, felixconfig.New())
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the node no longer has the same IP on it.
 		newNode, err := c.Nodes().Get(ctx, nodename, options.GetOptions{})
@@ -366,7 +383,7 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the IPAM allocation for the original leaked address is gone.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
 		Expect(err).To(HaveOccurred())
 
 		// Assert that exactly one address exists for the node and that it matches the node.
@@ -400,8 +417,8 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Run the allocateip code.
-		cfg, c := calicoclient.CreateClient()
-		reconcileTunnelAddrs(nodename, cfg, c, felixconfig.New())
+		err = reconcileTunnelAddrs(context.Background(), nodename, c, felixconfig.New())
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the node no longer has the same IP on it.
 		newNode, err := c.Nodes().Get(ctx, nodename, options.GetOptions{})
@@ -413,7 +430,7 @@ var _ = Describe("FV tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the IPAM allocation for the original leaked address is gone.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP("172.16.0.1")})
 		Expect(err).To(HaveOccurred())
 
 		// Assert that exactly one address exists for the node and that it matches the node.
@@ -425,7 +442,6 @@ var _ = Describe("FV tests", func() {
 })
 
 var _ = Describe("ensureHostTunnelAddress", func() {
-
 	ctx := context.Background()
 	cfg, _ := apiconfig.LoadClientConfigFromEnvironment()
 
@@ -502,8 +518,9 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		_, _, cidr, expectedAddr := getEnsureCIDRAndExpectedAddrForTunnelType(tunnelType)
 
 		_, ipnet, _ := net.ParseCIDR(cidr)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -524,8 +541,9 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		_, _, cidr, expectedAddr := getEnsureCIDRAndExpectedAddrForTunnelType(tunnelType)
 
 		_, ipnet, _ := net.ParseCIDR(cidr)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -544,20 +562,22 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		cidr1, expectedAddr1, cidr2, expectedAddr2 := getEnsureCIDRAndExpectedAddrForTunnelType(tunnelType)
 
 		_, ipnet, _ := net.ParseCIDR(cidr1)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr1)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr1)
 
 		// Simulate a node restart and ippool update.
 		_, ipnet, _ = net.ParseCIDR(cidr2)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 
 		// Check old address
 		// Verify 172.16.10.10 has been released.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
 		Expect(err).To(BeAssignableToTypeOf(cerrors.ErrorResourceDoesNotExist{}))
 
 		// Check new address has been assigned in pool1.
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -589,16 +609,17 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		_, ipnet, _ := net.ParseCIDR(cidr2)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 
 		// Check old address.
 		// Verify 172.16.10.10 has not been touched.
-		attr, _, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
+		allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(attr).To(Equal(wepAttr))
+		Expect(allocAttr.ActiveOwnerAttrs).To(Equal(wepAttr))
 
 		// Check new address has been assigned.
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -617,16 +638,18 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		_, _, cidr2, expectedAddr2 := getEnsureCIDRAndExpectedAddrForTunnelType(tunnelType)
 
 		_, ipnet, _ := net.ParseCIDR(cidr2)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 
 		// Now we have a wep IP allocated at 172.16.0.0 and tunnel ip allocated at 172.16.0.1.
 		// Release wep IP and call ensureHostTunnelAddress again. Tunnel ip should not be changed.
 		err = c.IPAM().ReleaseByHandle(ctx, "myhandle")
 		Expect(err).NotTo(HaveOccurred())
 
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -646,12 +669,13 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Verify 172.16.0.1 is not properly assigned to tunnel address.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr2)})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr2)})
 		Expect(err).To(BeAssignableToTypeOf(cerrors.ErrorResourceDoesNotExist{}))
 
 		_, ipnet, _ := net.ParseCIDR(cidr2)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -687,13 +711,14 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		_, ipnet, _ := net.ParseCIDR(cidr2)
-		ensureHostTunnelAddress(ctx, c, node.Name, []net.IPNet{*ipnet}, tunnelType)
-		expectTunnelAddressForNode(c, tunnelType, node.Name, expectedAddr2)
+		_, err = ensureHostTunnelAddress(ctx, c, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
+		expectTunnelAddressForNode(c, node, tunnelType, expectedAddr2)
 
 		// Verify 172.16.0.0 has not been released.
-		attr, _, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
+		allocAttr, err := c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(expectedAddr1)})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(attr).To(Equal(wepAttr))
+		Expect(allocAttr.ActiveOwnerAttrs).To(Equal(wepAttr))
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -702,7 +727,7 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 		Entry("VXLAN-v6", ipam.AttributeTypeVXLANV6),
 	)
 
-	DescribeTable("should panic on datastore errors", func(tunnelType string) {
+	DescribeTable("should return error on datastore errors", func(tunnelType string) {
 		pa := newIPPoolErrorAccessor(cerrors.ErrorDatastoreError{Err: errors.New("mock datastore error"), Identifier: nil})
 		cc := newShimClientWithPoolAccessor(c, be, pa)
 
@@ -717,12 +742,8 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 
 		_, ipnet, _ := net.ParseCIDR(cidr2)
 
-		defer func() {
-			if err := recover(); err == nil {
-				Fail("Panic didn't occur!")
-			}
-		}()
-		ensureHostTunnelAddress(ctx, cc, node.Name, []net.IPNet{*ipnet}, tunnelType)
+		_, err = ensureHostTunnelAddress(ctx, cc, node, []net.IPNet{*ipnet}, tunnelType)
+		Expect(err).To(HaveOccurred())
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -733,7 +754,6 @@ var _ = Describe("ensureHostTunnelAddress", func() {
 })
 
 var _ = Describe("removeHostTunnelAddress", func() {
-
 	ctx := context.Background()
 	cfg, _ := apiconfig.LoadClientConfigFromEnvironment()
 
@@ -768,10 +788,9 @@ var _ = Describe("removeHostTunnelAddress", func() {
 		_, err := c.Nodes().Create(ctx, node, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		removeHostTunnelAddr(ctx, c, node.Name, tunnelType)
-		_, err = c.Nodes().Get(ctx, node.Name, options.GetOptions{})
+		err = removeHostTunnelAddr(ctx, c, node, tunnelType)
 		Expect(err).NotTo(HaveOccurred())
-		expectTunnelAddressEmpty(c, tunnelType, node.Name)
+		expectTunnelAddressEmpty(node, tunnelType)
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
 		Entry("VXLAN", ipam.AttributeTypeVXLAN),
@@ -788,7 +807,8 @@ var _ = Describe("removeHostTunnelAddress", func() {
 		_, err := c.Nodes().Create(ctx, node, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		removeHostTunnelAddr(ctx, c, node.Name, tunnelType)
+		err = removeHostTunnelAddr(ctx, c, node, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 		n, err := c.Nodes().Get(ctx, node.Name, options.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(n.Spec.BGP).To(BeNil())
@@ -822,10 +842,10 @@ var _ = Describe("removeHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Remove the tunnel address.
-		removeHostTunnelAddr(ctx, c, node.Name, tunnelType)
-
+		err = removeHostTunnelAddr(ctx, c, node, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 		// Assert that the IPAM allocation is gone.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
 		Expect(err).To(HaveOccurred())
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
@@ -854,10 +874,11 @@ var _ = Describe("removeHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Remove the tunnel address.
-		removeHostTunnelAddr(ctx, c, node.Name, tunnelType)
+		err = removeHostTunnelAddr(ctx, c, node, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the IPAM allocation is gone.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
 		Expect(err).To(HaveOccurred())
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
@@ -888,10 +909,11 @@ var _ = Describe("removeHostTunnelAddress", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Remove the tunnel address.
-		removeHostTunnelAddr(ctx, c, node.Name, tunnelType)
+		err = removeHostTunnelAddr(ctx, c, node, tunnelType)
+		Expect(err).NotTo(HaveOccurred())
 
 		// Assert that the IPAM allocation is gone.
-		_, _, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
+		_, err = c.IPAM().GetAssignmentAttributes(ctx, net.IP{IP: gnet.ParseIP(allocationAddr)})
 		Expect(err).NotTo(HaveOccurred())
 	},
 		Entry("IPIP", ipam.AttributeTypeIPIP),
@@ -903,7 +925,6 @@ var _ = Describe("removeHostTunnelAddress", func() {
 })
 
 var _ = Describe("Running as daemon", func() {
-
 	ctx := context.Background()
 	cfg, _ := apiconfig.LoadClientConfigFromEnvironment()
 
@@ -935,20 +956,22 @@ var _ = Describe("Running as daemon", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("starting the IP allocation daemon")
-		done := make(chan struct{})
+		ctx, cancel := context.WithCancel(ctx)
 		completed := make(chan struct{})
 		go func() {
-			run("test.node", cfg, c, felixconfig.New(), done)
-			close(completed)
+			defer close(completed)
+			_ = run(ctx, "test.node", cfg, c, felixconfig.New(), false)
 		}()
 
 		// Wireguard is assigned first, then IPIP.  Note that this is an implementation detail rather than a requirement
 		// and so this might change in future.
 		By("waiting for wireguard and IPIP assignment")
 		Eventually(func() error {
-			return checkTunnelAddressForNode(c, ipam.AttributeTypeWireguard, "test.node", "172.16.0.0")
+			return checkTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeWireguard, "172.16.0.0")
 		}, "5s", "200ms").ShouldNot(HaveOccurred())
-		Eventually(func() error { return checkTunnelAddressForNode(c, ipam.AttributeTypeIPIP, "test.node", "172.16.0.1") }, "5s", "200ms").ShouldNot(HaveOccurred())
+		Eventually(func() error {
+			return checkTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeIPIP, "172.16.0.1")
+		}, "5s", "200ms").ShouldNot(HaveOccurred())
 
 		// Modify the IPv4 pool to be VXLAN.  The IPIP tunnel should be removed, and the VXLAN one should be assigned. The
 		// wireguard IP should not change.
@@ -958,12 +981,16 @@ var _ = Describe("Running as daemon", func() {
 		poolV4, err = c.IPPools().Update(ctx, poolV4, options.SetOptions{})
 		Expect(err).ToNot(HaveOccurred())
 
-		Eventually(func() error { return checkTunnelAddressEmpty(c, ipam.AttributeTypeIPIP, "test.node") }, "5s", "200ms").ShouldNot(HaveOccurred())
-		Eventually(func() error { return checkTunnelAddressForNode(c, ipam.AttributeTypeVXLAN, "test.node", "172.16.0.2") }, "5s", "200ms").ShouldNot(HaveOccurred())
-		expectTunnelAddressForNode(c, ipam.AttributeTypeWireguard, "test.node", "172.16.0.0")
+		Eventually(func() error {
+			return checkTunnelAddressEmptyForNodeName(c, "test.node", ipam.AttributeTypeIPIP)
+		}, "5s", "200ms").ShouldNot(HaveOccurred())
+		Eventually(func() error {
+			return checkTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeVXLAN, "172.16.0.2")
+		}, "5s", "200ms").ShouldNot(HaveOccurred())
+		expectTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeWireguard, "172.16.0.0")
 
 		// Verify that IPv6 address is assigned from the only one available in the VXLAN IPv6 IPPool
-		expectTunnelAddressForNode(c, ipam.AttributeTypeVXLANV6, "test.node", "2001:db8::")
+		expectTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeVXLANV6, "2001:db8::")
 
 		// Modify the node so that the wireguard status has a different public key - the IP address should not change.
 		By("changing the wireguard public key")
@@ -973,10 +1000,10 @@ var _ = Describe("Running as daemon", func() {
 		_, err = c.Nodes().Update(ctx, node, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Consistently(func() error {
-			return checkTunnelAddressForNode(c, ipam.AttributeTypeWireguard, "test.node", "172.16.0.0")
+			return checkTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeWireguard, "172.16.0.0")
 		}, "2s", "200ms").ShouldNot(HaveOccurred())
-		expectTunnelAddressEmpty(c, ipam.AttributeTypeIPIP, "test.node")
-		expectTunnelAddressForNode(c, ipam.AttributeTypeVXLAN, "test.node", "172.16.0.2")
+		expectTunnelAddressEmptyForNodeName(c, "test.node", ipam.AttributeTypeIPIP)
+		expectTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeVXLAN, "172.16.0.2")
 
 		// Modify the node so that there is no wireguard status. The  wireguardIP address should be removed.
 		By("removing wireguard public key from node status")
@@ -986,23 +1013,113 @@ var _ = Describe("Running as daemon", func() {
 		_, err = c.Nodes().Update(ctx, node, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		Eventually(func() error { return checkTunnelAddressEmpty(c, ipam.AttributeTypeWireguard, "test.node") }, "2s", "200ms").ShouldNot(HaveOccurred())
-		expectTunnelAddressEmpty(c, ipam.AttributeTypeIPIP, "test.node")
-		expectTunnelAddressForNode(c, ipam.AttributeTypeVXLAN, "test.node", "172.16.0.2")
+		Eventually(func() error {
+			return checkTunnelAddressEmptyForNodeName(c, "test.node", ipam.AttributeTypeWireguard)
+		}, "2s", "200ms").ShouldNot(HaveOccurred())
+		expectTunnelAddressEmptyForNodeName(c, "test.node", ipam.AttributeTypeIPIP)
+		expectTunnelAddressForNodeName(c, "test.node", ipam.AttributeTypeVXLAN, "172.16.0.2")
 
-		// Close the done channel to trigger completion.
 		By("shutting down the daemon")
-		close(done)
+		cancel()
 		Eventually(completed).Should(BeClosed(), "2s", "200ms")
 	})
 })
 
-var _ = Describe("determineEnabledPoolCIDRs", func() {
+var _ = Describe("Reconciliation triggers", func() {
+	const nodename = "test.node"
 
+	var r *reconciler
+
+	nodeUpdate := func(labels map[string]string) bapi.Update {
+		return bapi.Update{
+			KVPair: model.KVPair{
+				Key: model.ResourceKey{
+					Kind: internalapi.KindNode,
+					Name: nodename,
+				},
+				Value: &internalapi.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   nodename,
+						Labels: labels,
+					},
+					Status: internalapi.NodeStatus{
+						WireguardPublicKey: "jlkVyQYooZYzI2wFfNhSZez5eWh44yfq1wKVjLvSXgY=",
+					},
+				},
+			},
+			UpdateType: bapi.UpdateTypeKVUpdated,
+		}
+	}
+
+	// poolUpdate goes through the same v3 to v1 conversion as the tunnel IP
+	// syncer, so a field the conversion drops can't trigger a reconcile here either.
+	poolUpdate := func(nodeSelector string, mutators ...func(*api.IPPool)) bapi.Update {
+		pool := api.NewIPPool()
+		pool.Name = "ipip-pool"
+		pool.Spec.CIDR = "10.200.0.0/24"
+		pool.Spec.IPIPMode = api.IPIPModeAlways
+		pool.Spec.NodeSelector = nodeSelector
+		for _, m := range mutators {
+			m(pool)
+		}
+		kvp, err := resources.IPPoolV3ToV1(&model.KVPair{
+			Key:   model.ResourceKey{Kind: api.KindIPPool, Name: pool.Name},
+			Value: pool,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		return bapi.Update{KVPair: *kvp, UpdateType: bapi.UpdateTypeKVUpdated}
+	}
+
+	BeforeEach(func() {
+		r = &reconciler{
+			nodename: nodename,
+			// Buffered so that the triggers can be read back without a run loop.
+			ch:                   make(chan struct{}, 1),
+			data:                 make(map[string]any),
+			initialSyncCompleted: true,
+		}
+		r.OnUpdates([]bapi.Update{
+			nodeUpdate(map[string]string{"rack": "one"}),
+			poolUpdate("!all()"),
+		})
+		Expect(r.ch).To(Receive(), "expected the first update to trigger")
+	})
+
+	It("should trigger a reconcile when only the node labels change", func() {
+		r.OnUpdates([]bapi.Update{nodeUpdate(map[string]string{"rack": "two"})})
+		Expect(r.ch).To(Receive())
+	})
+
+	It("should not trigger a reconcile when the node is unchanged", func() {
+		r.OnUpdates([]bapi.Update{nodeUpdate(map[string]string{"rack": "one"})})
+		Expect(r.ch).ToNot(Receive())
+	})
+
+	It("should trigger a reconcile when only an IP pool's node selector changes", func() {
+		r.OnUpdates([]bapi.Update{poolUpdate("all()")})
+		Expect(r.ch).To(Receive())
+	})
+
+	It("should not trigger a reconcile when an IP pool is unchanged", func() {
+		r.OnUpdates([]bapi.Update{poolUpdate("!all()")})
+		Expect(r.ch).ToNot(Receive())
+	})
+
+	It("should trigger a reconcile when an IP pool starts deleting", func() {
+		r.OnUpdates([]bapi.Update{poolUpdate("!all()", func(p *api.IPPool) {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"projectcalico.org/ippool-finalizer"}
+		})})
+		Expect(r.ch).To(Receive())
+	})
+})
+
+var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("IPIP tests", func() {
 		It("should match ip-pool-1 but not ip-pool-2", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1021,7 +1138,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo != "bar"`,
 							IPIPMode:     api.IPIPModeAlways,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeIPIP)
@@ -1033,7 +1152,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 
 		It("should ignore IP pools that do not allow tunnel IPs", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1077,7 +1196,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("IPv4 VXLAN tests", func() {
 		It("should match ip-pool-1 but not ip-pool-2", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1096,7 +1215,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo != "bar"`,
 							VXLANMode:    api.VXLANModeAlways,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeVXLAN)
@@ -1107,7 +1228,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 		})
 		It("should match ip-pool-1 but not ip-pool-2 for VXLANMode CrossSubnet", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1126,7 +1247,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo != "bar"`,
 							VXLANMode:    api.VXLANModeCrossSubnet,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeVXLAN)
@@ -1140,7 +1263,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("IPv6 VXLAN tests", func() {
 		It("should match ip-pool-1 but not ip-pool-2", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1159,7 +1282,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo != "bar"`,
 							VXLANMode:    api.VXLANModeAlways,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeVXLANV6)
@@ -1170,7 +1295,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 		})
 		It("should match ip-pool-1 but not ip-pool-2 for VXLANMode CrossSubnet", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1189,7 +1314,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo != "bar"`,
 							VXLANMode:    api.VXLANModeCrossSubnet,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeVXLANV6)
@@ -1203,7 +1330,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("Dual stack VXLAN tests", func() {
 		It("should match both IPv4 and IPv6 pools", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1223,7 +1350,8 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							VXLANMode:    api.VXLANModeAlways,
 						},
 					},
-				}}
+				},
+			}
 
 			// Execute and test assertions.
 			_, cidrV4, _ := net.ParseCIDR("172.0.0.1/9")
@@ -1240,7 +1368,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 
 		It("should match both IPv4 and IPv6 pools for VXLANMode CrossSubnet", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1260,7 +1388,8 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							VXLANMode:    api.VXLANModeCrossSubnet,
 						},
 					},
-				}}
+				},
+			}
 
 			// Execute and test assertions.
 			_, cidrV4, _ := net.ParseCIDR("172.0.0.1/9")
@@ -1279,9 +1408,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("IPv4 Wireguard tests", func() {
 		It("node has public key - should match ip-pool-1 but not ip-pool-2", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{
+			n := internalapi.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}},
-				Status:     libapi.NodeStatus{WireguardPublicKey: "abcde"},
+				Status:     internalapi.NodeStatus{WireguardPublicKey: "abcde"},
 			}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
@@ -1299,7 +1428,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							CIDR:         "172.128.0.0/9",
 							NodeSelector: `foo != "bar"`,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeWireguard)
@@ -1310,7 +1441,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 		})
 		It("node has no public key - should match no pools", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1327,7 +1458,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							CIDR:         "172.128.0.0/9",
 							NodeSelector: `foo != "bar"`,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeWireguard)
@@ -1338,9 +1471,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("IPv6 Wireguard tests", func() {
 		It("node has public key - should match ip-pool-1 but not ip-pool-2", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{
+			n := internalapi.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}},
-				Status:     libapi.NodeStatus{WireguardPublicKeyV6: "abcde"},
+				Status:     internalapi.NodeStatus{WireguardPublicKeyV6: "abcde"},
 			}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
@@ -1358,7 +1491,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							CIDR:         "2001:db8:00:ff::/64",
 							NodeSelector: `foo != "bar"`,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeWireguardV6)
@@ -1369,7 +1504,7 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 		})
 		It("node has no public key - should match no pools", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
+			n := internalapi.Node{ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}}}
 			pl := api.IPPoolList{
 				Items: []api.IPPool{
 					{
@@ -1386,7 +1521,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							CIDR:         "2001:db8:00:ff::/64",
 							NodeSelector: `foo != "bar"`,
 						},
-					}}}
+					},
+				},
+			}
 
 			// Execute and test assertions.
 			cidrs := determineEnabledPoolCIDRs(n, pl, felixconfig.New(), ipam.AttributeTypeWireguardV6)
@@ -1397,9 +1534,9 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 	Context("Dual Stack Wireguard tests", func() {
 		It("node has both IPv4 and IPv6 public keys - should match both pools", func() {
 			// Mock out the node and ip pools
-			n := libapi.Node{
+			n := internalapi.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "bee-node", Labels: map[string]string{"foo": "bar"}},
-				Status: libapi.NodeStatus{
+				Status: internalapi.NodeStatus{
 					WireguardPublicKey:   "abcde",
 					WireguardPublicKeyV6: "fghij",
 				},
@@ -1421,7 +1558,8 @@ var _ = Describe("determineEnabledPoolCIDRs", func() {
 							NodeSelector: `foo == "bar"`,
 						},
 					},
-				}}
+				},
+			}
 
 			// Execute and test assertions.
 			_, cidrV4, _ := net.ParseCIDR("172.0.0.1/9")
@@ -1447,11 +1585,11 @@ func newIPPoolErrorAccessor(err error) *ipPoolErrorAccessor {
 	return &ipPoolErrorAccessor{err}
 }
 
-func (i *ipPoolErrorAccessor) GetEnabledPools(ipVersion int) ([]api.IPPool, error) {
+func (i *ipPoolErrorAccessor) GetEnabledPools(ctx context.Context, ipVersion int) ([]api.IPPool, error) {
 	return nil, i.err
 }
 
-func (i *ipPoolErrorAccessor) GetAllPools() ([]api.IPPool, error) {
+func (i *ipPoolErrorAccessor) GetAllPools(ctx context.Context) ([]api.IPPool, error) {
 	return nil, i.err
 }
 
@@ -1509,6 +1647,11 @@ func (c shimClient) HostEndpoints() client.HostEndpointInterface {
 	return c.client.HostEndpoints()
 }
 
+// LiveMigrations returns an interface for managing live migration resources.
+func (c shimClient) LiveMigrations() client.LiveMigrationInterface {
+	return c.client.LiveMigrations()
+}
+
 // WorkloadEndpoints returns an interface for managing workload endpoint resources.
 func (c shimClient) WorkloadEndpoints() client.WorkloadEndpointInterface {
 	return c.client.WorkloadEndpoints()
@@ -1555,8 +1698,8 @@ func (c shimClient) CalicoNodeStatus() client.CalicoNodeStatusInterface {
 }
 
 // IPAMConfig returns an interface for managing the IPAMConfig resource.
-func (c shimClient) IPAMConfig() client.IPAMConfigInterface {
-	return c.client.IPAMConfig()
+func (c shimClient) IPAMConfiguration() client.IPAMConfigurationInterface {
+	return c.client.IPAMConfiguration()
 }
 
 // BlockAffinities returns an interface for managing the block affinity resources.
@@ -1566,4 +1709,145 @@ func (c shimClient) BlockAffinities() client.BlockAffinityInterface {
 
 func (c shimClient) EnsureInitialized(ctx context.Context, calicoVersion, clusterType string) error {
 	return nil
+}
+
+func (c shimClient) Close() error {
+	return c.client.Close()
+}
+
+func (c shimClient) Tiers() client.TierInterface {
+	panic("not implemented")
+}
+
+func (c shimClient) StagedGlobalNetworkPolicies() client.StagedGlobalNetworkPolicyInterface {
+	panic("not implemented")
+}
+
+func (c shimClient) StagedKubernetesNetworkPolicies() client.StagedKubernetesNetworkPolicyInterface {
+	panic("not implemented")
+}
+
+func (c shimClient) StagedNetworkPolicies() client.StagedNetworkPolicyInterface {
+	panic("not implemented")
+}
+
+// nodeNotFoundClient embeds the interface so only the one call the reconcile makes
+// before it bails needs implementing.
+type nodeNotFoundClient struct {
+	client.Interface
+}
+
+func (nodeNotFoundClient) Nodes() client.NodeInterface { return nodeNotFoundNodes{} }
+
+type nodeNotFoundNodes struct {
+	client.NodeInterface
+}
+
+func (nodeNotFoundNodes) Get(_ context.Context, name string, _ options.GetOptions) (*internalapi.Node, error) {
+	return nil, cerrors.ErrorResourceDoesNotExist{Identifier: name}
+}
+
+type datastoreDownClient struct {
+	client.Interface
+}
+
+func (datastoreDownClient) Nodes() client.NodeInterface { return datastoreDownNodes{} }
+
+type datastoreDownNodes struct {
+	client.NodeInterface
+}
+
+func (datastoreDownNodes) Get(_ context.Context, _ string, _ options.GetOptions) (*internalapi.Node, error) {
+	return nil, errors.New("datastore is down")
+}
+
+var _ = Describe("reconciler run loop", func() {
+	var r reconciler
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var done chan error
+
+	BeforeEach(func() {
+		ctx, cancel = context.WithCancel(context.Background())
+		done = make(chan error, 1)
+		// Unbuffered, as in production: OnUpdates drops triggers sent mid-reconcile.
+		r = reconciler{nodename: "node1", ch: make(chan struct{})}
+	})
+
+	AfterEach(func() { cancel() })
+
+	// A deleted-and-re-registered node is briefly absent. Exiting here takes every
+	// other node service down with it, including the one that repairs the node.
+	It("keeps running when the node is momentarily absent", func() {
+		r.client = nodeNotFoundClient{}
+		go func() { done <- r.run(ctx) }()
+
+		r.ch <- struct{}{}
+		Consistently(done, "500ms").ShouldNot(Receive(), "a missing node must not stop the loop")
+
+		cancel()
+		Eventually(done, "5s").Should(Receive(BeNil()))
+	})
+
+	// OnUpdates drops a trigger that lands mid-reconcile, so the loop has to
+	// re-check on its own or it waits for an update that never comes.
+	It("retries a missing node without needing another trigger", func() {
+		c := &countingNotFoundClient{}
+		r.client = c
+		go func() { done <- r.run(ctx) }()
+
+		r.ch <- struct{}{}
+		Eventually(c.calls, "20s", "500ms").Should(BeNumerically(">=", 2),
+			"the loop must re-check without a second trigger")
+
+		cancel()
+		Eventually(done, "5s").Should(Receive(BeNil()))
+	})
+
+	It("still reports any other reconcile failure", func() {
+		r.client = datastoreDownClient{}
+		go func() { done <- r.run(ctx) }()
+
+		r.ch <- struct{}{}
+		Eventually(done, "5s").Should(Receive(MatchError(ContainSubstring("datastore is down"))))
+	})
+})
+
+// countingNotFoundClient always reports the node missing and counts the lookups.
+type countingNotFoundClient struct {
+	client.Interface
+	n atomic.Int64
+}
+
+func (c *countingNotFoundClient) calls() int64 { return c.n.Load() }
+
+func (c *countingNotFoundClient) Nodes() client.NodeInterface { return countingNotFoundNodes{c} }
+
+type countingNotFoundNodes struct {
+	owner *countingNotFoundClient
+}
+
+func (n countingNotFoundNodes) Create(context.Context, *internalapi.Node, options.SetOptions) (*internalapi.Node, error) {
+	panic("not used")
+}
+
+func (n countingNotFoundNodes) Update(context.Context, *internalapi.Node, options.SetOptions) (*internalapi.Node, error) {
+	panic("not used")
+}
+
+func (n countingNotFoundNodes) Delete(context.Context, string, options.DeleteOptions) (*internalapi.Node, error) {
+	panic("not used")
+}
+
+func (n countingNotFoundNodes) List(context.Context, options.ListOptions) (*internalapi.NodeList, error) {
+	panic("not used")
+}
+
+func (n countingNotFoundNodes) Watch(context.Context, options.ListOptions) (watch.Interface, error) {
+	panic("not used")
+}
+
+func (n countingNotFoundNodes) Get(_ context.Context, name string, _ options.GetOptions) (*internalapi.Node, error) {
+	n.owner.n.Add(1)
+	return nil, cerrors.ErrorResourceDoesNotExist{Identifier: name}
 }

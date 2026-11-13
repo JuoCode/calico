@@ -1,5 +1,4 @@
-# Copyright 2016 Metaswitch Networks
-# Copyright 2018 Tigera, Inc. All rights reserved.
+# Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,40 +12,40 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from collections import namedtuple
-import eventlet
 import json
 import logging
-import mock
 import socket
+from collections import namedtuple
+
+import eventlet
+
+import mock
 
 from neutron.agent.dhcp_agent import register_options
 from neutron.agent.linux import dhcp
 from neutron.tests import base
 
+from neutron_lib.constants import DHCPV6_STATEFUL, IPV6_SLAAC
+
+from oslo_config import cfg
+
+from networking_calico import datamodel_v1
+from networking_calico import datamodel_v2
+from networking_calico import datamodel_v3
 from networking_calico.agent.dhcp_agent import CalicoDhcpAgent
 from networking_calico.agent.dhcp_agent import FakePlugin
 from networking_calico.agent.linux.dhcp import DnsmasqRouted
 from networking_calico.common import config as calico_config
-from networking_calico.compat import cfg
-from networking_calico.compat import DHCPV6_STATEFUL
-from networking_calico import datamodel_v1
-from networking_calico import datamodel_v2
 from networking_calico.etcdutils import EtcdWatcher
 
 LOG = logging.getLogger(__name__)
 
-EtcdResponse = namedtuple('EtcdResponse', ['value'])
+EtcdResponse = namedtuple("EtcdResponse", ["value"])
 
 
-def make_endpoint_name(endpoint_id):
-    parts = [
-        socket.gethostname(),
-        'openstack',
-        'workload-ignored',
-        endpoint_id
-    ]
-    return '-'.join([p.replace('-', '--') for p in parts])
+def make_endpoint_name(endpoint_id, workload_id="workload-ignored"):
+    parts = [socket.gethostname(), "openstack", workload_id, endpoint_id]
+    return "-".join([p.replace("-", "--") for p in parts])
 
 
 class TestFakePlugin(base.BaseTestCase):
@@ -55,18 +54,49 @@ class TestFakePlugin(base.BaseTestCase):
         self.plugin = FakePlugin()
 
     def test_create(self):
-        port = self.plugin.create_dhcp_port({
-            'port': {'network_id': 'net-id-0'}
-        })
-        self.assertEqual({
-            'network_id': 'net-id-0',
-            'device_owner': 'network:dhcp',
-            'id': 'net-id-0',
-            'mac_address': '02:00:00:00:00:00'},
-            port)
+        port = self.plugin.create_dhcp_port({"port": {"network_id": "net-id-0"}})
+        self.assertEqual(
+            {
+                "network_id": "net-id-0",
+                "device_owner": "network:dhcp",
+                "id": "net-id-0",
+                "mac_address": "02:00:00:00:00:00",
+            },
+            port,
+        )
 
     def test_release(self):
-        self.plugin.release_dhcp_port('calico', 'dhcp')
+        self.plugin.release_dhcp_port("calico", "dhcp")
+
+
+class TestImportIsolation(base.BaseTestCase):
+    """Regression test: importing ``networking_calico.agent.dhcp_agent``
+    must not call ``eventlet.monkey_patch()``.
+
+    Module-level ``monkey_patch()`` was the cause of an indefinite hang
+    in ``tox -e py38`` -- subunit's runner ended up parked in
+    epoll_wait() on an empty FD set because every test process inherited
+    the patched interpreter via this module's import.  The patch is now
+    confined to the production wrapper at
+    ``networking_calico.agent.dhcp_agent_main``.  If anyone ever adds
+    ``monkey_patch()`` back to a unit-test-imported module this test
+    will fail immediately.
+
+    By the time this test runs, the test runner has already imported
+    test_dhcp_agent.py, which in turn imported the dhcp_agent module
+    (line 35-36), so the global socket-patched flag accurately reflects
+    what an import of that module does.
+    """
+
+    def test_dhcp_agent_import_does_not_monkey_patch_socket(self):
+        import eventlet.patcher
+
+        self.assertFalse(
+            eventlet.patcher.is_monkey_patched("socket"),
+            "Importing networking_calico.agent.dhcp_agent must not call"
+            " eventlet.monkey_patch(); see networking_calico/agent/"
+            "dhcp_agent_main.py for the production wrapper that does.",
+        )
 
 
 class TestDhcpAgent(base.BaseTestCase):
@@ -91,127 +121,287 @@ class TestDhcpAgent(base.BaseTestCase):
         agent.etcd.dnsmasq_updater = mock.Mock()
 
         # Check that running it invokes the etcd watcher loop.
-        with mock.patch.object(agent, 'etcd') as etcdobj:
+        with mock.patch.object(agent, "etcd") as etcdobj:
             agent.run()
             etcdobj.start.assert_called_with()
 
         # Notify initial snapshot (empty).
-        snapshot_data = agent.etcd._pre_snapshot_hook()
-        agent.etcd._post_snapshot_hook(snapshot_data)
+        agent.etcd._pre_snapshot_hook()
+        agent.etcd._post_snapshot_hook()
         agent.etcd.dnsmasq_updater.update_network.assert_not_called()
 
         # Notify subnets.
         agent.etcd.subnet_watcher.on_subnet_set(
-            EtcdResponse(value=json.dumps({
-                'cidr': '10.28.0.0/24',
-                'gateway_ip': '10.28.0.1',
-                'host_routes': []
-            })),
-            'v4subnet-1'
+            EtcdResponse(
+                value=json.dumps(
+                    {
+                        "cidr": "10.28.0.0/24",
+                        "gateway_ip": "10.28.0.1",
+                        "host_routes": [],
+                    }
+                )
+            ),
+            "v4subnet-1",
         )
         agent.etcd.subnet_watcher.on_subnet_set(
-            EtcdResponse(value=json.dumps({
-                'cidr': '2001:db8:1::/80',
-                'gateway_ip': '2001:db8:1::1'
-            })),
-            'v6subnet-1'
+            EtcdResponse(
+                value=json.dumps(
+                    {"cidr": "2001:db8:1::/80", "gateway_ip": "2001:db8:1::1"}
+                )
+            ),
+            "v6subnet-1",
         )
         agent.etcd.subnet_watcher.on_subnet_set(
-            EtcdResponse(value=json.dumps({
-                'cidr': '10.29.0.0/24',
-                'gateway_ip': '10.29.0.1',
-                'host_routes': [{'destination': '11.11.0.0/16',
-                                 'nexthop': '10.65.0.1'}]
-            })),
-            'v4subnet-2'
+            EtcdResponse(
+                value=json.dumps(
+                    {
+                        "cidr": "10.29.0.0/24",
+                        "gateway_ip": "10.29.0.1",
+                        "host_routes": [
+                            {"destination": "11.11.0.0/16", "nexthop": "10.65.0.1"}
+                        ],
+                    }
+                )
+            ),
+            "v4subnet-2",
         )
 
         # Notify an endpoint.
-        agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({'spec': {
-            'interfaceName': 'tap1234',
-            'mac': 'fe:16:65:12:33:44',
-            'profiles': ['profile-1'],
-            'ipNetworks': ['10.28.0.2/32', '2001:db8:1::2/128'],
-            'ipv4Gateway': '10.28.0.1',
-            'ipv6Gateway': '2001:db8:1::1'
-        }})),
-                                   make_endpoint_name('endpoint-1'))
+        agent.etcd.on_endpoint_set(
+            EtcdResponse(
+                value=json.dumps(
+                    {
+                        "spec": {
+                            "interfaceName": "tap1234",
+                            "mac": "fe:16:65:12:33:44",
+                            "profiles": ["profile-1"],
+                            "ipNetworks": ["10.28.0.2/32", "2001:db8:1::2/128"],
+                            "ipv4Gateway": "10.28.0.1",
+                            "ipv6Gateway": "2001:db8:1::1",
+                        }
+                    }
+                )
+            ),
+            make_endpoint_name("endpoint-1"),
+        )
 
         # Check DHCP driver was asked to restart.
         agent.etcd.dnsmasq_updater.update_network.assert_called()
         agent.etcd.dnsmasq_updater.update_network.reset_mock()
 
         # Notify another endpoint (using the same subnets).
-        agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({'spec': {
-            'interfaceName': 'tap5678',
-            'mac': 'fe:16:65:12:33:55',
-            'profiles': ['profile-1'],
-            'ipNetworks': ['10.28.0.3/32', '2001:db8:1::3/128'],
-            'ipv4Gateway': '10.28.0.1',
-            'ipv6Gateway': '2001:db8:1::1',
-            'fqdn': 'calico-vm17.datcon.co.uk'
-        }})),
-                                   make_endpoint_name('endpoint-2'))
+        agent.etcd.on_endpoint_set(
+            EtcdResponse(
+                value=json.dumps(
+                    {
+                        "spec": {
+                            "interfaceName": "tap5678",
+                            "mac": "fe:16:65:12:33:55",
+                            "profiles": ["profile-1"],
+                            "ipNetworks": ["10.28.0.3/32", "2001:db8:1::3/128"],
+                            "ipv4Gateway": "10.28.0.1",
+                            "ipv6Gateway": "2001:db8:1::1",
+                            "fqdn": "calico-vm17.datcon.co.uk",
+                        }
+                    }
+                )
+            ),
+            make_endpoint_name("endpoint-2"),
+        )
 
         # Check DHCP driver was asked to restart.
         agent.etcd.dnsmasq_updater.update_network.assert_called()
         agent.etcd.dnsmasq_updater.update_network.reset_mock()
 
         # Notify deletion of the first endpoint.
-        agent.etcd.on_endpoint_delete(None,
-                                      make_endpoint_name('endpoint-1'))
+        agent.etcd.on_endpoint_delete(None, make_endpoint_name("endpoint-1"))
 
         # Check DHCP driver was asked to reload allocations.
         agent.etcd.dnsmasq_updater.update_network.assert_called()
         agent.etcd.dnsmasq_updater.update_network.reset_mock()
 
         # Notify another endpoint using a new subnet.
-        agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({'spec': {
-            'interfaceName': 'tapABCD',
-            'mac': 'fe:16:65:12:33:66',
-            'profiles': ['profile-1'],
-            'ipNetworks': ['10.29.0.3/32'],
-            'ipv4Gateway': '10.29.0.1',
-        }})),
-                                   make_endpoint_name('endpoint-3'))
+        agent.etcd.on_endpoint_set(
+            EtcdResponse(
+                value=json.dumps(
+                    {
+                        "spec": {
+                            "interfaceName": "tapABCD",
+                            "mac": "fe:16:65:12:33:66",
+                            "profiles": ["profile-1"],
+                            "ipNetworks": ["10.29.0.3/32"],
+                            "ipv4Gateway": "10.29.0.1",
+                        }
+                    }
+                )
+            ),
+            make_endpoint_name("endpoint-3"),
+        )
 
         # Check DHCP driver was asked to restart.
         agent.etcd.dnsmasq_updater.update_network.assert_called()
         agent.etcd.dnsmasq_updater.update_network.reset_mock()
+
+    def _make_agent_with_subnet(self):
+        agent = CalicoDhcpAgent()
+        agent.etcd.mtu_watcher = mock.Mock()
+        agent.etcd.mtu_watcher.get_mtu.return_value = 1500
+        agent.etcd.dnsmasq_updater = mock.Mock()
+        agent.etcd.subnet_watcher.on_subnet_set(
+            EtcdResponse(
+                value=json.dumps({"cidr": "10.28.0.0/24", "gateway_ip": "10.28.0.1"})
+            ),
+            "v4subnet-1",
+        )
+        return agent
+
+    ENDPOINT = EtcdResponse(
+        value=json.dumps(
+            {
+                "spec": {
+                    "interfaceName": "tap1234",
+                    "mac": "fe:16:65:12:33:44",
+                    "ipNetworks": ["10.28.0.2/32"],
+                    "ipv4Gateway": "10.28.0.1",
+                }
+            }
+        )
+    )
+
+    @staticmethod
+    def _endpoint_with_fqdn(fqdn):
+        return EtcdResponse(
+            value=json.dumps(
+                {
+                    "metadata": {
+                        "annotations": {datamodel_v3.ANN_KEY_FQDN: fqdn},
+                    },
+                    "spec": {
+                        "interfaceName": "tap1234",
+                        "mac": "fe:16:65:12:33:44",
+                        "ipNetworks": ["10.28.0.2/32"],
+                        "ipv4Gateway": "10.28.0.1",
+                    },
+                }
+            )
+        )
+
+    def test_stale_name_deletion_restores_current_data(self):
+        """Deleting a stale name puts the remaining name's data back in the cache.
+
+        Here the stale name's refresh lands last, so the cache holds the old VM's
+        data -- its hostname, for one -- until the stale name is deleted.
+        """
+        agent = self._make_agent_with_subnet()
+        old_name = make_endpoint_name("endpoint-1", "vm-1")
+        new_name = make_endpoint_name("endpoint-1", "vm-2")
+        agent.etcd.on_endpoint_set(self._endpoint_with_fqdn("vm-1.example"), old_name)
+        agent.etcd.on_endpoint_set(self._endpoint_with_fqdn("vm-2.example"), new_name)
+        agent.etcd.on_endpoint_set(self._endpoint_with_fqdn("vm-1.example"), old_name)
+        agent.etcd.dnsmasq_updater.update_network.reset_mock()
+
+        agent.etcd.on_endpoint_delete(None, old_name)
+
+        port = agent.cache.get_port_by_id("endpoint-1")
+        self.assertEqual("vm-2", port.dns_assignment[0]["hostname"])
+        agent.etcd.dnsmasq_updater.update_network.assert_called()
+
+    def test_stale_name_deletion_keeps_mtu_change(self):
+        """Restoring the remaining name's data keeps an MTU change made since."""
+        agent = self._make_agent_with_subnet()
+        old_name = make_endpoint_name("endpoint-1", "vm-1")
+        new_name = make_endpoint_name("endpoint-1", "vm-2")
+        agent.etcd.on_endpoint_set(self.ENDPOINT, old_name)
+        agent.etcd.on_endpoint_set(self.ENDPOINT, new_name)
+        agent.etcd.on_mtu_change("endpoint-1", 9000)
+
+        agent.etcd.on_endpoint_delete(None, old_name)
+
+        port = agent.cache.get_port_by_id("endpoint-1")
+        self.assertEqual("9000", port.extra_dhcp_opts[0].opt_value)
+
+    def test_stale_name_deletion_keeps_port(self):
+        """Deleting one WEP name for a port doesn't remove it while another exists.
+
+        When a port moves to another VM, its WEP is recreated under a name with the new
+        VM's ID, so briefly there is a WEP under each name.  Their sets and deletions
+        can arrive in any order: here a refresh of the old name lands after the new
+        one's creation, and the old name's deletion after that.
+        """
+        agent = self._make_agent_with_subnet()
+        old_name = make_endpoint_name("endpoint-1", "vm-1")
+        new_name = make_endpoint_name("endpoint-1", "vm-2")
+        agent.etcd.on_endpoint_set(self.ENDPOINT, old_name)
+        agent.etcd.on_endpoint_set(self.ENDPOINT, new_name)
+        agent.etcd.on_endpoint_set(self.ENDPOINT, old_name)
+        agent.etcd.dnsmasq_updater.update_network.reset_mock()
+
+        agent.etcd.on_endpoint_delete(None, old_name)
+
+        self.assertIsNotNone(agent.cache.get_port_by_id("endpoint-1"))
+
+        agent.etcd.on_endpoint_delete(None, new_name)
+
+        self.assertIsNone(agent.cache.get_port_by_id("endpoint-1"))
+        agent.etcd.dnsmasq_updater.update_network.assert_called()
+
+    def test_snapshot_forgets_names_deleted_while_disconnected(self):
+        """A name missing from a new snapshot no longer keeps its port alive."""
+        agent = self._make_agent_with_subnet()
+        old_name = make_endpoint_name("endpoint-1", "vm-1")
+        new_name = make_endpoint_name("endpoint-1", "vm-2")
+        agent.etcd.on_endpoint_set(self.ENDPOINT, old_name)
+
+        # The old name was deleted while the watcher was disconnected, so the new
+        # snapshot has only the new one.
+        agent.etcd._pre_snapshot_hook()
+        agent.etcd.on_endpoint_set(self.ENDPOINT, new_name)
+        agent.etcd._post_snapshot_hook()
+
+        agent.etcd.on_endpoint_delete(None, new_name)
+
+        self.assertIsNone(agent.cache.get_port_by_id("endpoint-1"))
 
     def test_initial_snapshot(self):
         # Create the DHCP agent.
         agent = CalicoDhcpAgent()
 
         # Check that running it invokes the etcd watcher loop.
-        with mock.patch.object(agent, 'etcd') as etcdobj:
+        with mock.patch.object(agent, "etcd") as etcdobj:
             agent.run()
             etcdobj.start.assert_called_with()
 
-        with mock.patch.object(agent, 'call_driver') as call_driver:
+        with mock.patch.object(agent, "call_driver") as call_driver:
             # Notify a non-empty initial snapshot.
-            snapshot_data = agent.etcd._pre_snapshot_hook()
-            agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({'spec': {
-                'interfaceName': 'tap1234',
-                'mac': 'fe:16:65:12:33:44',
-                'profiles': ['profile-1'],
-                'ipNetworks': ['10.28.0.2/32'],
-                'ipv4Gateway': '10.28.0.1',
-            }})),
-                make_endpoint_name('endpoint-4')
+            agent.etcd._pre_snapshot_hook()
+            agent.etcd.on_endpoint_set(
+                EtcdResponse(
+                    value=json.dumps(
+                        {
+                            "spec": {
+                                "interfaceName": "tap1234",
+                                "mac": "fe:16:65:12:33:44",
+                                "profiles": ["profile-1"],
+                                "ipNetworks": ["10.28.0.2/32"],
+                                "ipv4Gateway": "10.28.0.1",
+                            }
+                        }
+                    )
+                ),
+                make_endpoint_name("endpoint-4"),
             )
-            agent.etcd._post_snapshot_hook(snapshot_data)
+            agent.etcd._post_snapshot_hook()
 
             # Check DHCP driver was not troubled - because the subnet data was
             # missing and so the port could not be processed further.
             call_driver.assert_not_called()
 
-    @mock.patch.object(EtcdWatcher, 'start')
+    @mock.patch.object(EtcdWatcher, "start")
     def test_kill_agent(self, loop_fn):
 
         # To test handling of SubnetWatcher's loop exiting, make
         # EtcdWatcher.start throw an exception.
-        loop_fn.side_effect = Exception('from test_kill_agent')
+        loop_fn.side_effect = Exception("from test_kill_agent")
 
         # Create the DHCP agent and allow it to start the SubnetWatcher loop.
         agent = CalicoDhcpAgent()
@@ -227,13 +417,15 @@ class TestDhcpAgent(base.BaseTestCase):
         # Create the DHCP agent.
         agent = CalicoDhcpAgent()
 
-        with mock.patch.object(agent, 'call_driver') as call_driver:
+        with mock.patch.object(agent, "call_driver") as call_driver:
             # Notify an endpoint missing some required fields.
-            agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({
-                'mac': 'fe:16:65:12:33:44',
-                'ipNetworks': ['2001:db8:1::1']
-            })),
-                make_endpoint_name('endpoint-1')
+            agent.etcd.on_endpoint_set(
+                EtcdResponse(
+                    value=json.dumps(
+                        {"mac": "fe:16:65:12:33:44", "ipNetworks": ["2001:db8:1::1"]}
+                    )
+                ),
+                make_endpoint_name("endpoint-1"),
             )
 
             # Check DHCP driver was not asked to do anything.
@@ -241,8 +433,7 @@ class TestDhcpAgent(base.BaseTestCase):
 
             # Notify an endpoint with non-dict data.
             agent.etcd.on_endpoint_set(
-                EtcdResponse(value="not even a dict!"),
-                make_endpoint_name('endpoint-1')
+                EtcdResponse(value="not even a dict!"), make_endpoint_name("endpoint-1")
             )
 
             # Check DHCP driver was not asked to do anything.
@@ -250,8 +441,7 @@ class TestDhcpAgent(base.BaseTestCase):
 
             # One more variant.
             agent.etcd.on_endpoint_set(
-                EtcdResponse(value="\"nor this!\""),
-                make_endpoint_name('endpoint-1')
+                EtcdResponse(value='"nor this!"'), make_endpoint_name("endpoint-1")
             )
 
             # Check DHCP driver was not asked to do anything.
@@ -261,16 +451,22 @@ class TestDhcpAgent(base.BaseTestCase):
         # Create the DHCP agent.
         agent = CalicoDhcpAgent()
 
-        with mock.patch.object(agent, 'call_driver') as call_driver:
-            with mock.patch.object(agent.etcd, 'on_endpoint_delete') as ep_del:
+        with mock.patch.object(agent, "call_driver") as call_driver:
+            with mock.patch.object(agent.etcd, "on_endpoint_delete") as ep_del:
                 # Notify an endpoint that is valid but has no ipNetworks.
-                agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({
-                    'spec': {
-                        'interfaceName': 'tapfe166512-33',
-                        'mac': 'fe:16:65:12:33:44',
-                        'ipNetworks': []
-                    }})),
-                    make_endpoint_name('endpoint-1')
+                agent.etcd.on_endpoint_set(
+                    EtcdResponse(
+                        value=json.dumps(
+                            {
+                                "spec": {
+                                    "interfaceName": "tapfe166512-33",
+                                    "mac": "fe:16:65:12:33:44",
+                                    "ipNetworks": [],
+                                }
+                            }
+                        )
+                    ),
+                    make_endpoint_name("endpoint-1"),
                 )
 
                 # Check handled as a deletion.
@@ -283,17 +479,24 @@ class TestDhcpAgent(base.BaseTestCase):
         # Create the DHCP agent.
         agent = CalicoDhcpAgent()
 
-        with mock.patch.object(agent, 'call_driver') as call_driver:
+        with mock.patch.object(agent, "call_driver") as call_driver:
             # Notify an endpoint.
-            agent.etcd.on_endpoint_set(EtcdResponse(value=json.dumps({'spec': {
-                'interfaceName': 'tap1234',
-                'mac': 'fe:16:65:12:33:44',
-                'profiles': ['profile-1'],
-                'ipNetworks': ['10.28.0.2/32', '2001:db8:1::2/128'],
-                'ipv4Gateway': '10.28.0.1',
-                'ipv6Gateway': '2001:db8:1::1'
-            }})),
-                make_endpoint_name('endpoint-1')
+            agent.etcd.on_endpoint_set(
+                EtcdResponse(
+                    value=json.dumps(
+                        {
+                            "spec": {
+                                "interfaceName": "tap1234",
+                                "mac": "fe:16:65:12:33:44",
+                                "profiles": ["profile-1"],
+                                "ipNetworks": ["10.28.0.2/32", "2001:db8:1::2/128"],
+                                "ipv4Gateway": "10.28.0.1",
+                                "ipv6Gateway": "2001:db8:1::1",
+                            }
+                        }
+                    )
+                ),
+                make_endpoint_name("endpoint-1"),
             )
             call_driver.assert_not_called()
 
@@ -301,151 +504,224 @@ class TestDhcpAgent(base.BaseTestCase):
         # Create the DHCP agent.
         agent = CalicoDhcpAgent()
 
-        agent.etcd.subnet_watcher.on_subnet_set(EtcdResponse(value=json.dumps({
-            'gateway_ip': '10.28.0.1'
-        })),
-            'v4subnet-1'
+        agent.etcd.subnet_watcher.on_subnet_set(
+            EtcdResponse(value=json.dumps({"gateway_ip": "10.28.0.1"})), "v4subnet-1"
         )
 
-        agent.etcd.subnet_watcher.on_subnet_set(EtcdResponse(value=json.dumps({
-            'gateway_ip': '2001:db8:1::1'
-        })),
-            'v6subnet-1'
+        agent.etcd.subnet_watcher.on_subnet_set(
+            EtcdResponse(value=json.dumps({"gateway_ip": "2001:db8:1::1"})),
+            "v6subnet-1",
         )
 
         self.assertFalse(agent.etcd.subnet_watcher.subnets_by_id)
 
     def test_etcd_watchers_init_with_conf_values(self):
         agent = CalicoDhcpAgent()
-        self.assertEqual(agent.etcd.prefix,
-                         "/calico/resources/v3/projectcalico.org/" +
-                         "workloadendpoints/openstack/" +
-                         self.hostname.replace('-', '--') +
-                         "-openstack-")
-        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix,
-                         datamodel_v1.SUBNET_DIR)
-        self.assertEqual(agent.etcd.subnet_watcher.prefix,
-                         datamodel_v2.subnet_dir())
+        self.assertEqual(
+            agent.etcd.prefix,
+            "/calico/resources/v3/projectcalico.org/"
+            + "workloadendpoints/openstack/"
+            + self.hostname.replace("-", "--")
+            + "-openstack-",
+        )
+        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix, datamodel_v1.SUBNET_DIR)
+        self.assertEqual(agent.etcd.subnet_watcher.prefix, datamodel_v2.subnet_dir())
 
     def test_host_config(self):
         cfg.CONF.host = "my-special-hostname"
         agent = CalicoDhcpAgent()
-        self.assertEqual(agent.etcd.prefix,
-                         "/calico/resources/v3/projectcalico.org/" +
-                         "workloadendpoints/openstack/" +
-                         "my--special--hostname" +
-                         "-openstack-")
-        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix,
-                         datamodel_v1.SUBNET_DIR)
-        self.assertEqual(agent.etcd.subnet_watcher.prefix,
-                         datamodel_v2.subnet_dir())
+        self.assertEqual(
+            agent.etcd.prefix,
+            "/calico/resources/v3/projectcalico.org/"
+            + "workloadendpoints/openstack/"
+            + "my--special--hostname"
+            + "-openstack-",
+        )
+        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix, datamodel_v1.SUBNET_DIR)
+        self.assertEqual(agent.etcd.subnet_watcher.prefix, datamodel_v2.subnet_dir())
 
     def test_region_config(self):
-        cfg.CONF.set_override('openstack_region',
-                              'asia-central',
-                              group='calico')
+        cfg.CONF.set_override("openstack_region", "asia-central", group="calico")
         calico_config._reset_globals()
         agent = CalicoDhcpAgent()
-        self.assertEqual(agent.etcd.prefix,
-                         "/calico/resources/v3/projectcalico.org/" +
-                         "workloadendpoints/openstack-region-asia-central/" +
-                         self.hostname.replace('-', '--') +
-                         "-openstack-")
-        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix,
-                         datamodel_v1.SUBNET_DIR)
-        self.assertEqual(agent.etcd.subnet_watcher.prefix,
-                         datamodel_v2.subnet_dir("region-asia-central"))
+        self.assertEqual(
+            agent.etcd.prefix,
+            "/calico/resources/v3/projectcalico.org/"
+            + "workloadendpoints/openstack-region-asia-central/"
+            + self.hostname.replace("-", "--")
+            + "-openstack-",
+        )
+        self.assertEqual(agent.etcd.v1_subnet_watcher.prefix, datamodel_v1.SUBNET_DIR)
+        self.assertEqual(
+            agent.etcd.subnet_watcher.prefix,
+            datamodel_v2.subnet_dir("region-asia-central"),
+        )
         calico_config._reset_globals()
-
-
-commonutils = 'neutron.agent.linux.dhcp.commonutils'
-try:
-    from neutron.agent.linux.dhcp import commonutils as xxx  # noqa
-except Exception:
-    # In Mitaka the import name changed to 'common_utils'.
-    commonutils = 'neutron.agent.linux.dhcp.common_utils'
 
 
 class TestDnsmasqRouted(base.BaseTestCase):
     def setUp(self):
         super(TestDnsmasqRouted, self).setUp()
         register_options(cfg.CONF)
-        cfg.CONF.set_override('dhcp_confs', '/run')
+        cfg.CONF.set_override("dhcp_confs", "/run")
         cfg.CONF.set_override(
-            'interface_driver',
-            'networking_calico.agent.linux.interface.RoutedInterfaceDriver'
+            "interface_driver",
+            "networking_calico.agent.linux.interface.RoutedInterfaceDriver",
         )
         self.mock_makedirs_p = mock.patch("os.makedirs")
         self.mock_makedirs = self.mock_makedirs_p.start()
 
-    @mock.patch('neutron.agent.linux.dhcp.DeviceManager')
-    @mock.patch(commonutils)
+    @mock.patch("neutron.agent.linux.dhcp.DeviceManager")
+    @mock.patch("neutron.agent.linux.dhcp.common_utils")
     def test_build_cmdline(self, commonutils, device_mgr_cls):
         v4subnet = mock.Mock()
-        v4subnet.id = 'v4subnet-1'
+        v4subnet.id = "v4subnet-1"
         v4subnet.enable_dhcp = True
         v4subnet.ip_version = 4
-        v4subnet.cidr = '10.28.0.0/24'
+        v4subnet.cidr = "10.28.0.0/24"
         v6subnet = mock.Mock()
-        v6subnet.id = 'v6subnet-1'
+        v6subnet.id = "v6subnet-1"
         v6subnet.enable_dhcp = True
         v6subnet.ip_version = 6
-        v6subnet.cidr = '2001:db8:1::/80'
+        v6subnet.cidr = "2001:db8:1::/80"
         v6subnet.ipv6_ra_mode = DHCPV6_STATEFUL
         v6subnet.ipv6_address_mode = DHCPV6_STATEFUL
         network = mock.Mock()
-        network.id = 'calico'
+        network.id = "calico"
         network.subnets = [v4subnet, v6subnet]
         network.mtu = 0
         network.ports = [
-            dhcp.DictModel({'device_id': 'tap1'}),
-            dhcp.DictModel({'device_id': 'tap2'}),
-            dhcp.DictModel({'device_id': 'tap3'}),
+            dhcp.DictModel({"device_id": "tap1"}),
+            dhcp.DictModel({"device_id": "tap2"}),
+            dhcp.DictModel({"device_id": "tap3"}),
         ]
         network.non_local_subnets = []
         network.get.side_effect = lambda key, dflt=None: dflt
         device_mgr_cls.return_value.driver.bridged = False
-        dhcp_driver = DnsmasqRouted(cfg.CONF,
-                                    network,
-                                    None,
-                                    plugin=FakePlugin())
-        with mock.patch.object(dhcp_driver, '_get_value_from_conf_file') as gv:
-            gv.return_value = 'ns-dhcp'
-            cmdline = dhcp_driver._build_cmdline_callback('/run/pid_file')
+        dhcp_driver = DnsmasqRouted(cfg.CONF, network, None, plugin=FakePlugin())
+        with mock.patch.object(dhcp_driver, "_get_value_from_conf_file") as gv:
+            gv.return_value = "ns-dhcp"
+            cmdline = dhcp_driver._build_cmdline_callback("/run/pid_file")
 
         # Filter out dnsmasq args that we don't care about.
         filtered_args = []
         for arg in cmdline:
-            if '--domain=' in arg:
+            if "--domain=" in arg:
                 continue
             if arg in [
-                    '--no-hosts',
-                    '--no-resolv',
-                    '--pid-file=/run/pid_file',
-                    '--dhcp-hostsfile=/run/calico/host',
-                    '--addn-hosts=/run/calico/addn_hosts',
-                    '--dhcp-optsfile=/run/calico/opts',
-                    '--dhcp-leasefile=/run/calico/leases',
-                    '--dhcp-match=set:ipxe,175',
-                    '--dhcp-lease-max=16777216',
-                    '--conf-file=',
+                "--no-hosts",
+                "--no-resolv",
+                "--pid-file=/run/pid_file",
+                "--dhcp-hostsfile=/run/calico/host",
+                "--addn-hosts=/run/calico/addn_hosts",
+                "--dhcp-optsfile=/run/calico/opts",
+                "--dhcp-leasefile=/run/calico/leases",
+                "--dhcp-match=set:ipxe,175",
+                "--dhcp-lease-max=16777216",
+                "--conf-file=",
             ]:
                 continue
             filtered_args.append(arg)
 
         # Check the remaining filtered args against what we expect.
-        self.assertEqual([
-            'dnsmasq',
-            '--except-interface=lo',
-            '--bind-dynamic',
-            '--interface=ns-dhcp',
-            '--dhcp-range=set:subnet-v4subnet-1,10.28.0.0' +
-            ',static,255.255.255.0,86400s',
-            '--dhcp-range=set:subnet-v6subnet-1,2001:db8:1::' +
-            ',static,off-link,80,86400s',
-            '--enable-ra',
-            '--interface=tap1',
-            '--interface=tap2',
-            '--interface=tap3',
-            '--bridge-interface=ns-dhcp,tap1,tap2,tap3'],
-            filtered_args)
+        self.assertEqual(
+            [
+                "dnsmasq",
+                "--except-interface=lo",
+                "--bind-dynamic",
+                "--interface=ns-dhcp",
+                "--dhcp-range=set:subnet-v4subnet-1,10.28.0.0"
+                + ",static,255.255.255.0,86400s",
+                "--dhcp-range=set:subnet-v6subnet-1,2001:db8:1::"
+                + ",static,off-link,80,86400s",
+                "--enable-ra",
+                "--ra-param=ns-*,mtu:off,0",
+                "--interface=tap1",
+                "--interface=tap2",
+                "--interface=tap3",
+                "--bridge-interface=ns-dhcp,tap1,tap2,tap3",
+            ],
+            filtered_args,
+        )
+
+    @mock.patch("neutron.agent.linux.dhcp.DeviceManager")
+    @mock.patch("neutron.agent.linux.dhcp.common_utils")
+    def test_build_cmdline_slaac(self, commonutils, device_mgr_cls):
+        v4subnet = mock.Mock()
+        v4subnet.id = "v4subnet-1"
+        v4subnet.enable_dhcp = True
+        v4subnet.ip_version = 4
+        v4subnet.cidr = "10.28.0.0/24"
+        v6subnet = mock.Mock()
+        v6subnet.id = "v6subnet-1"
+        v6subnet.enable_dhcp = True
+        v6subnet.ip_version = 6
+        v6subnet.cidr = "2001:db8:1::/80"
+        v6subnet.ipv6_ra_mode = DHCPV6_STATEFUL
+        v6subnet.ipv6_address_mode = DHCPV6_STATEFUL
+        v6subnet_slaac = mock.Mock()
+        v6subnet_slaac.id = "v6subnet-2"
+        v6subnet_slaac.enable_dhcp = True
+        v6subnet_slaac.ip_version = 6
+        v6subnet_slaac.cidr = "2001:e000:1::/64"
+        v6subnet_slaac.ipv6_ra_mode = IPV6_SLAAC
+        v6subnet_slaac.ipv6_address_mode = IPV6_SLAAC
+        network = mock.Mock()
+        network.id = "calico"
+        network.subnets = [v4subnet, v6subnet, v6subnet_slaac]
+        network.mtu = 0
+        network.ports = [
+            dhcp.DictModel({"device_id": "tap1"}),
+            dhcp.DictModel({"device_id": "tap2"}),
+            dhcp.DictModel({"device_id": "tap3"}),
+        ]
+        network.non_local_subnets = []
+        network.get.side_effect = lambda key, dflt=None: dflt
+        device_mgr_cls.return_value.driver.bridged = False
+        dhcp_driver = DnsmasqRouted(cfg.CONF, network, None, plugin=FakePlugin())
+        with mock.patch.object(dhcp_driver, "_get_value_from_conf_file") as gv:
+            gv.return_value = "ns-dhcp"
+            cmdline = dhcp_driver._build_cmdline_callback("/run/pid_file")
+
+        # Filter out dnsmasq args that we don't care about.
+        filtered_args = []
+        for arg in cmdline:
+            if "--domain=" in arg:
+                continue
+            if arg in [
+                "--no-hosts",
+                "--no-resolv",
+                "--pid-file=/run/pid_file",
+                "--dhcp-hostsfile=/run/calico/host",
+                "--addn-hosts=/run/calico/addn_hosts",
+                "--dhcp-optsfile=/run/calico/opts",
+                "--dhcp-leasefile=/run/calico/leases",
+                "--dhcp-match=set:ipxe,175",
+                "--dhcp-lease-max=16777216",
+                "--conf-file=",
+            ]:
+                continue
+            filtered_args.append(arg)
+
+        # Check the remaining filtered args against what we expect.
+        self.assertEqual(
+            [
+                "dnsmasq",
+                "--except-interface=lo",
+                "--bind-dynamic",
+                "--interface=ns-dhcp",
+                "--dhcp-range=set:subnet-v4subnet-1,10.28.0.0"
+                + ",static,255.255.255.0,86400s",
+                "--dhcp-range=set:subnet-v6subnet-2,2001:e000:1::"
+                + ",slaac,ra-only,64,86400s",
+                "--dhcp-range=set:subnet-v6subnet-1,2001:db8:1::"
+                + ",static,off-link,80,86400s",
+                "--enable-ra",
+                "--ra-param=ns-*,mtu:off,0",
+                "--interface=tap1",
+                "--interface=tap2",
+                "--interface=tap3",
+                "--bridge-interface=ns-dhcp,tap1,tap2,tap3",
+            ],
+            filtered_args,
+        )

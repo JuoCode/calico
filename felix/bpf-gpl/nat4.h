@@ -5,15 +5,19 @@
 #ifndef __CALI_NAT4_H__
 #define __CALI_NAT4_H__
 
-#include <stddef.h>
-
 #include <linux/if_ether.h>
+#include <linux/in.h>
+#include <linux/ip.h>
 #include <linux/udp.h>
 
-#include "bpf.h"
-#include "skb.h"
-#include "routes.h"
+#include "cali_bpf.h"
+#include "counters.h"
+#include "globals.h"
+#include "log.h"
 #include "nat_types.h"
+#include "reasons.h"
+#include "skb.h"
+#include "types.h"
 
 /* Number of bytes we add to a packet when we do encap. */
 #define VXLAN_ENCAP_SIZE	(sizeof(struct ethhdr) + sizeof(struct iphdr) + \
@@ -27,10 +31,15 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx,  __be32 *ip_src,
 	__u32 new_hdrsz = sizeof(struct ethhdr) + sizeof(struct iphdr) +
 			sizeof(struct udphdr) + sizeof(struct vxlanhdr);
 
-	ret = bpf_skb_adjust_room(ctx->skb, new_hdrsz, BPF_ADJ_ROOM_MAC,
-						  BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
-						  BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
-						  BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr)));
+	__u64 flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
+			BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
+			BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr));
+
+	if (ctx->state->ip_proto == IPPROTO_UDP) {
+		flags |= BPF_F_ADJ_ROOM_FIXED_GSO;
+	}
+
+	ret = bpf_skb_adjust_room(ctx->skb, new_hdrsz, BPF_ADJ_ROOM_MAC, flags);
 
 	if (ret) {
 		goto out;
@@ -40,7 +49,7 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx,  __be32 *ip_src,
 
 	if (skb_refresh_validate_ptrs(ctx, new_hdrsz)) {
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short VXLAN encap\n");
+		CALI_DEBUG("Too short VXLAN encap");
 		goto out;
 	}
 
@@ -75,7 +84,7 @@ static CALI_BPF_INLINE int vxlan_encap(struct cali_tc_ctx *ctx,  __be32 *ip_src,
 	/* keep eth_inner MACs zeroed, it is useless after decap */
 	eth_inner->h_proto = eth_hdr(ctx)->h_proto;
 
-	CALI_DEBUG("vxlan encap %x : %x\n", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
+	CALI_DEBUG("vxlan encap %x : %x", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
 
 	/* change the checksums last to avoid pointer access revalidation */
 
@@ -95,7 +104,7 @@ static CALI_BPF_INLINE int vxlan_decap(struct __sk_buff *skb)
 	extra_hdrsz = sizeof(struct ethhdr) + sizeof(struct iphdr) +
 		sizeof(struct udphdr) + sizeof(struct vxlanhdr);
 
-	ret = bpf_skb_adjust_room(skb, -extra_hdrsz, BPF_ADJ_ROOM_MAC | BPF_F_ADJ_ROOM_FIXED_GSO, 0);
+	ret = bpf_skb_adjust_room(skb, -extra_hdrsz, BPF_ADJ_ROOM_MAC, BPF_F_ADJ_ROOM_FIXED_GSO);
 
 	return ret;
 }

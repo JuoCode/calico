@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,16 +20,23 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
-	"github.com/projectcalico/calico/felix/iptables"
-	. "github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
+	"github.com/projectcalico/calico/felix/generictables"
+	"github.com/projectcalico/calico/felix/nftables/nftrender"
 	"github.com/projectcalico/calico/felix/proto"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
-func (r *DefaultRuleRenderer) StaticFilterTableChains(ipVersion uint8) (chains []*Chain) {
-	chains = append(chains, r.StaticFilterForwardChains()...)
+func (r *DefaultRuleRenderer) StaticFilterTableChains(ipVersion uint8) (chains []*generictables.Chain) {
+	chains = append(chains, r.StaticFilterForwardChains(ipVersion)...)
 	chains = append(chains, r.StaticFilterInputChains(ipVersion)...)
 	chains = append(chains, r.StaticFilterOutputChains(ipVersion)...)
+	if r.LogConnectionTransitions {
+		chains = append(chains, r.connStateLogChain(ipVersion))
+	}
+	if r.nft && r.NFTablesFlowTableOffload {
+		chains = append(chains, r.FlowOffloadChain(ipVersion))
+	}
 	return
 }
 
@@ -40,8 +47,8 @@ const (
 	ProtoICMPv6 = 58
 )
 
-func (r *DefaultRuleRenderer) StaticFilterInputChains(ipVersion uint8) []*Chain {
-	result := []*Chain{}
+func (r *DefaultRuleRenderer) StaticFilterInputChains(ipVersion uint8) []*generictables.Chain {
+	result := []*generictables.Chain{}
 	result = append(result,
 		r.filterInputChain(ipVersion),
 		r.filterWorkloadToHostChain(ipVersion),
@@ -53,10 +60,10 @@ func (r *DefaultRuleRenderer) StaticFilterInputChains(ipVersion uint8) []*Chain 
 	return result
 }
 
-func (r *DefaultRuleRenderer) acceptAlreadyAccepted() []Rule {
-	return []Rule{
+func (r *DefaultRuleRenderer) acceptAlreadyAccepted() []generictables.Rule {
+	return []generictables.Rule{
 		{
-			Match:  Match().MarkSingleBitSet(r.IptablesMarkAccept),
+			Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action: r.filterAllowAction,
 		},
 	}
@@ -64,8 +71,8 @@ func (r *DefaultRuleRenderer) acceptAlreadyAccepted() []Rule {
 
 // Forward check chain is to check if a packet belongs to a forwarded traffic or not.
 // With kube-proxy running in ipvs mode, both local or forwarded traffic goes through INPUT filter chain.
-func (r *DefaultRuleRenderer) StaticFilterInputForwardCheckChain(ipVersion uint8) *Chain {
-	var fwRules []Rule
+func (r *DefaultRuleRenderer) StaticFilterInputForwardCheckChain(ipVersion uint8) *generictables.Chain {
+	var fwRules []generictables.Rule
 	var portRanges []*proto.PortRange
 
 	// Assembly port ranges for kubernetes node ports.
@@ -90,27 +97,27 @@ func (r *DefaultRuleRenderer) StaticFilterInputForwardCheckChain(ipVersion uint8
 	fwRules = append(fwRules,
 		// If packet belongs to an existing conntrack connection, it does not belong to a forwarded traffic even destination ip is a
 		// service ip. This could happen when pod send back response to a local host process accessing a service ip.
-		Rule{
-			Match:  Match().ConntrackState("RELATED,ESTABLISHED"),
-			Action: ReturnAction{},
+		generictables.Rule{
+			Match:  r.NewMatch().ConntrackState("RELATED,ESTABLISHED"),
+			Action: r.Return(),
 		},
 	)
 
 	// If packet is accessing local host within kubernetes NodePort range, it belongs to a forwarded traffic.
-	for _, portSplit := range SplitPortList(portRanges) {
+	for _, portSplit := range SplitPortList(portRanges, r.matchCapabilities.PortsPerRule) {
 		fwRules = append(fwRules,
-			Rule{
-				Match: Match().Protocol("tcp").
+			generictables.Rule{
+				Match: r.NewMatch().Protocol("tcp").
 					DestPortRanges(portSplit).
 					DestIPSet(hostIPSet),
-				Action:  GotoAction{Target: ChainDispatchSetEndPointMark},
+				Action:  r.GoTo(ChainDispatchSetEndPointMark),
 				Comment: []string{"To kubernetes NodePort service"},
 			},
-			Rule{
-				Match: Match().Protocol("udp").
+			generictables.Rule{
+				Match: r.NewMatch().Protocol("udp").
 					DestPortRanges(portSplit).
 					DestIPSet(hostIPSet),
-				Action:  GotoAction{Target: ChainDispatchSetEndPointMark},
+				Action:  r.GoTo(ChainDispatchSetEndPointMark),
 				Comment: []string{"To kubernetes NodePort service"},
 			},
 		)
@@ -118,14 +125,14 @@ func (r *DefaultRuleRenderer) StaticFilterInputForwardCheckChain(ipVersion uint8
 
 	fwRules = append(fwRules,
 		// If packet is accessing non local host ip, it belongs to a forwarded traffic.
-		Rule{
-			Match:   Match().NotDestIPSet(hostIPSet),
-			Action:  JumpAction{Target: ChainDispatchSetEndPointMark},
+		generictables.Rule{
+			Match:   r.NewMatch().NotDestIPSet(hostIPSet),
+			Action:  r.Jump(ChainDispatchSetEndPointMark),
 			Comment: []string{"To kubernetes service"},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainForwardCheck,
 		Rules: fwRules,
 	}
@@ -136,8 +143,8 @@ func (r *DefaultRuleRenderer) StaticFilterInputForwardCheckChain(ipVersion uint8
 // Class 2. forwarded packet originated from a non calico endpoint              --> INPUT filter --> OUTPUT filter
 // Class 3. local process originated packet --> OUTPUT filter
 // This function handles traffic in Class 1 and Class 2.
-func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chain {
-	var fwRules []Rule
+func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *generictables.Chain {
+	var fwRules []generictables.Rule
 
 	fwRules = append(fwRules,
 		// Only packets that we know are really being forwarded reach this chain. However, since
@@ -147,9 +154,9 @@ func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chai
 		// mark them with mark pattern IptablesMarkNonCaliEndpoint and exclude them here.  This
 		// prevents the default drop at the end of the dispatch chain from dropping non-Calico
 		// traffic.
-		Rule{
-			Match:  Match().NotMarkMatchesWithMask(r.IptablesMarkNonCaliEndpoint, r.IptablesMarkEndpoint),
-			Action: JumpAction{Target: ChainDispatchFromEndPointMark},
+		generictables.Rule{
+			Match:  r.NewMatch().NotMarkMatchesWithMask(r.MarkNonCaliEndpoint, r.MarkEndpoint),
+			Action: r.Jump(ChainDispatchFromEndPointMark),
 		},
 	)
 
@@ -157,11 +164,11 @@ func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chai
 	// interface-name-based dispatch chains.
 	for _, prefix := range r.WorkloadIfacePrefixes {
 		log.WithField("ifacePrefix", prefix).Debug("Adding workload match rules")
-		ifaceMatch := prefix + "+"
+		ifaceMatch := prefix + r.wildcard
 		fwRules = append(fwRules,
-			Rule{
-				Match:  Match().OutInterface(ifaceMatch),
-				Action: JumpAction{Target: ChainToWorkloadDispatch},
+			generictables.Rule{
+				Match:  r.NewMatch().OutInterface(ifaceMatch),
+				Action: r.Jump(ChainToWorkloadDispatch),
 			},
 		)
 	}
@@ -170,16 +177,16 @@ func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chai
 		// The packet may be going to a host endpoint, send it to the host endpoint
 		// apply-on-forward dispatch chain. That chain returns any packets that are not going to a
 		// known host endpoint for further processing.
-		Rule{
-			Action: JumpAction{Target: ChainDispatchToHostEndpointForward},
+		generictables.Rule{
+			Action: r.Jump(ChainDispatchToHostEndpointForward),
 		},
 
 		// Before we ACCEPT the packet, clear the per-interface mark bit.  This is required because
 		// the packet may get encapsulated and pass through iptables again.  Since the new encapped
 		// packet would inherit the mark bits, it would be (incorrectly) treated as a forwarded
 		// packet.
-		Rule{
-			Action: ClearMarkAction{Mark: r.IptablesMarkEndpoint},
+		generictables.Rule{
+			Action: r.ClearMark(r.MarkEndpoint),
 		},
 
 		// If a packet reaches here, one of the following must be true:
@@ -193,31 +200,31 @@ func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chai
 		// the packet so it's right for us to ACCEPT it here (unless configured otherwise).  In
 		// the other case, we don't own the packet so we always return it to the OUTPUT chain
 		// for further processing.
-		Rule{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action:  r.filterAllowAction,
 			Comment: []string{"Policy explicitly accepted packet."},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainForwardEndpointMark,
 		Rules: fwRules,
 	}
 }
 
-func FilterInputChainAllowWG(ipVersion uint8, r Config, allowAction iptables.Action) []Rule {
-	var inputRules []Rule
+func (r *DefaultRuleRenderer) FilterInputChainAllowWG(ipVersion uint8, c Config, allowAction generictables.Action) []generictables.Rule {
+	var inputRules []generictables.Rule
 
-	if ipVersion == 4 && r.WireguardEnabled {
+	if ipVersion == 4 && c.WireguardEnabled {
 		// When Wireguard is enabled, auto-allow Wireguard traffic from other nodes.  Without this,
 		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
 		// connectivity problems.
 		inputRules = append(inputRules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
-					DestPorts(uint16(r.WireguardListeningPort)).
-					DestAddrType(AddrTypeLocal),
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(c.WireguardListeningPort)).
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  allowAction,
 				Comment: []string{"Allow incoming IPv4 Wireguard packets"},
 			},
@@ -226,15 +233,15 @@ func FilterInputChainAllowWG(ipVersion uint8, r Config, allowAction iptables.Act
 		)
 	}
 
-	if ipVersion == 6 && r.WireguardEnabledV6 {
+	if ipVersion == 6 && c.WireguardEnabledV6 {
 		// When Wireguard is enabled, auto-allow Wireguard traffic from other nodes.  Without this,
 		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
 		// connectivity problems.
 		inputRules = append(inputRules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
-					DestPorts(uint16(r.WireguardListeningPortV6)).
-					DestAddrType(AddrTypeLocal),
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(c.WireguardListeningPortV6)).
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  allowAction,
 				Comment: []string{"Allow incoming IPv6 Wireguard packets"},
 			},
@@ -246,23 +253,23 @@ func FilterInputChainAllowWG(ipVersion uint8, r Config, allowAction iptables.Act
 	return inputRules
 }
 
-func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
-	var inputRules []Rule
+func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *generictables.Chain {
+	var inputRules []generictables.Rule
 
 	if ipVersion == 4 && r.IPIPEnabled {
 		// IPIP is enabled, filter incoming IPIP packets to ensure they come from a
 		// recognised host and are going to a local address on the host.  We use the protocol
 		// number rather than its name because the name is not guaranteed to be known by the kernel.
 		inputRules = append(inputRules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoIPIP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoIPIP).
 					SourceIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllHostNets)).
-					DestAddrType(AddrTypeLocal),
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPIP packets from Calico hosts"},
 			},
-			Rule{
-				Match:   Match().ProtocolNum(ProtoIPIP),
+			generictables.Rule{
+				Match:   r.NewMatch().ProtocolNum(ProtoIPIP),
 				Action:  r.IptablesFilterDenyAction(),
 				Comment: []string{fmt.Sprintf("%s IPIP packets from non-Calico hosts", r.IptablesFilterDenyAction())},
 			},
@@ -273,19 +280,19 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 		// IPv4 VXLAN is enabled, filter incoming VXLAN packets that match our VXLAN port to ensure they
 		// come from a recognised host and are going to a local address on the host.
 		inputRules = append(inputRules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
 					SourceIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllVXLANSourceNets)).
-					DestAddrType(AddrTypeLocal),
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPv4 VXLAN packets from allowed hosts"},
 			},
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
-					DestAddrType(AddrTypeLocal),
-				Action:  DropAction{},
+					DestAddrType(generictables.AddrTypeLocal),
+				Action:  r.Drop(),
 				Comment: []string{"Drop IPv4 VXLAN packets from non-allowed hosts"},
 			},
 		)
@@ -295,39 +302,39 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 		// IPv6 VXLAN is enabled, filter incoming VXLAN packets that match our VXLAN port to ensure they
 		// come from a recognised host and are going to a local address on the host.
 		inputRules = append(inputRules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
 					SourceIPSet(r.IPSetConfigV6.NameForMainIPSet(IPSetIDAllVXLANSourceNets)).
-					DestAddrType(AddrTypeLocal),
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPv6 VXLAN packets from allowed hosts"},
 			},
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
-					DestAddrType(AddrTypeLocal),
+					DestAddrType(generictables.AddrTypeLocal),
 				Action:  r.IptablesFilterDenyAction(),
 				Comment: []string{fmt.Sprintf("%s IPv6 VXLAN packets from non-allowed hosts", r.IptablesFilterDenyAction())},
 			},
 		)
 	}
 
-	inputRules = append(inputRules, FilterInputChainAllowWG(ipVersion, r.Config, r.filterAllowAction)...)
+	inputRules = append(inputRules, r.FilterInputChainAllowWG(ipVersion, r.Config, r.filterAllowAction)...)
 
 	if r.KubeIPVSSupportEnabled {
 		// Check if packet belongs to forwarded traffic. (e.g. part of an ipvs connection).
 		// If it is, set endpoint mark and skip "to local host" rules below.
 		inputRules = append(inputRules,
-			Rule{
-				Action: ClearMarkAction{Mark: r.IptablesMarkEndpoint},
+			generictables.Rule{
+				Action: r.ClearMark(r.MarkEndpoint),
 			},
-			Rule{
-				Action: JumpAction{Target: ChainForwardCheck},
+			generictables.Rule{
+				Action: r.Jump(ChainForwardCheck),
 			},
-			Rule{
-				Match:  Match().MarkNotClear(r.IptablesMarkEndpoint),
-				Action: ReturnAction{},
+			generictables.Rule{
+				Match:  r.NewMatch().MarkNotClear(r.MarkEndpoint),
+				Action: r.Return(),
 			},
 		)
 	}
@@ -335,10 +342,10 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 	// Apply our policy to packets coming from workload endpoints.
 	for _, prefix := range r.WorkloadIfacePrefixes {
 		log.WithField("ifacePrefix", prefix).Debug("Adding workload match rules")
-		ifaceMatch := prefix + "+"
-		inputRules = append(inputRules, Rule{
-			Match:  Match().InInterface(ifaceMatch),
-			Action: GotoAction{Target: ChainWorkloadToHost},
+		ifaceMatch := prefix + r.wildcard
+		inputRules = append(inputRules, generictables.Rule{
+			Match:  r.NewMatch().InInterface(ifaceMatch),
+			Action: r.GoTo(ChainWorkloadToHost),
 		})
 	}
 
@@ -349,27 +356,27 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 
 	// Apply host endpoint policy.
 	inputRules = append(inputRules,
-		Rule{
-			Action: ClearMarkAction{Mark: r.allCalicoMarkBits()},
+		generictables.Rule{
+			Action: r.ClearMark(r.allCalicoMarkBits()),
 		},
-		Rule{
-			Action: JumpAction{Target: ChainDispatchFromHostEndpoint},
+		generictables.Rule{
+			Action: r.Jump(ChainDispatchFromHostEndpoint),
 		},
-		Rule{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action:  r.filterAllowAction,
 			Comment: []string{"Host endpoint policy accepted packet."},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainFilterInput,
 		Rules: inputRules,
 	}
 }
 
-func ICMPv6Filter(action iptables.Action) []Rule {
-	var rules []Rule
+func (r *DefaultRuleRenderer) ICMPv6Filter(action generictables.Action) []generictables.Rule {
+	var rules []generictables.Rule
 
 	// For IPv6, we need to allow certain ICMP traffic from workloads in order to act
 	// as a router.  Note: we do this before the policy chains, so we're bypassing the egress
@@ -386,8 +393,8 @@ func ICMPv6Filter(action iptables.Action) []Rule {
 	// - 135: neighbor solicitation.
 	// - 136: neighbor advertisement.
 	for _, icmpType := range []uint8{130, 131, 132, 133, 135, 136} {
-		rules = append(rules, Rule{
-			Match: Match().
+		rules = append(rules, generictables.Rule{
+			Match: r.NewMatch().
 				ProtocolNum(ProtoICMPv6).
 				ICMPV6Type(icmpType),
 			Action: action,
@@ -397,11 +404,11 @@ func ICMPv6Filter(action iptables.Action) []Rule {
 	return rules
 }
 
-func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain {
-	var rules []Rule
+func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *generictables.Chain {
+	var rules []generictables.Rule
 
 	if ipVersion == 6 {
-		rules = ICMPv6Filter(r.filterAllowAction)
+		rules = r.ICMPv6Filter(r.filterAllowAction)
 	}
 
 	if r.OpenStackSpecialCasesEnabled {
@@ -413,8 +420,8 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 			// do this instead.
 			log.WithField("ip", r.OpenStackMetadataIP).Info(
 				"OpenStack metadata IP specified, installing special-case rule.")
-			rules = append(rules, Rule{
-				Match: Match().
+			rules = append(rules, generictables.Rule{
+				Match: r.NewMatch().
 					Protocol("tcp").
 					DestNet(r.OpenStackMetadataIP.String()).
 					DestPorts(r.OpenStackMetadataPort),
@@ -433,15 +440,15 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 		}
 		dnsDestPort := uint16(53)
 		rules = append(rules,
-			Rule{
-				Match: Match().
+			generictables.Rule{
+				Match: r.NewMatch().
 					Protocol("udp").
 					SourcePorts(dhcpSrcPort).
 					DestPorts(dhcpDestPort),
 				Action: r.filterAllowAction,
 			},
-			Rule{
-				Match: Match().
+			generictables.Rule{
+				Match: r.NewMatch().
 					Protocol("udp").
 					DestPorts(dnsDestPort),
 				Action: r.filterAllowAction,
@@ -450,8 +457,8 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 	}
 
 	// Now send traffic to the policy chains to apply the egress policy.
-	rules = append(rules, Rule{
-		Action: JumpAction{Target: ChainFromWorkloadDispatch},
+	rules = append(rules, generictables.Rule{
+		Action: r.Jump(ChainFromWorkloadDispatch),
 	})
 
 	// If the dispatch chain accepts the packet, it returns to us here.  Apply the configured
@@ -459,27 +466,27 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 	// it here.  We can't optimize that away because there may be other rules (such as log
 	// rules in the policy).
 	for _, action := range r.inputAcceptActions {
-		rules = append(rules, Rule{
+		rules = append(rules, generictables.Rule{
 			Action:  action,
 			Comment: []string{"Configured DefaultEndpointToHostAction"},
 		})
 	}
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainWorkloadToHost,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{}
 
-	for _, protoPort := range r.Config.FailsafeInboundHostPorts {
-		rule := Rule{
-			Match: Match().
+	for _, protoPort := range r.FailsafeInboundHostPorts {
+		rule := generictables.Rule{
+			Match: r.NewMatch().
 				Protocol(protoPort.Protocol).
 				DestPorts(protoPort.Port),
-			Action: AcceptAction{},
+			Action: r.Allow(),
 		}
 
 		if protoPort.Net != "" {
@@ -489,7 +496,7 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 				continue
 			}
 			if int(ipVersion) == ip.Version() {
-				rule.Match = Match().
+				rule.Match = r.NewMatch().
 					Protocol(protoPort.Protocol).
 					DestPorts(protoPort.Port).
 					SourceNet(protoPort.Net)
@@ -505,12 +512,12 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 		// Otherwise, it could fall through to some doNotTrack policy and half of the connection
 		// would get untracked.  If we ACCEPT here then the traffic falls through to the filter
 		// table, where it'll only be accepted if there's a conntrack entry.
-		for _, protoPort := range r.Config.FailsafeOutboundHostPorts {
-			rule := Rule{
-				Match: Match().
+		for _, protoPort := range r.FailsafeOutboundHostPorts {
+			rule := generictables.Rule{
+				Match: r.NewMatch().
 					Protocol(protoPort.Protocol).
 					SourcePorts(protoPort.Port),
-				Action: AcceptAction{},
+				Action: r.Allow(),
 			}
 
 			if protoPort.Net != "" {
@@ -520,7 +527,7 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 					continue
 				}
 				if int(ipVersion) == ip.Version() {
-					rule.Match = Match().
+					rule.Match = r.NewMatch().
 						Protocol(protoPort.Protocol).
 						SourcePorts(protoPort.Port).
 						SourceNet(protoPort.Net)
@@ -532,21 +539,21 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 		}
 	}
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainFailsafeIn,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{}
 
-	for _, protoPort := range r.Config.FailsafeOutboundHostPorts {
-		rule := Rule{
-			Match: Match().
+	for _, protoPort := range r.FailsafeOutboundHostPorts {
+		rule := generictables.Rule{
+			Match: r.NewMatch().
 				Protocol(protoPort.Protocol).
 				DestPorts(protoPort.Port),
-			Action: AcceptAction{},
+			Action: r.Allow(),
 		}
 
 		if protoPort.Net != "" {
@@ -556,7 +563,7 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 				continue
 			}
 			if int(ipVersion) == ip.Version() {
-				rule.Match = Match().
+				rule.Match = r.NewMatch().
 					Protocol(protoPort.Protocol).
 					DestPorts(protoPort.Port).
 					DestNet(protoPort.Net)
@@ -572,12 +579,12 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 		// Otherwise, it could fall through to some doNotTrack policy and half of the connection
 		// would get untracked.  If we ACCEPT here then the traffic falls through to the filter
 		// table, where it'll only be accepted if there's a conntrack entry.
-		for _, protoPort := range r.Config.FailsafeInboundHostPorts {
-			rule := Rule{
-				Match: Match().
+		for _, protoPort := range r.FailsafeInboundHostPorts {
+			rule := generictables.Rule{
+				Match: r.NewMatch().
 					Protocol(protoPort.Protocol).
 					SourcePorts(protoPort.Port),
-				Action: AcceptAction{},
+				Action: r.Allow(),
 			}
 
 			if protoPort.Net != "" {
@@ -587,7 +594,7 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 					continue
 				}
 				if int(ipVersion) == ip.Version() {
-					rule.Match = Match().
+					rule.Match = r.NewMatch().
 						Protocol(protoPort.Protocol).
 						SourcePorts(protoPort.Port).
 						DestNet(protoPort.Net)
@@ -599,14 +606,24 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 		}
 	}
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainFailsafeOut,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) StaticFilterForwardChains() []*Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) StaticFilterForwardChains(ipVersion uint8) []*generictables.Chain {
+	rules := []generictables.Rule{}
+
+	if r.nft && r.NFTablesFlowTableOffload {
+		// Offload established flows here, ahead of the dispatch jumps below: the per-workload
+		// dispatch chains terminally accept established traffic, and the kernel only allows flow
+		// offload in chains reached from the forward hook.
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch().ConntrackState("RELATED,ESTABLISHED"),
+			Action: r.Jump(ChainFlowOffload),
+		})
+	}
 
 	// Rules for filter forward chains dispatches the packet to our dispatch chains if it is going
 	// to/from an interface that we're responsible for.  Note: the dispatch chains represent "allow"
@@ -619,76 +636,97 @@ func (r *DefaultRuleRenderer) StaticFilterForwardChains() []*Chain {
 
 	// Jump to from-host-endpoint dispatch chains.
 	rules = append(rules,
-		Rule{
+		generictables.Rule{
 			// we're clearing all our mark bits to minimise non-determinism caused by rules in other chains.
 			// We exclude the accept bit because we use that to communicate from the raw/pre-dnat chains.
-			Action: ClearMarkAction{Mark: r.allCalicoMarkBits() &^ r.IptablesMarkAccept},
+			Action: r.ClearMark(r.allCalicoMarkBits() &^ r.MarkAccept),
 		},
-		Rule{
+		generictables.Rule{
 			// Apply forward policy for the incoming Host endpoint if accept bit is clear which means the packet
 			// was not accepted in a previous raw or pre-DNAT chain.
-			Match:  Match().MarkClear(r.IptablesMarkAccept),
-			Action: JumpAction{Target: ChainDispatchFromHostEndPointForward},
+			Match:  r.NewMatch().MarkClear(r.MarkAccept),
+			Action: r.Jump(ChainDispatchFromHostEndPointForward),
 		},
 	)
 
 	// Jump to workload dispatch chains.
 	for _, prefix := range r.WorkloadIfacePrefixes {
 		log.WithField("ifacePrefix", prefix).Debug("Adding workload match rules")
-		ifaceMatch := prefix + "+"
+		ifaceMatch := prefix + r.wildcard
 		rules = append(rules,
-			Rule{
-				Match:  Match().InInterface(ifaceMatch),
-				Action: JumpAction{Target: ChainFromWorkloadDispatch},
+			generictables.Rule{
+				Match:  r.NewMatch().InInterface(ifaceMatch),
+				Action: r.Jump(ChainFromWorkloadDispatch),
 			},
-			Rule{
-				Match:  Match().OutInterface(ifaceMatch),
-				Action: JumpAction{Target: ChainToWorkloadDispatch},
+			generictables.Rule{
+				Match:  r.NewMatch().OutInterface(ifaceMatch),
+				Action: r.Jump(ChainToWorkloadDispatch),
 			},
 		)
 	}
 
 	// Jump to to-host-endpoint dispatch chains.
 	rules = append(rules,
-		Rule{
+		generictables.Rule{
 			// Apply forward policy for the outgoing host endpoint.
-			Action: JumpAction{Target: ChainDispatchToHostEndpointForward},
+			Action: r.Jump(ChainDispatchToHostEndpointForward),
 		},
 	)
 
 	// Jump to chain for blocking service CIDR loops.
 	rules = append(rules,
-		Rule{
-			Action: JumpAction{Target: ChainCIDRBlock},
+		generictables.Rule{
+			Action: r.Jump(ChainCIDRBlock),
 		},
 	)
 
-	return []*Chain{{
+	return []*generictables.Chain{{
 		Name:  ChainFilterForward,
 		Rules: rules,
 	}}
 }
 
+// FlowOffloadChain renders the chain filter FORWARD jumps to under flowtable
+// offload. An offloaded flow skips FORWARD and POSTROUTING for its whole life,
+// so endpoints needing rules there are excluded by IP.
+func (r *DefaultRuleRenderer) FlowOffloadChain(ipVersion uint8) *generictables.Chain {
+	noOffloadSetName := r.ipSetConfig(ipVersion).NameForMainIPSet(IPSetIDNoFlowOffload)
+	return &generictables.Chain{
+		Name: ChainFlowOffload,
+		Rules: []generictables.Rule{{
+			Match: r.NewMatch().
+				NotSourceIPSet(noOffloadSetName).
+				NotDestIPSet(noOffloadSetName),
+			Action:  r.FlowOffload(),
+			Comment: []string{"Offload established Calico flows."},
+		}},
+	}
+}
+
 // StaticFilterForwardAppendRules returns rules which should be statically appended to the end of the filter
 // table's forward chain.
-func (r *DefaultRuleRenderer) StaticFilterForwardAppendRules() []Rule {
-	return []Rule{
-		{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
+func (r *DefaultRuleRenderer) StaticFilterForwardAppendRules() []generictables.Rule {
+	var rules []generictables.Rule
+
+	rules = append(rules,
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action:  r.filterAllowAction,
 			Comment: []string{"Policy explicitly accepted packet."},
 		},
 
 		// Set IptablesMarkAccept bit here, to indicate to our mangle-POSTROUTING chain that this is
 		// forwarded traffic and should not be subject to normal host endpoint policy.
-		{
-			Action: SetMarkAction{Mark: r.IptablesMarkAccept},
+		generictables.Rule{
+			Action: r.SetMark(r.MarkAccept),
 		},
-	}
+	)
+
+	return rules
 }
 
-func (r *DefaultRuleRenderer) StaticFilterOutputChains(ipVersion uint8) []*Chain {
-	result := []*Chain{}
+func (r *DefaultRuleRenderer) StaticFilterOutputChains(ipVersion uint8) []*generictables.Chain {
+	result := []*generictables.Chain{}
 	result = append(result,
 		r.filterOutputChain(ipVersion),
 		r.failsafeOutChain("filter", ipVersion),
@@ -701,8 +739,15 @@ func (r *DefaultRuleRenderer) StaticFilterOutputChains(ipVersion uint8) []*Chain
 	return result
 }
 
-func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
-	var rules []Rule
+func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *generictables.Chain {
+	var rules []generictables.Rule
+
+	if r.LogConnectionTransitions {
+		// Replies to workload-to-host connections leave via this chain and return to the
+		// workload interface below without traversing any per-endpoint chain, so the
+		// connection state log check must happen here.
+		rules = append(rules, r.connStateLogRule())
+	}
 
 	// Accept immediately if we've already accepted this packet in the raw or mangle table.
 	rules = append(rules, r.acceptAlreadyAccepted()...)
@@ -716,9 +761,9 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// We use a goto so that a RETURN from that chain will skip the rest of this chain
 		// and continue execution in the parent chain (OUTPUT).
 		rules = append(rules,
-			Rule{
-				Match:  Match().MarkNotClear(r.IptablesMarkEndpoint),
-				Action: GotoAction{Target: ChainForwardEndpointMark},
+			generictables.Rule{
+				Match:  r.NewMatch().MarkNotClear(r.MarkEndpoint),
+				Action: r.GoTo(ChainForwardEndpointMark),
 			},
 		)
 	}
@@ -732,12 +777,12 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// If the packet is going to a workload endpoint, apply workload ingress policy if traffic
 		// belongs to an IPVS connection and return at the end.
 		log.WithField("ifacePrefix", prefix).Debug("Adding workload match rules")
-		ifaceMatch := prefix + "+"
+		ifaceMatch := prefix + r.wildcard
 		rules = append(rules,
-			Rule{
+			generictables.Rule{
 				// if packet goes to a workload endpoint. set return action properly.
-				Match:  Match().OutInterface(ifaceMatch),
-				Action: ReturnAction{},
+				Match:  r.NewMatch().OutInterface(ifaceMatch),
+				Action: r.Return(),
 			},
 		)
 	}
@@ -750,10 +795,10 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// it's too easy to make a host policy that blocks IPIP traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoIPIP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoIPIP).
 					DestIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllHostNets)).
-					SrcAddrType(AddrTypeLocal, false),
+					SrcAddrType(generictables.AddrTypeLocal, false),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPIP packets to other Calico hosts"},
 			},
@@ -765,10 +810,10 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// it's too easy to make a host policy that blocks VXLAN traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
-					SrcAddrType(AddrTypeLocal, false).
+					SrcAddrType(generictables.AddrTypeLocal, false).
 					DestIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllVXLANSourceNets)),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPv4 VXLAN packets to other allowed hosts"},
@@ -781,10 +826,10 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// it's too easy to make a host policy that blocks VXLAN traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
-					SrcAddrType(AddrTypeLocal, false).
+					SrcAddrType(generictables.AddrTypeLocal, false).
 					DestIPSet(r.IPSetConfigV6.NameForMainIPSet(IPSetIDAllVXLANSourceNets)),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow IPv6 VXLAN packets to other allowed hosts"},
@@ -797,12 +842,12 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.WireguardListeningPort)).
 					// Note that we do not need to limit the destination hosts to Calico nodes because allowed peers are
 					// programmed separately
-					SrcAddrType(AddrTypeLocal, false),
+					SrcAddrType(generictables.AddrTypeLocal, false),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow outgoing IPv4 Wireguard packets"},
 			},
@@ -814,16 +859,24 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
-			Rule{
-				Match: Match().ProtocolNum(ProtoUDP).
+			generictables.Rule{
+				Match: r.NewMatch().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.WireguardListeningPortV6)).
 					// Note that we do not need to limit the destination hosts to Calico nodes because allowed peers are
 					// programmed separately
-					SrcAddrType(AddrTypeLocal, false),
+					SrcAddrType(generictables.AddrTypeLocal, false),
 				Action:  r.filterAllowAction,
 				Comment: []string{"Allow outgoing IPv6 Wireguard packets"},
 			},
 		)
+	}
+
+	// Matching on conntrack status varies by table type.
+	notDNATMatch := r.NewMatch()
+	if m, ok := notDNATMatch.(nftrender.NFTMatchCriteria); ok {
+		notDNATMatch = m.NotConntrackStatus("DNAT")
+	} else {
+		notDNATMatch = notDNATMatch.NotConntrackState("DNAT")
 	}
 
 	// Apply host endpoint policy to traffic that has not been DNAT'd.  In the DNAT case we
@@ -833,54 +886,54 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 	// apply host endpoint in the mangle POSTROUTING chain; see StaticManglePostroutingChain for
 	// that.
 	rules = append(rules,
-		Rule{
-			Action: ClearMarkAction{Mark: r.allCalicoMarkBits()},
+		generictables.Rule{
+			Action: r.ClearMark(r.allCalicoMarkBits()),
 		},
-		Rule{
-			Match:  Match().NotConntrackState("DNAT"),
-			Action: JumpAction{Target: ChainDispatchToHostEndpoint},
+		generictables.Rule{
+			Match:  notDNATMatch,
+			Action: r.Jump(ChainDispatchToHostEndpoint),
 		},
-		Rule{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action:  r.filterAllowAction,
 			Comment: []string{"Host endpoint policy accepted packet."},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainFilterOutput,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) StaticNATTableChains(ipVersion uint8) (chains []*Chain) {
+func (r *DefaultRuleRenderer) StaticNATTableChains(ipVersion uint8) (chains []*generictables.Chain) {
 	chains = append(chains, r.StaticNATPreroutingChains(ipVersion)...)
 	chains = append(chains, r.StaticNATPostroutingChains(ipVersion)...)
 	chains = append(chains, r.StaticNATOutputChains(ipVersion)...)
 	return
 }
 
-func (r *DefaultRuleRenderer) StaticNATPreroutingChains(ipVersion uint8) []*Chain {
-	rules := []Rule{
+func (r *DefaultRuleRenderer) StaticNATPreroutingChains(ipVersion uint8) []*generictables.Chain {
+	rules := []generictables.Rule{
 		{
-			Action: JumpAction{Target: ChainFIPDnat},
+			Action: r.Jump(ChainFIPDnat),
 		},
 	}
 
 	if ipVersion == 4 && r.OpenStackSpecialCasesEnabled && r.OpenStackMetadataIP != nil {
-		rules = append(rules, Rule{
-			Match: Match().
+		rules = append(rules, generictables.Rule{
+			Match: r.NewMatch().
 				Protocol("tcp").
 				DestPorts(80).
 				DestNet("169.254.169.254/32"),
-			Action: DNATAction{
-				DestAddr: r.OpenStackMetadataIP.String(),
-				DestPort: r.OpenStackMetadataPort,
-			},
+			Action: r.DNAT(
+				r.OpenStackMetadataIP.String(),
+				r.OpenStackMetadataPort,
+			),
 		})
 	}
 
-	chains := []*Chain{{
+	chains := []*generictables.Chain{{
 		Name:  ChainNATPrerouting,
 		Rules: rules,
 	}}
@@ -888,37 +941,52 @@ func (r *DefaultRuleRenderer) StaticNATPreroutingChains(ipVersion uint8) []*Chai
 	return chains
 }
 
-func (r *DefaultRuleRenderer) StaticNATPostroutingChains(ipVersion uint8) []*Chain {
-	rules := []Rule{
+func (r *DefaultRuleRenderer) StaticNATPostroutingChains(ipVersion uint8) []*generictables.Chain {
+	rules := []generictables.Rule{
 		{
-			Action: JumpAction{Target: ChainFIPSnat},
+			Action: r.Jump(ChainFIPSnat),
 		},
 		{
-			Action: JumpAction{Target: ChainNATOutgoing},
+			Action: r.Jump(ChainNATOutgoing),
 		},
 	}
 
 	if r.BPFEnabled {
 		// Prepend a BPF SNAT rule.
-		rules = append([]Rule{
+		rules = append([]generictables.Rule{
 			{
 				Comment: []string{"BPF loopback SNAT"},
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
-				Action:  MasqAction{},
+				Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
+				Action:  r.Masq(""),
 			},
 		}, rules...)
 	}
 
+	// If a masquerade below picks the VXLAN port as the source port, replies come back
+	// with that as their dest port and get caught by our "Drop VXLAN packets from
+	// non-allowed hosts" filter rule. When VXLAN is enabled, build a source port range
+	// that excludes the VXLAN port and apply it to the UDP masquerade below.
+	// See https://github.com/projectcalico/calico/issues/12244.
+	masqToPorts := ""
+	if (ipVersion == 4 && r.VXLANEnabled) || (ipVersion == 6 && r.VXLANEnabledV6) {
+		masqToPorts = masqPortRangeExcluding(r.VXLANPort)
+	}
+
 	var tunnelIfaces []string
 
-	if ipVersion == 4 && r.IPIPEnabled && len(r.IPIPTunnelAddress) > 0 {
-		tunnelIfaces = append(tunnelIfaces, "tunl0")
-	}
-	if ipVersion == 4 && r.VXLANEnabled && len(r.VXLANTunnelAddress) > 0 {
-		tunnelIfaces = append(tunnelIfaces, "vxlan.calico")
-	}
-	if ipVersion == 6 && r.VXLANEnabledV6 && len(r.VXLANTunnelAddressV6) > 0 {
-		tunnelIfaces = append(tunnelIfaces, "vxlan-v6.calico")
+	if !r.BPFEnabled || r.BPFOverlayIPOnDevice {
+		// In BPF mode (without BPFOverlayIPOnDevice), encap/decap and source IP
+		// selection are handled by BPF programs directly, so these masquerade
+		// rules for IPIP/VXLAN tunnels are not needed.
+		if ipVersion == 4 && r.IPIPEnabled && len(r.IPIPTunnelAddress) > 0 {
+			tunnelIfaces = append(tunnelIfaces, dataplanedefs.IPIPIfaceName)
+		}
+		if ipVersion == 4 && r.VXLANEnabled && len(r.VXLANTunnelAddress) > 0 {
+			tunnelIfaces = append(tunnelIfaces, dataplanedefs.VXLANIfaceNameV4)
+		}
+		if ipVersion == 6 && r.VXLANEnabledV6 && len(r.VXLANTunnelAddressV6) > 0 {
+			tunnelIfaces = append(tunnelIfaces, dataplanedefs.VXLANIfaceNameV6)
+		}
 	}
 	if ipVersion == 4 && r.WireguardEnabled && len(r.WireguardInterfaceName) > 0 {
 		// Wireguard is assigned an IP dynamically and without restarting Felix. Just add the interface if we have
@@ -947,44 +1015,153 @@ func (r *DefaultRuleRenderer) StaticNATPostroutingChains(ipVersion uint8) []*Cha
 		// Other remote sources will only reach the tunnel if they're being NATted
 		// already (for example, a Kubernetes "NodePort").  The kernel will then
 		// choose the correct source on its own.
-		rules = append(rules, Rule{
-			Match: Match().
-				// Only match packets going out the tunnel.
+		//
+		// Both rules below share the same match: packets going out the tunnel
+		// (OutInterface) whose source is not the tunnel's own address (NotSrcAddrType,
+		// limited to the output interface) but is some local IP on the box (SrcAddrType).
+		// Matching on address type rather than the specific IP keeps the rule static.
+		if masqToPorts != "" {
+			// Only UDP can hit the drop rule, so only UDP needs its source port
+			// constrained; the rule below masquerades everything else normally. A
+			// separate rule is needed regardless, since --to-ports is only valid on a
+			// rule that also matches a protocol.
+			rules = append(rules, generictables.Rule{
+				Match: r.NewMatch().
+					ProtocolNum(ProtoUDP).
+					OutInterface(tunnel).
+					NotSrcAddrType(generictables.AddrTypeLocal, true).
+					SrcAddrType(generictables.AddrTypeLocal, false),
+				Action: r.Masq(masqToPorts),
+			})
+		}
+		rules = append(rules, generictables.Rule{
+			Match: r.NewMatch().
 				OutInterface(tunnel).
-				// Match packets that don't have the correct source address.  This
-				// matches local addresses (i.e. ones assigned to this host)
-				// limiting the match to the output interface (which we matched
-				// above as the tunnel).  Avoiding embedding the IP address lets
-				// us use a static rule, which is easier to manage.
-				NotSrcAddrType(AddrTypeLocal, true).
-				// Only match if the IP is also some local IP on the box.  This
-				// prevents us from matching packets from workloads, which are
-				// remote as far as the routing table is concerned.
-				SrcAddrType(AddrTypeLocal, false),
-			Action: MasqAction{},
+				NotSrcAddrType(generictables.AddrTypeLocal, true).
+				SrcAddrType(generictables.AddrTypeLocal, false),
+			Action: r.Masq(""),
 		})
 	}
-	return []*Chain{{
+	return []*generictables.Chain{{
 		Name:  ChainNATPostrouting,
 		Rules: rules,
 	}}
 }
 
-func (r *DefaultRuleRenderer) StaticNATOutputChains(ipVersion uint8) []*Chain {
-	rules := []Rule{
+// masqPortRangeExcluding returns a masquerade "--to-ports" range that excludes the given
+// port. iptables and nftables only accept a single contiguous range, so we can't punch a
+// hole in the middle; instead we take whichever side of the port is wider, with a floor of
+// 1024 to stay off privileged ports. Returns "" (no restriction) for an out-of-range port.
+func masqPortRangeExcluding(port int) string {
+	if port <= 0 || port > 65535 {
+		return ""
+	}
+	const lo, hi = 1024, 65535
+	if port-lo >= hi-port {
+		return fmt.Sprintf("%d-%d", lo, port-1)
+	}
+	return fmt.Sprintf("%d-%d", port+1, hi)
+}
+
+func (r *DefaultRuleRenderer) StaticNATOutputChains(ipVersion uint8) []*generictables.Chain {
+	rules := []generictables.Rule{
 		{
-			Action: JumpAction{Target: ChainFIPDnat},
+			Action: r.Jump(ChainFIPDnat),
 		},
 	}
 
-	return []*Chain{{
+	return []*generictables.Chain{{
 		Name:  ChainNATOutput,
 		Rules: rules,
 	}}
 }
 
-func (r *DefaultRuleRenderer) StaticMangleTableChains(ipVersion uint8) []*Chain {
-	var chains []*Chain
+// connStateLogRule returns the rule used at the top of the per-endpoint conntrack rules
+// (and the filter OUTPUT chain) to divert the first response packet of a connection that
+// matched a Log rule to the connection state log chain.  The ctstate match ensures that
+// only response (or related) packets are diverted; same-direction packets such as a
+// retransmitted SYN still carry the connmark bit but are ctstate NEW.
+func (r *DefaultRuleRenderer) connStateLogRule() generictables.Rule {
+	return generictables.Rule{
+		Match: r.NewMatch().
+			ConnMarkMatchesWithMask(r.MarkConnStateLog, r.MarkConnStateLog).
+			ConntrackState("RELATED,ESTABLISHED"),
+		Action: r.Jump(ChainConnStateLog),
+	}
+}
+
+// connStateLogChain builds the chain that receives the first response packet of each
+// connection that matched a policy Log rule.  It writes a single LOG recording how the
+// connection was answered, clears the "no response seen yet" connmark bit and returns.
+// Three mutually exclusive branches, each a LOG/clear/RETURN triplet (LOG is
+// non-terminating, so each branch must return before the next branch's LOG):
+//
+//   - TCP RST: the connection was refused.
+//   - Related ICMP error (e.g. port unreachable): conntrack associates ICMP errors with
+//     the original connection's conntrack entry, so they carry its connmark.  Any other
+//     ctstate RELATED packet (conntrack-helper child flows) falls through to the branch
+//     below rather than being logged as an ICMP error.
+//   - Anything else is the first genuine reply: the connection is established.
+//
+// These rules are not rate limited: the connmark bit that brings a packet here is only
+// set when the policy Log rule's own LOG was emitted (see
+// CombineMatchAndActionsForProtoRule), so the volume of these logs is already bounded
+// by LogActionRateLimit, and each of these logs pairs with a log that the user has
+// already seen.
+func (r *DefaultRuleRenderer) connStateLogChain(ipVersion uint8) *generictables.Chain {
+	icmpProtocol := "icmp"
+	if ipVersion == 6 {
+		icmpProtocol = "ipv6-icmp"
+	}
+	var rules []generictables.Rule
+	appendBranch := func(match generictables.MatchCriteria, logSuffix string) {
+		rules = append(rules,
+			generictables.Rule{
+				Match:  match,
+				Action: r.Log(r.connStateLogPrefix(logSuffix)),
+			},
+			generictables.Rule{
+				Match:  match,
+				Action: r.SetConnmark(0, r.MarkConnStateLog),
+			},
+			generictables.Rule{
+				Match:  match,
+				Action: r.Return(),
+			},
+		)
+	}
+	appendBranch(r.NewMatch().TCPFlagsSet("RST"), "-rst")
+	appendBranch(r.NewMatch().Protocol(icmpProtocol).ConntrackState("RELATED"), "-icmp-err")
+	appendBranch(r.NewMatch(), "-est")
+	return &generictables.Chain{
+		Name:  ChainConnStateLog,
+		Rules: rules,
+	}
+}
+
+// connStateLogPrefix generates the log prefix for a connection transition log by
+// appending the transition suffix to LogConnectionTransitionsPrefix.  The prefix is used
+// verbatim (the chain is shared by all endpoints so, unlike generateLogPrefix, per-policy
+// %-specifiers cannot be resolved) and truncated so that the suffix and the ": " appended
+// by the Log action stay within the backend's log prefix limit.
+func (r *DefaultRuleRenderer) connStateLogPrefix(suffix string) string {
+	base := r.LogConnectionTransitionsPrefix
+	if len(base) == 0 {
+		base = "calico-response"
+	}
+	maxLen := 29 // iptables shows at most 29 characters of log prefix.
+	if r.nft {
+		maxLen = 126 // nftables accepts at most 126 characters of log prefix.
+	}
+	maxBase := maxLen - len(suffix) - len(": ")
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	return base + suffix
+}
+
+func (r *DefaultRuleRenderer) StaticMangleTableChains(ipVersion uint8) []*generictables.Chain {
+	var chains []*generictables.Chain
 
 	chains = append(chains,
 		r.failsafeInChain("mangle", ipVersion),
@@ -993,11 +1170,16 @@ func (r *DefaultRuleRenderer) StaticMangleTableChains(ipVersion uint8) []*Chain 
 		r.StaticManglePostroutingChain(ipVersion),
 	)
 
+	if r.LogConnectionTransitions {
+		// The per-endpoint chains in this table jump to the connection state log chain.
+		chains = append(chains, r.connStateLogChain(ipVersion))
+	}
+
 	return chains
 }
 
-func (r *DefaultRuleRenderer) StaticManglePreroutingChain(ipVersion uint8) *Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) StaticManglePreroutingChain(ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{}
 
 	// ACCEPT or RETURN immediately if packet matches an existing connection.  Note that we also
 	// have a rule like this at the start of each pre-endpoint chain; the functional difference
@@ -1009,24 +1191,24 @@ func (r *DefaultRuleRenderer) StaticManglePreroutingChain(ipVersion uint8) *Chai
 	// else's rule to drop a packet.  (And in that case, the user can configure
 	// IptablesMangleAllowAction to be RETURN.)
 	rules = append(rules,
-		Rule{
-			Match:  Match().ConntrackState("RELATED,ESTABLISHED"),
+		generictables.Rule{
+			Match:  r.NewMatch().ConntrackState("RELATED,ESTABLISHED"),
 			Action: r.mangleAllowAction,
 		},
 	)
 
 	// Or if we've already accepted this packet in the raw table.
 	rules = append(rules,
-		Rule{
-			Match:  Match().MarkSingleBitSet(r.IptablesMarkAccept),
+		generictables.Rule{
+			Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action: r.mangleAllowAction,
 		},
 	)
 
 	// Now dispatch to host endpoint chain for the incoming interface.
 	rules = append(rules,
-		Rule{
-			Action: JumpAction{Target: ChainDispatchFromHostEndpoint},
+		generictables.Rule{
+			Action: r.Jump(ChainDispatchFromHostEndpoint),
 		},
 		// Following that...  If the packet was explicitly allowed by a pre-DNAT policy, it
 		// will have MarkAccept set.  If the packet was denied, it will have been dropped
@@ -1036,32 +1218,70 @@ func (r *DefaultRuleRenderer) StaticManglePreroutingChain(ipVersion uint8) *Chai
 
 		// In the MarkAccept case, we ACCEPT or RETURN according to
 		// IptablesMangleAllowAction.
-		Rule{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
 			Action:  r.mangleAllowAction,
 			Comment: []string{"Host endpoint policy accepted packet."},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainManglePrerouting,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) StaticManglePostroutingChain(ipVersion uint8) *Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) StaticManglePostroutingChain(ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{}
+
+	if r.IstioAmbientModeEnabled {
+		var meshIPSet string
+		if ipVersion == 4 {
+			meshIPSet = r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllIstioWEPs)
+		} else {
+			meshIPSet = r.IPSetConfigV6.NameForMainIPSet(IPSetIDAllIstioWEPs)
+		}
+		for _, ifacePrefix := range r.WorkloadIfacePrefixes {
+			rules = append(rules,
+				generictables.Rule{
+					Match: r.NewMatch().
+						Protocol("tcp").
+						ConntrackState("NEW").
+						OutInterface(ifacePrefix + r.wildcard).
+						DestIPSet(meshIPSet).
+						SourceIPSet(meshIPSet),
+					Action: r.DSCP(r.IstioDSCPMark),
+				})
+		}
+	}
 
 	// Note, we use RETURN as the Allow action in this chain, rather than ACCEPT because the
 	// mangle table is typically used, if at all, for packet manipulations that might need to
 	// apply to our allowed traffic.
 
+	if !r.BPFEnabled {
+		ipConf := r.ipSetConfig(ipVersion)
+		networkIPsSetName := ipConf.NameForMainIPSet(IPSetIDNetworkPools)
+		localHostSetName := ipConf.NameForMainIPSet(IPSetIDThisHostIPs)
+		dscpSetName := ipConf.NameForMainIPSet(IPSetIDDSCPEndpoints)
+		rules = append(
+			rules, generictables.Rule{
+				Match: r.NewMatch().
+					SourceIPSet(dscpSetName).
+					NotDestIPSet(networkIPsSetName).
+					NotDestIPSet(localHostSetName),
+				Action:  r.Jump(ChainEgressDSCP),
+				Comment: []string{"set dscp for traffic leaving cluster."},
+			},
+		)
+	}
+
 	// Allow immediately if IptablesMarkAccept is set.  Our filter-FORWARD chain sets this for
 	// any packets that reach the end of that chain.  The principle is that we don't want to
 	// apply normal host endpoint policy to forwarded traffic.
-	rules = append(rules, Rule{
-		Match:  Match().MarkSingleBitSet(r.IptablesMarkAccept),
-		Action: ReturnAction{},
+	rules = append(rules, generictables.Rule{
+		Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
+		Action: r.Return(),
 	})
 
 	// Similarly, avoid applying normal host endpoint policy to IPVS-forwarded traffic.
@@ -1073,9 +1293,9 @@ func (r *DefaultRuleRenderer) StaticManglePostroutingChain(ipVersion uint8) *Cha
 	// check even when not strictly needed.
 	if r.KubeIPVSSupportEnabled {
 		rules = append(rules,
-			Rule{
-				Match:  Match().MarkNotClear(r.IptablesMarkEndpoint),
-				Action: ReturnAction{},
+			generictables.Rule{
+				Match:  r.NewMatch().MarkNotClear(r.MarkEndpoint),
+				Action: r.Return(),
 			},
 		)
 	}
@@ -1099,129 +1319,162 @@ func (r *DefaultRuleRenderer) StaticManglePostroutingChain(ipVersion uint8) *Cha
 	// does not recalculate the outgoing interface (OIF) until AFTER the filter-OUTPUT chain.
 	// The OIF has been recalculated by the time we hit THIS chain (mangle-POSTROUTING), so we
 	// can reliably apply host endpoint policy here.
+
+	// Matching on conntrack status varies by table type.
+	dnatMatch := r.NewMatch()
+	if m, ok := dnatMatch.(nftrender.NFTMatchCriteria); ok {
+		dnatMatch = m.ConntrackStatus("DNAT")
+	} else {
+		dnatMatch = dnatMatch.ConntrackState("DNAT")
+	}
+
 	rules = append(rules,
-		Rule{
-			Action: ClearMarkAction{Mark: r.allCalicoMarkBits()},
+		generictables.Rule{
+			Action: r.ClearMark(r.allCalicoMarkBits()),
 		},
-		Rule{
-			Match:  Match().ConntrackState("DNAT"),
-			Action: JumpAction{Target: ChainDispatchToHostEndpoint},
+		generictables.Rule{
+			Match:  dnatMatch,
+			Action: r.Jump(ChainDispatchToHostEndpoint),
 		},
-		Rule{
-			Match:   Match().MarkSingleBitSet(r.IptablesMarkAccept),
-			Action:  ReturnAction{},
+		generictables.Rule{
+			Match:   r.NewMatch().MarkSingleBitSet(r.MarkAccept),
+			Action:  r.Return(),
 			Comment: []string{"Host endpoint policy accepted packet."},
 		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainManglePostrouting,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) StaticRawTableChains(ipVersion uint8) []*Chain {
-	return []*Chain{
+func (r *DefaultRuleRenderer) StaticRawTableChains(ipVersion uint8) []*generictables.Chain {
+	return []*generictables.Chain{
 		r.failsafeInChain("raw", ipVersion),
 		r.failsafeOutChain("raw", ipVersion),
 		r.StaticRawPreroutingChain(ipVersion),
 		r.WireguardIncomingMarkChain(),
-		r.StaticRawOutputChain(0),
+		r.StaticRawOutputChain(0, ipVersion),
 	}
 }
 
 func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
-	wgEncryptHost, bypassHostConntrack bool) []*Chain {
-
-	var rawRules []Rule
+	wgEncryptHost, bypassHostConntrack bool,
+) []*generictables.Chain {
+	var rawRules []generictables.Rule
 
 	if ((r.WireguardEnabled && len(r.WireguardInterfaceName) > 0) || (r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0)) && wgEncryptHost {
 		// Set a mark on packets coming from any interface except for lo, wireguard, or pod veths to ensure the RPF
 		// check allows it.
 		log.Debug("Adding Wireguard iptables rule chain")
-		rawRules = append(rawRules, Rule{
+		rawRules = append(rawRules, generictables.Rule{
 			Match:  nil,
-			Action: JumpAction{Target: ChainSetWireguardIncomingMark},
+			Action: r.Jump(ChainSetWireguardIncomingMark),
 		})
 	}
 
 	rawRules = append(rawRules,
-		Rule{
+		generictables.Rule{
 			// Return, i.e. no-op, if bypass mark is not set.
-			Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenBypass, 0xffffffff),
-			Action:  GotoAction{Target: ChainRawBPFUntrackedPolicy},
+			Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenBypassXDP, 0xffffffff),
+			Action:  r.GoTo(ChainRawBPFUntrackedPolicy),
 			Comment: []string{"Jump to target for packets with Bypass mark"},
 		},
-		Rule{
-			Match:   Match().DestAddrType(AddrTypeLocal),
-			Action:  SetMaskedMarkAction{Mark: tcdefs.MarkSeenSkipFIB, Mask: tcdefs.MarkSeenSkipFIB},
+		generictables.Rule{
+			Match:   r.NewMatch().DestAddrType(generictables.AddrTypeLocal),
+			Action:  r.SetMaskedMark(tcdefs.MarkSeenSkipFIB, tcdefs.MarkSeenSkipFIB),
 			Comment: []string{"Mark traffic towards the host - it is TRACKed"},
-		},
-		Rule{
-			Match:   Match().NotDestAddrType(AddrTypeLocal),
-			Action:  GotoAction{Target: ChainRawUntrackedFlows},
-			Comment: []string{"Check if forwarded traffic needs to be TRACKed"},
 		},
 	)
 
-	rawPreroutingChain := &Chain{
+	if bypassHostConntrack {
+		rawRules = append(rawRules,
+			generictables.Rule{
+				Match:   r.NewMatch().NotDestAddrType(generictables.AddrTypeLocal),
+				Action:  r.GoTo(ChainRawUntrackedFlows),
+				Comment: []string{"Check if forwarded traffic needs to be TRACKed"},
+			},
+		)
+	}
+
+	rawPreroutingChain := &generictables.Chain{
 		Name:  ChainRawPrerouting,
 		Rules: rawRules,
 	}
 
 	// BPF Untracked Flow Rules:
-	var bpfUntrackedFlowRules []Rule
+	var bpfUntrackedFlowRules []generictables.Rule
 	if bypassHostConntrack {
 		// Iterate all BPF interfaces forced to track packets and append rule.
 		for _, interfaceName := range r.BPFForceTrackPacketsFromIfaces {
 			if len(interfaceName) > 0 {
 				bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
-					Rule{
-						Match:   Match().InInterface(interfaceName),
-						Action:  ReturnAction{},
+					generictables.Rule{
+						Match:   r.NewMatch().InInterface(interfaceName),
+						Action:  r.Return(),
 						Comment: []string{"Track interface " + interfaceName},
 					},
 				)
 			}
 		}
 
+		switch ipVersion {
+		case 4:
+			bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
+				generictables.Rule{
+					Match:   r.NewMatch().DestNet("169.254.0.0/16"),
+					Action:  r.Return(),
+					Comment: []string{"link-local"},
+				},
+			)
+		case 6:
+			bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
+				generictables.Rule{
+					Match:   r.NewMatch().DestNet("fe80::/10"),
+					Action:  r.Return(),
+					Comment: []string{"link-local"},
+				},
+			)
+		}
+
 		bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
-			Rule{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenSkipFIB, tcdefs.MarkSeenSkipFIB),
-				Action:  ReturnAction{},
+			generictables.Rule{
+				Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenSkipFIB, tcdefs.MarkSeenCodeMask),
+				Action:  r.Return(),
 				Comment: []string{"MarkSeenSkipFIB Mark"},
 			},
-			Rule{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenFallThrough, tcdefs.MarkSeenFallThroughMask),
-				Action:  ReturnAction{},
+			generictables.Rule{
+				Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenFallThrough, tcdefs.MarkSeenFallThroughMask),
+				Action:  r.Return(),
 				Comment: []string{"MarkSeenFallThrough Mark"},
 			},
-			Rule{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
-				Action:  ReturnAction{},
+			generictables.Rule{
+				Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
+				Action:  r.Return(),
 				Comment: []string{"MarkSeenMASQ Mark"},
 			},
-			Rule{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenNATOutgoing, tcdefs.MarkSeenNATOutgoingMask),
-				Action:  ReturnAction{},
+			generictables.Rule{
+				Match:   r.NewMatch().MarkMatchesWithMask(tcdefs.MarkSeenNATOutgoing, tcdefs.MarkSeenNATOutgoingMask),
+				Action:  r.Return(),
 				Comment: []string{"MarkSeenNATOutgoing Mark"},
 			},
-			Rule{
-				Action: NoTrackAction{},
+			generictables.Rule{
+				Action: r.NoTrack(),
 			},
 		)
 	}
-	bpfUntrackedFlowChain := &Chain{
+	bpfUntrackedFlowChain := &generictables.Chain{
 		Name:  ChainRawUntrackedFlows,
 		Rules: bpfUntrackedFlowRules,
 	}
 
-	xdpUntrackedPoliciesChain := &Chain{
+	xdpUntrackedPoliciesChain := &generictables.Chain{
 		Name: ChainRawBPFUntrackedPolicy,
-		Rules: []Rule{
+		Rules: []generictables.Rule{
 			// At this point we know bypass mark is set, which means that the packet has
 			// been explicitly allowed by untracked ingress policy (XDP).  We should
-			// clear the mark so as not to affect any FROM_HOST processing.  (There
+			// clear the mark so as not to affect any FROM_HOST processing.  There
 			// shouldn't be any FROM_HOST processing, because untracked policy is only
 			// intended for traffic to/from the host.  But if the traffic is in fact
 			// forwarded and goes to or through another endpoint, it's better to enforce
@@ -1229,17 +1482,17 @@ func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
 			// mark.  Note that we can clear the mark without stomping on anyone else's
 			// logic because no one else's iptables should have had a chance to execute
 			// yet.
-			Rule{
-				Action: SetMarkAction{Mark: 0},
+			{
+				Action: r.SetMaskedMark(0, tcdefs.MarksMask),
 			},
 			// Now ensure that the packet is not tracked.
-			Rule{
-				Action: NoTrackAction{},
+			{
+				Action: r.NoTrack(),
 			},
 		},
 	}
 
-	chains := []*Chain{
+	chains := []*generictables.Chain{
 		rawPreroutingChain,
 		xdpUntrackedPoliciesChain,
 		bpfUntrackedFlowChain,
@@ -1248,72 +1501,86 @@ func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
 	}
 
 	chains = append(chains,
-		r.StaticRawOutputChain(tcdefs.MarkSeenBypass))
+		r.StaticRawOutputChain(tcdefs.MarkSeenBypass, ipVersion))
 
 	return chains
 }
 
-func (r *DefaultRuleRenderer) StaticRawPreroutingChain(ipVersion uint8) *Chain {
-	rules := []Rule{}
+func (r *DefaultRuleRenderer) StaticRawPreroutingChain(ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{}
 
 	// For safety, clear all our mark bits before we start.  (We could be in append mode and
 	// another process' rules could have left the mark bit set.)
 	rules = append(rules,
-		Rule{Action: ClearMarkAction{Mark: r.allCalicoMarkBits()}},
+		generictables.Rule{Action: r.ClearMark(r.allCalicoMarkBits())},
 	)
 
 	// Set a mark on encapsulated packets coming from WireGuard to ensure the RPF check allows it
-	if ((r.WireguardEnabled && len(r.WireguardInterfaceName) > 0) || (r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0)) && r.Config.WireguardEncryptHostTraffic {
+	if ((r.WireguardEnabled && len(r.WireguardInterfaceName) > 0) || (r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0)) && r.WireguardEncryptHostTraffic {
 		log.Debug("Adding Wireguard iptables rule")
-		rules = append(rules, Rule{
+		rules = append(rules, generictables.Rule{
 			Match:  nil,
-			Action: JumpAction{Target: ChainSetWireguardIncomingMark},
+			Action: r.Jump(ChainSetWireguardIncomingMark),
+		})
+	}
+
+	// Ensure VXLAN UDP Flows are not tracked in conntrack.
+	// VXLAN uses different source ports in each direction so
+	// tracking results in unreplied flows.
+	if (ipVersion == 4 && r.VXLANEnabled) || (ipVersion == 6 && r.VXLANEnabledV6) {
+		log.Debug("Adding VXLAN NOTRACK iptables rule to PREROUTING chain")
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch().Protocol("udp").DestPort(uint16(r.VXLANPort)),
+			Action: r.NoTrack(),
 		})
 	}
 
 	// Set a mark on the packet if it's from a workload interface.
-	markFromWorkload := r.IptablesMarkScratch0
+	markFromWorkload := r.MarkScratch0
 	for _, ifacePrefix := range r.WorkloadIfacePrefixes {
-		rules = append(rules, Rule{
-			Match:  Match().InInterface(ifacePrefix + "+"),
-			Action: SetMarkAction{Mark: markFromWorkload},
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch().InInterface(ifacePrefix + r.wildcard),
+			Action: r.SetMark(markFromWorkload),
 		})
 	}
 
 	// Send workload traffic to a specific chain to skip the rpf check for some workloads
 	rules = append(rules,
-		Rule{
-			Match:  Match().MarkMatchesWithMask(markFromWorkload, markFromWorkload),
-			Action: JumpAction{Target: ChainRpfSkip},
+		generictables.Rule{
+			Match:  r.NewMatch().MarkMatchesWithMask(markFromWorkload, markFromWorkload),
+			Action: r.Jump(ChainRpfSkip),
 		})
 
 	// Apply strict RPF check to packets from workload interfaces.  This prevents
 	// workloads from spoofing their IPs.  Note: non-privileged containers can't
 	// usually spoof but privileged containers and VMs can.
-	//
 	rules = append(rules,
-		RPFilter(ipVersion, markFromWorkload, markFromWorkload, r.OpenStackSpecialCasesEnabled, false, r.IptablesFilterDenyAction())...)
+		r.RPFilter(ipVersion, markFromWorkload, markFromWorkload, r.OpenStackSpecialCasesEnabled, r.IptablesFilterDenyAction())...)
 
 	rules = append(rules,
 		// Send non-workload traffic to the untracked policy chains.
-		Rule{Match: Match().MarkClear(markFromWorkload),
-			Action: JumpAction{Target: ChainDispatchFromHostEndpoint}},
+		generictables.Rule{
+			Match:  r.NewMatch().MarkClear(markFromWorkload),
+			Action: r.Jump(ChainDispatchFromHostEndpoint),
+		},
 		// Then, if the packet was marked as allowed, accept it.  Packets also return here
 		// without the mark bit set if the interface wasn't one that we're policing.  We
 		// let those packets fall through to the user's policy.
-		Rule{Match: Match().MarkSingleBitSet(r.IptablesMarkAccept),
-			Action: AcceptAction{}},
+		generictables.Rule{
+			Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
+			Action: r.Allow(),
+		},
 	)
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainRawPrerouting,
 		Rules: rules,
 	}
 }
 
 // RPFilter returns rules that implement RPF
-func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, acceptLocal bool, dropActionOverride Action) []Rule {
-	rules := make([]Rule, 0, 2)
+func (r *DefaultRuleRenderer) RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled bool, dropActionOverride generictables.Action) []generictables.Rule {
+	rules := make([]generictables.Rule, 0, 2)
 
 	// For OpenStack, allow DHCP v4 packets with source 0.0.0.0.  These must be allowed before
 	// checking against the iptables rp_filter module, because the rp_filter module in some
@@ -1336,19 +1603,19 @@ func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, 
 	if openStackSpecialCasesEnabled && ipVersion == 4 {
 		log.Info("Add OpenStack special-case rule for DHCP with source 0.0.0.0")
 		rules = append(rules,
-			Rule{
-				Match: Match().
+			generictables.Rule{
+				Match: r.NewMatch().
 					Protocol("udp").
 					SourceNet("0.0.0.0").
 					SourcePorts(68).
 					DestPorts(67),
-				Action: AcceptAction{},
+				Action: r.Allow(),
 			},
 		)
 	}
 
-	rules = append(rules, Rule{
-		Match:  Match().MarkMatchesWithMask(mark, mask).RPFCheckFailed(acceptLocal),
+	rules = append(rules, generictables.Rule{
+		Match:  r.NewMatch().MarkMatchesWithMask(mark, mask).RPFCheckFailed(),
 		Action: dropActionOverride,
 	})
 
@@ -1356,68 +1623,84 @@ func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, 
 }
 
 func (r *DefaultRuleRenderer) allCalicoMarkBits() uint32 {
-	return r.IptablesMarkAccept |
-		r.IptablesMarkPass |
-		r.IptablesMarkScratch0 |
-		r.IptablesMarkScratch1
+	return r.MarkAccept |
+		r.MarkPass |
+		r.MarkScratch0 |
+		r.MarkScratch1
 }
 
-func (r *DefaultRuleRenderer) WireguardIncomingMarkChain() *Chain {
-	rules := []Rule{
+func (r *DefaultRuleRenderer) WireguardIncomingMarkChain() *generictables.Chain {
+	rules := []generictables.Rule{
 		{
-			Match:  Match().InInterface("lo"),
-			Action: ReturnAction{},
+			Match:  r.NewMatch().InInterface("lo"),
+			Action: r.Return(),
 		},
 		{
-			Match:  Match().InInterface(r.WireguardInterfaceName),
-			Action: ReturnAction{},
+			Match:  r.NewMatch().InInterface(r.WireguardInterfaceName),
+			Action: r.Return(),
 		},
 		{
-			Match:  Match().InInterface(r.WireguardInterfaceNameV6),
-			Action: ReturnAction{},
+			Match:  r.NewMatch().InInterface(r.WireguardInterfaceNameV6),
+			Action: r.Return(),
 		},
 	}
 
 	for _, ifacePrefix := range r.WorkloadIfacePrefixes {
-		rules = append(rules, Rule{
-			Match:  Match().InInterface(fmt.Sprintf("%s+", ifacePrefix)),
-			Action: ReturnAction{},
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch().InInterface(fmt.Sprintf("%s%s", ifacePrefix, r.wildcard)),
+			Action: r.Return(),
 		})
 	}
 
-	rules = append(rules, Rule{Match: nil, Action: SetMarkAction{Mark: r.WireguardIptablesMark}})
+	rules = append(rules, generictables.Rule{Match: nil, Action: r.SetMark(r.WireguardMark)})
 
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainSetWireguardIncomingMark,
 		Rules: rules,
 	}
 }
 
-func (r *DefaultRuleRenderer) StaticRawOutputChain(tcBypassMark uint32) *Chain {
-	rules := []Rule{
+func (r *DefaultRuleRenderer) StaticRawOutputChain(tcBypassMark uint32, ipVersion uint8) *generictables.Chain {
+	rules := []generictables.Rule{
 		// For safety, clear all our mark bits before we start.  (We could be in
 		// append mode and another process' rules could have left the mark bit set.)
-		{Action: ClearMarkAction{Mark: r.allCalicoMarkBits()}},
+		{Action: r.ClearMark(r.allCalicoMarkBits())},
 		// Then, jump to the untracked policy chains.
-		{Action: JumpAction{Target: ChainDispatchToHostEndpoint}},
+		{Action: r.Jump(ChainDispatchToHostEndpoint)},
 		// Then, if the packet was marked as allowed, accept it.  Packets also
 		// return here without the mark bit set if the interface wasn't one that
 		// we're policing.
 	}
+
+	// Ensure VXLAN UDP Flows are not tracked in conntrack.
+	if (ipVersion == 4 && r.VXLANEnabled) || (ipVersion == 6 && r.VXLANEnabledV6) {
+		log.Debug("Adding VXLAN NOTRACK iptables rule")
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch().Protocol("udp").DestPort(uint16(r.VXLANPort)),
+			Action: r.NoTrack(),
+		})
+	}
+
 	if tcBypassMark == 0 {
-		rules = append(rules, []Rule{
-			{Match: Match().MarkSingleBitSet(r.IptablesMarkAccept),
-				Action: AcceptAction{}},
+		rules = append(rules, []generictables.Rule{
+			{
+				Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
+				Action: r.Allow(),
+			},
 		}...)
 	} else {
-		rules = append(rules, []Rule{
-			{Match: Match().MarkSingleBitSet(r.IptablesMarkAccept),
-				Action: SetMaskedMarkAction{Mark: tcBypassMark, Mask: 0xffffffff}},
-			{Match: Match().MarkMatchesWithMask(tcBypassMark, 0xffffffff),
-				Action: AcceptAction{}},
+		rules = append(rules, []generictables.Rule{
+			{
+				Match:  r.NewMatch().MarkSingleBitSet(r.MarkAccept),
+				Action: r.SetMaskedMark(tcBypassMark, 0xffffffff),
+			},
+			{
+				Match:  r.NewMatch().MarkMatchesWithMask(tcBypassMark, 0xffffffff),
+				Action: r.Allow(),
+			},
 		}...)
 	}
-	return &Chain{
+	return &generictables.Chain{
 		Name:  ChainRawOutput,
 		Rules: rules,
 	}

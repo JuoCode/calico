@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,23 +15,32 @@
 package checker
 
 import (
+	"fmt"
 	"net"
+	"net/url"
+	"path"
+	"regexp"
+	"slices"
 	"strings"
 
-	"github.com/projectcalico/calico/app-policy/proto"
-	"github.com/projectcalico/calico/libcalico-go/lib/selector"
-
-	"fmt"
-
-	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	authz "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/app-policy/policystore"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/libcalico-go/lib/selector"
 )
 
-var (
-	// Envoy supports TCP only. Add a k:v into this map if more protocol is supported in the future.
-	protocolMapL4 = map[int32]string{6: "tcp"}
-)
+// protocolMapL4 maps an L4 protocol number to the name Felix uses in IP+port IP set
+// members. A named port can be declared on tcp, udp or sctp, and Felix emits members
+// for all three. Envoy's ext_authz adapter only ever reports tcp or udp, but the key is
+// built from whatever the Flow reports, so a Flow carrying 132 gets "sctp" here rather
+// than an empty protocol field that no member can equal.
+var protocolMapL4 = map[int]string{
+	1:   "icmp",
+	6:   "tcp",
+	17:  "udp",
+	132: "sctp",
+}
 
 type namespaceMatch struct {
 	Names    []string
@@ -48,42 +57,106 @@ func (i *InvalidDataFromDataPlane) Error() string {
 	return "Invalid data from dataplane " + i.string
 }
 
-// match checks if the Rule matches the request.  It returns true if the Rule matches, false otherwise.
-func match(rule *proto.Rule, req *requestCache, policyNamespace string) bool {
-	log.WithFields(log.Fields{
-		"rule":            rule,
-		"Req.Method":      req.Request.GetAttributes().GetRequest().GetHttp().GetMethod(),
-		"Req.Path":        req.Request.GetAttributes().GetRequest().GetHttp().GetPath(),
-		"Req.Protocol":    req.Request.GetAttributes().GetRequest().GetHttp().GetProtocol(),
-		"Req.Source":      req.Request.GetAttributes().GetSource(),
-		"Req.Destination": req.Request.GetAttributes().GetDestination(),
-	}).Debug("Checking rule on request")
-	attr := req.Request.GetAttributes()
-	return matchSource(rule, req, policyNamespace) &&
-		matchDestination(rule, req, policyNamespace) &&
-		matchRequest(rule, attr.GetRequest()) &&
-		matchL4Protocol(rule, attr.GetDestination())
+// L4Flow abstracts the common l4 data and behavior needed for the match algorithms.
+type L4Flow interface {
+	GetSourceIP() net.IP
+	GetDestIP() net.IP
+	GetSourcePort() int
+	GetDestPort() int
+	GetProtocol() int
 }
 
-func matchSource(r *proto.Rule, req *requestCache, policyNamespace string) bool {
+// L7Flow abstracts the common l7 data and behavior needed for the match algorithms.
+type L7Flow interface {
+	GetHttpMethod() *string
+	GetHttpPath() *string
+	GetSourcePrincipal() *string
+	GetDestPrincipal() *string
+	GetSourceLabels() map[string]string
+	GetDestLabels() map[string]string
+}
+
+// flow abstracts the common data and behavior needed for the match algorithms.
+//go:generate mockery --name=Flow --output=mocks --outpkg=mocks
+
+type Flow interface {
+	L4Flow
+	L7Flow
+}
+
+// match checks if the Rule matches the request. It returns true if the Rule matches, false otherwise.
+func match(policyNamespace string, rule *proto.Rule, req *requestCache) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"rule":       rule,
+			"Protocol":   req.GetProtocol(),
+			"SourceIP":   req.GetSourceIP(),
+			"DestIP":     req.GetDestIP(),
+			"SourcePort": req.GetSourcePort(),
+			"DestPort":   req.GetDestPort(),
+			"HttpMethod": req.GetHttpMethod(),
+			"HttpPath":   req.GetHttpPath(),
+		}).Debug("Checking rule on request")
+	}
+	// A rule's criteria are ANDed, so they may be evaluated in any order. Evaluate them
+	// cheapest-first, because most rules in a large policy set are rejected by exactly
+	// one criterion and the walk stops at it:
+	//
+	//   - protocol and ports are integer comparisons against the flow;
+	//   - the address criteria parse a CIDR per entry, or hash and walk an IP set;
+	//   - the identity criteria parse and evaluate a label selector.
+	//
+	// The HTTP criteria go last because matchRequest normalises the request path,
+	// and because it panics on a malformed one: leaving it last confines that to
+	// requests that a rule otherwise matches.
+	return matchL4Protocol(rule, req.GetProtocol()) &&
+		matchSrcPort(rule, req) &&
+		matchDstPort(rule, req) &&
+		matchSrcNet(rule, req) &&
+		matchDstNet(rule, req) &&
+		matchSrcIPSets(rule, req) &&
+		matchDstIPSets(rule, req) &&
+		matchDstIPPortSetIds(rule, req) &&
+		matchSrcIdentity(policyNamespace, rule, req) &&
+		matchDstIdentity(policyNamespace, rule, req) &&
+		matchRequest(rule, req)
+}
+
+// matchSrcIdentity checks the source service account and namespace criteria of the Rule
+// against the request's identity. It returns true if the Rule matches, false otherwise.
+func matchSrcIdentity(policyNamespace string, r *proto.Rule, req *requestCache) bool {
 	nsMatch := computeNamespaceMatch(
 		policyNamespace,
 		r.GetOriginalSrcNamespaceSelector(),
 		r.GetOriginalSrcSelector(),
 		r.GetOriginalNotSrcSelector(),
 		r.GetSrcServiceAccountMatch())
-	addr := req.Request.GetAttributes().GetSource().GetAddress()
-	return matchServiceAccounts(r.GetSrcServiceAccountMatch(), req.SourcePeer()) &&
-		matchNamespace(nsMatch, req.SourceNamespace()) &&
-		matchSrcIPSets(r, req) &&
-		matchPort("src", r.GetSrcPorts(), r.GetSrcNamedPortIpSetIds(), req, addr) &&
-		matchNet("src", r.GetSrcNet(), addr)
+
+	return matchServiceAccounts(r.GetSrcServiceAccountMatch(), req.getSrcPeer()) &&
+		matchNamespace(nsMatch, req.getSrcNamespace())
 }
 
+// matchDstIdentity checks the destination service account and namespace criteria of the
+// Rule against the request's identity. It returns true if the Rule matches, false
+// otherwise.
+func matchDstIdentity(policyNamespace string, r *proto.Rule, req *requestCache) bool {
+	nsMatch := computeNamespaceMatch(
+		policyNamespace,
+		r.GetOriginalDstNamespaceSelector(),
+		r.GetOriginalDstSelector(),
+		r.GetOriginalNotDstSelector(),
+		r.GetDstServiceAccountMatch())
+
+	return matchServiceAccounts(r.GetDstServiceAccountMatch(), req.getDstPeer()) &&
+		matchNamespace(nsMatch, req.getDstNamespace())
+}
+
+// computeNamespaceMatch computes the namespace match based on the policyNamespace, namespace
+// selector, pod selector,
 func computeNamespaceMatch(
 	policyNamespace, nsSelector, podSelector, notPodSelector string, saMatch *proto.ServiceAccountMatch,
-) *namespaceMatch {
-	nsMatch := &namespaceMatch{}
+) namespaceMatch {
+	nsMatch := namespaceMatch{}
 	if nsSelector != "" {
 		// In all cases, if a namespace label selector is present, it takes precedence.
 		nsMatch.Selector = nsSelector
@@ -103,33 +176,27 @@ func computeNamespaceMatch(
 	return nsMatch
 }
 
-func matchDestination(r *proto.Rule, req *requestCache, policyNamespace string) bool {
-	nsMatch := computeNamespaceMatch(
-		policyNamespace,
-		r.GetOriginalDstNamespaceSelector(),
-		r.GetOriginalDstSelector(),
-		r.GetOriginalNotDstSelector(),
-		r.GetDstServiceAccountMatch())
-	addr := req.Request.GetAttributes().GetDestination().GetAddress()
-	return matchServiceAccounts(r.GetDstServiceAccountMatch(), req.DestinationPeer()) &&
-		matchNamespace(nsMatch, req.DestinationNamespace()) &&
-		matchDstIPSets(r, req) &&
-		matchPort("dst", r.GetDstPorts(), r.GetDstNamedPortIpSetIds(), req, addr) &&
-		matchNet("dst", r.GetDstNet(), addr)
+// matchRequest checks if the request part of the Rule matches the request. It returns true if the
+// Rule matches, false otherwise.
+func matchRequest(rule *proto.Rule, req *requestCache) bool {
+	return matchHTTP(rule.GetHttpMatch(), req.GetHttpMethod(), req.GetHttpPath())
 }
 
-func matchRequest(rule *proto.Rule, req *authz.AttributeContext_Request) bool {
-	log.WithField("request", req).Debug("Matching request.")
-	return matchHTTP(rule.GetHttpMatch(), req.GetHttp())
-}
-
-func matchServiceAccounts(saMatch *proto.ServiceAccountMatch, p peer) bool {
-	log.WithFields(log.Fields{
-		"name":      p.Name,
-		"namespace": p.Namespace,
-		"labels":    p.Labels,
-		"rule":      saMatch},
-	).Debug("Matching service account.")
+// matchServiceAccounts checks if the service account part of the Rule matches the request. It
+// returns true if the Rule matches, false otherwise.
+func matchServiceAccounts(saMatch *proto.ServiceAccountMatch, p *peer) bool {
+	if p == nil {
+		log.Debug("nil peer. Return true")
+		return true
+	}
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"name":      p.Name,
+			"namespace": p.Namespace,
+			"labels":    p.Labels,
+			"rule":      saMatch},
+		).Debug("Matching service account.")
+	}
 	if saMatch == nil {
 		log.Debug("nil ServiceAccountMatch.  Return true.")
 		return true
@@ -143,43 +210,54 @@ func matchServiceAccounts(saMatch *proto.ServiceAccountMatch, p peer) bool {
 			matchLabels(saMatch.GetSelector(), p.Labels))
 }
 
+// matchName checks if the name matches the names. It returns true if the name matches, false
+// otherwise.
 func matchName(names []string, name string) bool {
-	log.WithFields(log.Fields{
-		"names": names,
-		"name":  name,
-	}).Debug("Matching name")
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"names": names,
+			"name":  name,
+		}).Debug("Matching name")
+	}
 	if len(names) == 0 {
 		log.Debug("No names on rule.")
 		return true
 	}
-	for _, n := range names {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(names, name)
 }
 
+// matchLabels checks if the selector matches the labels. It returns true if the selector matches,
+// false otherwise.
 func matchLabels(selectorStr string, labels map[string]string) bool {
-	log.WithFields(log.Fields{
-		"selector": selectorStr,
-		"labels":   labels,
-	}).Debug("Matching labels.")
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"selector": selectorStr,
+			"labels":   labels,
+		}).Debug("Matching labels")
+	}
 	sel, err := selector.Parse(selectorStr)
 	if err != nil {
-		log.Warnf("Could not parse label selector %v, %v", selectorStr, err)
+		rlogBadSelector.Warnf("Could not parse label selector %v, %v", selectorStr, err)
 		return false
 	}
 	log.Debugf("Parsed selector.")
 	return sel.Evaluate(labels)
 }
 
-func matchNamespace(nsMatch *namespaceMatch, ns namespace) bool {
-	log.WithFields(log.Fields{
-		"namespace": ns.Name,
-		"labels":    ns.Labels,
-		"rule":      nsMatch},
-	).Debug("Matching namespace.")
+// matchNamespace checks if the namespace part of the Rule matches the request. It returns true if
+// the Rule matches, false otherwise.
+func matchNamespace(nsMatch namespaceMatch, ns *namespace) bool {
+	if ns == nil {
+		log.Debug("nil namespace. Return true")
+		return true
+	}
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"namespace": ns.Name,
+			"labels":    ns.Labels,
+			"rule":      nsMatch},
+		).Debug("Matching namespace.")
+	}
 	// In case of plain text, Dikastes falls back on IP addresses. In such a case
 	// namespace is empty as there is no such information in the authorization header.
 	// In case of plain text so Dikastes only matches if the IP addresses are part of
@@ -189,32 +267,46 @@ func matchNamespace(nsMatch *namespaceMatch, ns namespace) bool {
 			matchLabels(nsMatch.Selector, ns.Labels))
 }
 
-func matchHTTP(rule *proto.HTTPMatch, req *authz.AttributeContext_HttpRequest) bool {
-	log.WithFields(log.Fields{
-		"rule": rule,
-	}).Debug("Matching HTTP.")
+// matchHTTP checks if the HTTP part of the Rule matches the request. It returns true if the Rule
+// matches, false otherwise.
+func matchHTTP(rule *proto.HTTPMatch, httpMethod, httpPath *string) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"rule": rule,
+		}).Debug("Matching HTTP.")
+	}
 	if rule == nil {
-		log.Debug("nil HTTPRule.  Return true")
+		log.Debug("nil HTTPRule. Return true")
 		return true
 	}
-	return matchHTTPMethods(rule.GetMethods(), req.GetMethod()) && matchHTTPPaths(rule.GetPaths(), req.GetPath())
+
+	return matchHTTPMethods(rule.GetMethods(), httpMethod) && matchHTTPPaths(rule.GetPaths(), httpPath)
 }
 
-func matchHTTPMethods(methods []string, reqMethod string) bool {
-	log.WithFields(log.Fields{
-		"methods":   methods,
-		"reqMethod": reqMethod,
-	}).Debug("Matching HTTP Methods")
+// matchHTTPMethods checks if the HTTP methods match. It returns true if the methods match, false
+// otherwise.
+func matchHTTPMethods(methods []string, reqMethod *string) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"methods":   methods,
+			"reqMethod": reqMethod,
+		}).Debug("Matching HTTP Methods")
+	}
+	if reqMethod == nil {
+		log.Debug("Request has nil HTTP Method.")
+		return true
+	}
 	if len(methods) == 0 {
 		log.Debug("Rule has 0 HTTP Methods, matched.")
 		return true
 	}
+
 	for _, method := range methods {
 		if method == "*" {
 			log.Debug("Rule matches all methods with wildcard *")
 			return true
 		}
-		if method == reqMethod {
+		if method == *reqMethod {
 			log.Debug("HTTP Method matched.")
 			return true
 		}
@@ -223,36 +315,63 @@ func matchHTTPMethods(methods []string, reqMethod string) bool {
 	return false
 }
 
-func matchHTTPPaths(paths []*proto.HTTPMatch_PathMatch, reqPath string) bool {
-	log.WithFields(log.Fields{
-		"paths":   paths,
-		"reqPath": reqPath,
-	}).Debug("Matching HTTP Paths")
+// matchHTTPPaths checks if the HTTP paths match. It returns true if the paths match, false
+// otherwise.
+//
+// The request-target is normalised per RFC 3986 / RFC 7230 before comparison:
+// query and fragment are stripped, percent-escapes are decoded, repeated
+// slashes are collapsed, and "." / ".." segments are resolved. This matches
+// what upstream HTTP servers do before dispatching a request, so an
+// authorisation decision here is made on the same path the upstream will
+// actually serve. Prefix matches are anchored to path-segment boundaries so
+// that prefix "/pub" does not authorise "/public-leak".
+func matchHTTPPaths(paths []*proto.HTTPMatch_PathMatch, reqPath *string) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"paths":   paths,
+			"reqPath": reqPath,
+		}).Debug("Matching HTTP Paths")
+	}
 	if len(paths) == 0 {
 		log.Debug("Rule has 0 HTTP Paths, matched.")
 		return true
 	}
-	// Accept only valid paths
-	if !strings.HasPrefix(reqPath, "/") {
-		s := fmt.Sprintf("Invalid HTTP Path \"%s\"", reqPath)
+	if reqPath == nil {
+		log.Debug("nil HTTP Path. Default is /")
+		return true
+	}
+	// Accept only valid paths.
+	if !strings.HasPrefix(*reqPath, "/") {
+		s := fmt.Sprintf("Invalid HTTP Path \"%s\"", *reqPath)
 		log.Error(s)
 		// Let the caller recover from the panic.
 		panic(&InvalidDataFromDataPlane{s})
 	}
-	// Strip out the query '?' and fragment '#' identifier
-	for _, s := range []string{"?", "#"} {
-		reqPath = strings.Split(reqPath, s)[0]
+	normalizedReq, ok := normalizeHTTPPath(*reqPath)
+	if !ok {
+		log.WithField("reqPath", *reqPath).Debug("HTTP Path could not be normalized; not matched.")
+		return false
 	}
 	for _, pathMatch := range paths {
-		switch pathMatch.GetPathMatch().(type) {
+		switch m := pathMatch.GetPathMatch().(type) {
 		case *proto.HTTPMatch_PathMatch_Exact:
-			if reqPath == pathMatch.GetExact() {
+			rulePath, ok := normalizeHTTPPath(m.Exact)
+			if !ok {
+				rlogBadRulePath.Warnf("HTTP Path exact rule could not be normalized; skipping: %s", m.Exact)
+				continue
+			}
+			if normalizedReq == rulePath {
 				log.Debug("HTTP Path exact matched.")
 				return true
 			}
 		case *proto.HTTPMatch_PathMatch_Prefix:
-			if strings.HasPrefix(reqPath, pathMatch.GetPrefix()) {
-				log.Debugf("HTTP Path prefix %s matched.", pathMatch.GetPrefix())
+			rulePrefix, ok := normalizeHTTPPath(m.Prefix)
+			if !ok {
+				rlogBadRulePath.Warnf("HTTP Path prefix rule could not be normalized; skipping: %s", m.Prefix)
+				continue
+			}
+			if segmentPrefixMatch(normalizedReq, rulePrefix) {
+				log.Debugf("HTTP Path prefix %s matched.", m.Prefix)
 				return true
 			}
 		}
@@ -261,95 +380,303 @@ func matchHTTPPaths(paths []*proto.HTTPMatch_PathMatch, reqPath string) bool {
 	return false
 }
 
-func matchSrcIPSets(r *proto.Rule, req *requestCache) bool {
-	log.WithFields(log.Fields{
-		"SrcIpSetIds":    r.SrcIpSetIds,
-		"NotSrcIpSetIds": r.NotSrcIpSetIds,
-	}).Debug("matching source IP sets")
-	addr := req.Request.GetAttributes().GetSource().GetAddress()
-	return matchIPSetsAll(r.SrcIpSetIds, req, addr) &&
-		matchIPSetsNotAny(r.NotSrcIpSetIds, req, addr)
+// reStillEncodedPathSensitive matches a surviving percent-encoding of a
+// path-sensitive character after one decode: "." (%2e), "/" (%2f) or "\"
+// (%5c), upper or lower case. Presence of these after a single decode
+// indicates a double-encoded payload that a double-decoding upstream
+// (e.g. Spring Security with setAllowUrlEncodedSlash, nginx with
+// merge_slashes=off, some WAF placements) would resolve differently
+// from the single-decode view we use for authorisation.
+var reStillEncodedPathSensitive = regexp.MustCompile(`(?i)%(2e|2f|5c)`)
+
+// normalizeHTTPPath applies RFC 3986 / RFC 7230 style normalisation to an HTTP
+// request-target so prefix and exact comparisons are resilient to
+// percent-encoded path separators, repeated slashes and "." / ".." segments.
+// It returns false when the input cannot be interpreted as an absolute path,
+// or when the decoded path contains shapes whose resolved form depends on
+// upstream-specific behaviour we cannot predict (surviving path-sensitive
+// escapes, null bytes). Callers treat "false" as a non-match rather than
+// falling back to raw byte comparison.
+func normalizeHTTPPath(p string) (string, bool) {
+	// Strip query and fragment — not part of the path.
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	// Percent-decode once. Upstream servers decode once before dispatch, so a
+	// single decode here gives the same view they act on. Double-decoding
+	// would over-authorise (e.g. %252e%252e would become "..").
+	decoded, err := url.PathUnescape(p)
+	if err != nil {
+		return "", false
+	}
+	// Reject still-encoded path-sensitive escapes. After a single decode any
+	// remaining %2e / %2f / %5c was originally double-encoded, which carries
+	// a second layer of traversal payload that a double-decoding upstream
+	// would resolve into a different path than the one we'd authorise here.
+	if reStillEncodedPathSensitive.MatchString(decoded) {
+		return "", false
+	}
+	// Reject null bytes. Some Java stacks and any C-string-aware upstream
+	// treat NUL as end-of-string, so "/admin\x00/../public" dispatches to
+	// "/admin"; the authorisation view diverges from what will be served.
+	if strings.IndexByte(decoded, 0) >= 0 {
+		return "", false
+	}
+	// Fold backslash to forward slash. "\" is not a valid HTTP path character
+	// per RFC 3986, but Windows / IIS backends accept it as a path separator,
+	// so an attacker could otherwise smuggle traversal past path.Clean using
+	// "\..\". Folding here aligns the authorisation view with the most
+	// permissive upstream interpretation.
+	if strings.ContainsRune(decoded, '\\') {
+		decoded = strings.ReplaceAll(decoded, "\\", "/")
+	}
+	if !strings.HasPrefix(decoded, "/") {
+		return "", false
+	}
+	// Strip matrix / path parameters per segment (JSR-339 / Servlet 3.0+).
+	// Tomcat, Jetty, Jersey, Spring MVC and Resin remove ";..." suffixes
+	// per segment before dispatch, so a request like "/public/..;x/admin"
+	// dispatches to "/admin" after the container resolves the now-visible
+	// "..". We strip matrix parameters before dot-segment resolution so the
+	// authorisation view matches.
+	if strings.IndexByte(decoded, ';') >= 0 {
+		decoded = stripMatrixParams(decoded)
+	}
+	// path.Clean collapses repeated slashes and resolves "." / ".." segments,
+	// and always returns a path rooted at "/" for inputs starting with "/".
+	// Trailing slashes are stripped, which is fine for matching: "/foo" and
+	// "/foo/" address the same resource for an authorisation decision.
+	return path.Clean(decoded), true
 }
 
+// stripMatrixParams removes ";..." matrix-parameter suffixes from every path
+// segment. Given "/a;x=1/b;y=2/c" it returns "/a/b/c". A leading segment of
+// ";foo" (no body before the semicolon) becomes empty; path.Clean will then
+// collapse it away during subsequent cleaning.
+func stripMatrixParams(p string) string {
+	var b strings.Builder
+	b.Grow(len(p))
+	for i := 0; i < len(p); {
+		j := strings.IndexByte(p[i:], '/')
+		var seg string
+		if j < 0 {
+			seg = p[i:]
+			i = len(p)
+		} else {
+			seg = p[i : i+j]
+			i += j + 1
+		}
+		if k := strings.IndexByte(seg, ';'); k >= 0 {
+			seg = seg[:k]
+		}
+		b.WriteString(seg)
+		if i <= len(p) && j >= 0 {
+			b.WriteByte('/')
+		}
+	}
+	return b.String()
+}
+
+// segmentPrefixMatch reports whether req equals prefix or extends it at a path
+// segment boundary. Both arguments are expected to have been passed through
+// normalizeHTTPPath already, so prefix does not end with a trailing slash
+// (except for the root "/").
+func segmentPrefixMatch(req, prefix string) bool {
+	if prefix == "/" {
+		return strings.HasPrefix(req, "/")
+	}
+	if req == prefix {
+		return true
+	}
+	return strings.HasPrefix(req, prefix+"/")
+}
+
+// matchSrcIPSets checks if the source IP is within the IP sets and not in the not IP sets. It
+// returns true if the IP sets match, false otherwise.
+func matchSrcIPSets(r *proto.Rule, req *requestCache) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"SrcIpSetIds":    r.SrcIpSetIds,
+			"NotSrcIpSetIds": r.NotSrcIpSetIds,
+		}).Debug("matching source IP sets")
+	}
+	if len(r.SrcIpSetIds) == 0 && len(r.NotSrcIpSetIds) == 0 {
+		return true
+	}
+	srcIP := req.getSrcIPStr()
+	return matchIPSetsAll(r.SrcIpSetIds, req.getIPSet, srcIP) &&
+		matchIPSetsNotAny(r.NotSrcIpSetIds, req.getIPSet, srcIP)
+}
+
+// matchDstIPPortSetIds checks if the destination IP, protocol and port is within the IP sets. It
+// returns true if the IP sets match, false otherwise. There is no notDstIPPortSetIds.
+func matchDstIPPortSetIds(r *proto.Rule, req *requestCache) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"DstIpPortSetIds": r.GetDstIpPortSetIds(),
+		}).Debug("matching destination IP port sets")
+	}
+	if len(r.GetDstIpPortSetIds()) == 0 {
+		return true
+	}
+	// The values compared against are of the form "ip,protocol:port".
+	return matchIPSetsAll(r.GetDstIpPortSetIds(), req.getIPSet, req.getDstIPProtoPortStr())
+}
+
+// matchDstIPSets checks if the destination IP is within the IP sets and not in the not IP sets. It
+// returns true if the IP sets match, false otherwise.
 func matchDstIPSets(r *proto.Rule, req *requestCache) bool {
-	log.WithFields(log.Fields{
-		"DstIpSetIds":    r.DstIpSetIds,
-		"NotDstIpSetIds": r.NotDstIpSetIds,
-	}).Debug("matching destination IP sets")
-	addr := req.Request.GetAttributes().GetDestination().GetAddress()
-	return matchIPSetsAll(r.DstIpSetIds, req, addr) &&
-		matchIPSetsNotAny(r.NotDstIpSetIds, req, addr)
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"DstIpSetIds":    r.GetDstIpSetIds(),
+			"NotDstIpSetIds": r.GetNotDstIpSetIds(),
+		}).Debug("matching destination IP sets")
+	}
+	if len(r.GetDstIpSetIds()) == 0 && len(r.GetNotDstIpSetIds()) == 0 {
+		return true
+	}
+	destIP := req.getDstIPStr()
+	return matchIPSetsAll(r.GetDstIpSetIds(), req.getIPSet, destIP) &&
+		matchIPSetsNotAny(r.GetNotDstIpSetIds(), req.getIPSet, destIP)
 }
 
 // matchIPSetsAll returns true if the address matches all of the IP set ids, false otherwise.
-func matchIPSetsAll(ids []string, req *requestCache, addr *core.Address) bool {
+// The value is either an IP address or an IP address protocol and port.
+func matchIPSetsAll(ids []string, ipsSetFunc func(string) policystore.IPSet, value string) bool {
 	for _, id := range ids {
-		s := req.GetIPSet(id)
-		if !s.ContainsAddress(addr) {
+		if s := ipsSetFunc(id); s != nil && !s.Contains(value) {
 			return false
 		}
 	}
 	return true
 }
 
-// matchIPSetsNotAny returns true if the address does not match any of the ipset ids, false otherwise.
-func matchIPSetsNotAny(ids []string, req *requestCache, addr *core.Address) bool {
+// matchIPSetsNotAny returns true if the address does not match any of the ipset ids, false
+// otherwise. The value is either an IP address or an IP address protocol and port.
+
+func matchIPSetsNotAny(ids []string, ipsSetFunc func(string) policystore.IPSet, value string) bool {
 	for _, id := range ids {
-		s := req.GetIPSet(id)
-		if s.ContainsAddress(addr) {
+		if s := ipsSetFunc(id); s != nil && s.Contains(value) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchPort(dir string, ranges []*proto.PortRange, namedPortSets []string, req *requestCache, addr *core.Address) bool {
-	log.WithFields(log.Fields{
-		"ranges":        ranges,
-		"namedPortSets": namedPortSets,
-		"addr":          addr,
-		"dir":           dir,
-	}).Debug("matching port")
+// matchDstPort checks if the destination port is within the port ranges and named port sets. It
+// also checks if the destination port is not within the not port ranges and named port sets.
+func matchDstPort(r *proto.Rule, req *requestCache) bool {
+	return matchPort("dst", r.GetDstPorts(), r.GetDstNamedPortIpSetIds(), req.getIPSet, req.GetDestPort(), req.getDstIPProtoPortStr) &&
+		matchNotPort("dst", r.GetNotDstPorts(), r.GetNotDstNamedPortIpSetIds(), req.getIPSet, req.GetDestPort(), req.getDstIPProtoPortStr)
+}
+
+// matchSrcPort checks if the source port is within the port ranges and named port sets. It also
+// checks if the source port is not within the not port ranges and named port sets.
+func matchSrcPort(r *proto.Rule, req *requestCache) bool {
+	return matchPort("src", r.GetSrcPorts(), r.GetSrcNamedPortIpSetIds(), req.getIPSet, req.GetSourcePort(), req.getSrcIPProtoPortStr) &&
+		matchNotPort("src", r.GetNotSrcPorts(), r.GetNotSrcNamedPortIpSetIds(), req.getIPSet, req.GetSourcePort(), req.getSrcIPProtoPortStr)
+}
+
+// matchPort checks if the port is within the port ranges and named port sets. It returns true if
+// the port matches, false otherwise.
+//
+// A named port set holds "<IP>,<protocol>:<port>" members, not bare port numbers: it names a
+// port on a specific set of endpoints. namedPortKey supplies that key for the leg being tested,
+// which is what the other dataplanes match such a set on.
+func matchPort(dir string, ranges []*proto.PortRange, namedPortSets []string, ipsSetFunc func(string) policystore.IPSet, port int, namedPortKey func() string) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"ranges":        ranges,
+			"namedPortSets": namedPortSets,
+			"port":          port,
+			"dir":           dir,
+		}).Debug("matching port")
+	}
 	if len(ranges) == 0 && len(namedPortSets) == 0 {
 		return true
 	}
-	p := int32(addr.GetSocketAddress().GetPortValue())
+	p := int32(port)
 	for _, r := range ranges {
 		if r.GetFirst() <= p && p <= r.GetLast() {
 			return true
 		}
 	}
+	if len(namedPortSets) == 0 {
+		return false
+	}
+	key := namedPortKey()
 	for _, id := range namedPortSets {
-		s := req.GetIPSet(id)
-		if s.ContainsAddress(addr) {
+		if s := ipsSetFunc(id); s != nil && s.Contains(key) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchNet(dir string, nets []string, addr *core.Address) bool {
-	log.WithFields(log.Fields{
-		"nets": nets,
-		"addr": addr,
-		"dir":  dir,
-	}).Debug("matching net")
+// matchNotPort checks if the port is not within the port ranges and named port sets. It returns
+// true if the port matches, false otherwise. See matchPort for how named port sets are keyed.
+func matchNotPort(dir string, ranges []*proto.PortRange, namedPortSets []string, ipsSetFunc func(string) policystore.IPSet, port int, namedPortKey func() string) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"ranges":        ranges,
+			"namedPortSets": namedPortSets,
+			"port":          port,
+			"dir":           dir,
+		}).Debug("matching port")
+	}
+	if len(ranges) == 0 && len(namedPortSets) == 0 {
+		return true
+	}
+	p := int32(port)
+	for _, r := range ranges {
+		if r.GetFirst() <= p && p <= r.GetLast() {
+			return false
+		}
+	}
+	if len(namedPortSets) == 0 {
+		return true
+	}
+	key := namedPortKey()
+	for _, id := range namedPortSets {
+		if s := ipsSetFunc(id); s != nil && s.Contains(key) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchDstNet checks if the destination IP is within the CIDRs and not in the not CIDRs.
+func matchDstNet(rule *proto.Rule, req *requestCache) bool {
+	return matchNet("dst", rule.GetDstNet(), req.GetDestIP()) &&
+		matchNotNet("dst", rule.GetNotDstNet(), req.GetDestIP())
+}
+
+// matchSrcNet checks if the source IP is within the CIDRs and not in the not CIDRs.
+func matchSrcNet(rule *proto.Rule, req *requestCache) bool {
+	return matchNet("src", rule.GetSrcNet(), req.GetSourceIP()) &&
+		matchNotNet("src", rule.GetNotSrcNet(), req.GetSourceIP())
+}
+
+// matchNet checks if the IP is within the CIDRs. It returns true if the IP matches, false
+// otherwise.
+func matchNet(dir string, nets []string, ip net.IP) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"nets": nets,
+			"ip":   ip.String(),
+			"dir":  dir,
+		}).Debug("matching net")
+	}
 	if len(nets) == 0 {
 		return true
 	}
-	ip := net.ParseIP(addr.GetSocketAddress().GetAddress())
-	if ip == nil {
-		// Envoy should not send us malformed IP addresses, but its possible we could get requests from non-IP
-		// connections, like Pipes.
-		log.WithField("ip", addr.GetSocketAddress().GetAddress()).Warn("unable to parse IP")
-		return false
-	}
+
 	for _, n := range nets {
 		_, ipn, err := net.ParseCIDR(n)
 		if err != nil {
-			// Don't match CIDRs if they are malformed. This case should generally be weeded out by validation earlier
-			// in processing before it gets to Dikastes.
-			log.WithField("cidr", n).Warn("unable to parse CIDR")
+			// Don't match CIDRs if they are malformed. This case should generally be weeded out by
+			// validation earlier in processing before it gets to Dikastes.
+			rlogBadCIDR.Warnf("unable to parse CIDR %s", n)
 			return false
 		}
 		if ipn.Contains(ip) {
@@ -359,39 +686,84 @@ func matchNet(dir string, nets []string, addr *core.Address) bool {
 	return false
 }
 
-func matchL4Protocol(rule *proto.Rule, dest *authz.AttributeContext_Peer) bool {
-	// Extract L4 protocol type of socket address for destination peer context. Match against rules.
-	if dest == nil {
-		log.Warn("Matching L4 protocol. nil request destination peer.")
-		return false
+// matchNotNet checks if the IP is not within the CIDRs. It returns false if the IP matches, true
+// otherwise.
+func matchNotNet(dir string, nets []string, ip net.IP) bool {
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"nets": nets,
+			"ip":   ip.String(),
+			"dir":  dir,
+		}).Debug("matching net")
+	}
+	if len(nets) == 0 {
+		return true
 	}
 
-	// Default protocol is TCP. Convert to lowercase.
-	reqProtocol := strings.ToLower(dest.GetAddress().GetSocketAddress().GetProtocol().String())
-	log.WithFields(log.Fields{
-		"isProtocol":      rule.GetProtocol(),
-		"isNotProtocol":   rule.NotProtocol,
-		"requestProtocol": reqProtocol,
-	}).Debug("Matching L4 protocol")
+	for _, n := range nets {
+		_, ipn, err := net.ParseCIDR(n)
+		if err != nil {
+			// Don't match CIDRs if they are malformed. This case should generally be weeded out by
+			// validation earlier in processing before it gets to Dikastes.
+			rlogBadCIDR.Warnf("unable to parse CIDR %s", n)
+			return false
+		}
+		if ipn.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
 
-	checkStringInRuleProtocol := func(p *proto.Protocol, s string, defaultResult bool) bool {
+var stringToProto = map[string]int{
+	"icmp":    1,
+	"icmpv6":  58,
+	"tcp":     6,
+	"udp":     17,
+	"udplite": 136,
+	"sctp":    132,
+}
+
+// validL4Protocol reports whether the flow's protocol is one the data plane could
+// have observed. Protocol is an 8-bit field, and 0 is unassigned.
+func validL4Protocol(protocol int) bool {
+	return protocol >= 1 && protocol <= 255
+}
+
+// matchL4Protocol checks if the L4 protocol matches the rule. It returns true if the protocol
+// matches, false otherwise. requestCache.GetProtocol warns about an out-of-range protocol.
+func matchL4Protocol(rule *proto.Rule, protocol int) bool {
+	if !validL4Protocol(protocol) {
+		return false
+	}
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"isProtocol":      rule.GetProtocol(),
+			"isNotProtocol":   rule.GetNotProtocol(),
+			"requestProtocol": protocol,
+		}).Debug("Matching L4 protocol")
+	}
+
+	checkStringInRuleProtocol := func(p *proto.Protocol, pNumber int, defaultResult bool) bool {
 		if p == nil {
 			return defaultResult
 		}
 
-		// Check if given protocol string matches what is specified in rule.
-		// Note we compare names in lowercase.
+		// Check if given protocol matches what is specified in rule.
+		var protoNumber int
 		if name := p.GetName(); name != "" {
-			return strings.ToLower(name) == s
+			var ok bool
+			protoNumber, ok = stringToProto[strings.ToLower(name)]
+			if !ok {
+				return false
+			}
+		} else {
+			// Widening the rule's protobuf int32, so no value is lost.
+			protoNumber = int(p.GetNumber())
 		}
-
-		if name, ok := protocolMapL4[p.GetNumber()]; ok {
-			return name == s
-		}
-
-		return false
+		return protoNumber == pNumber
 	}
 
-	return checkStringInRuleProtocol(rule.GetProtocol(), reqProtocol, true) &&
-		!checkStringInRuleProtocol(rule.GetNotProtocol(), reqProtocol, false)
+	return checkStringInRuleProtocol(rule.GetProtocol(), protocol, true) &&
+		!checkStringInRuleProtocol(rule.GetNotProtocol(), protocol, false)
 }

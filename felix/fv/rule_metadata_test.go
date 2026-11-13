@@ -12,39 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
-	"math/rand"
+	cryptorand "crypto/rand"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/connectivity"
-	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 )
 
-var _ = Describe("Rule Metadata tests", func() {
-
+var _ = infrastructure.DatastoreDescribe("Rule Metadata tests", []apiconfig.DatastoreType{apiconfig.EtcdV3}, func(getInfra infrastructure.InfraFactory) {
 	var (
 		tc     infrastructure.TopologyContainers
 		client client.Interface
 		infra  infrastructure.DatastoreInfra
-		etcd   *containers.Container
 		wl0    *workload.Workload
 		wl1    *workload.Workload
 	)
 
 	BeforeEach(func() {
-		tc, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(infrastructure.DefaultTopologyOptions())
+		infra = getInfra()
+		tc, client = infrastructure.StartSingleNodeTopology(infrastructure.DefaultTopologyOptions(), infra)
 
 		wl0 = workload.Run(tc.Felixes[0], "test0", "default", "10.65.0.1", "80", "tcp")
 		wl0.Configure(client)
@@ -53,16 +49,7 @@ var _ = Describe("Rule Metadata tests", func() {
 		wl1.Configure(client)
 	})
 
-	AfterEach(func() {
-		wl0.Stop()
-		wl1.Stop()
-		tc.Stop()
-		etcd.Stop()
-		infra.Stop()
-	})
-
 	Context("With a GlobalNetworkPolicy with rule metadata", func() {
-
 		var gnp *api.GlobalNetworkPolicy
 
 		BeforeEach(func() {
@@ -77,13 +64,16 @@ var _ = Describe("Rule Metadata tests", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should add comments to iptables", func() {
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=gnp\""))
+		It("should add comments to the dataplane", func() {
+			if NFTMode() {
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("fvtest=gnp"))
+			} else {
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=gnp\""))
+			}
 		})
 	})
 
 	Context("With a Profile with rule metadata", func() {
-
 		var p *api.Profile
 
 		BeforeEach(func() {
@@ -97,13 +87,16 @@ var _ = Describe("Rule Metadata tests", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should add comments to iptables", func() {
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=profile\""))
+		It("should add comments to the dataplane", func() {
+			if NFTMode() {
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("fvtest=profile"))
+			} else {
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=profile\""))
+			}
 		})
 	})
 
 	Context("With a NetworkPolicy with rule metadata", func() {
-
 		var np *api.NetworkPolicy
 
 		BeforeEach(func() {
@@ -120,19 +113,21 @@ var _ = Describe("Rule Metadata tests", func() {
 		})
 
 		It("should add comments to iptables", func() {
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=networkpolicy\""))
+			if NFTMode() {
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("fvtest=networkpolicy"))
+			} else {
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"fvtest=networkpolicy\""))
+			}
 		})
-
 	})
 
 	Context("With a Profile with rule metadata including newlines and unicode", func() {
-
 		var p *api.Profile
 
 		BeforeEach(func() {
 			// build some random bytes to try to break annotation processing
 			rv := make([]byte, 200)
-			_, err := rand.Read(rv)
+			_, err := cryptorand.Read(rv)
 			Expect(err).ToNot(HaveOccurred())
 			// the profile should allow the workloads to communicate
 			p = api.NewProfile()
@@ -145,7 +140,8 @@ var _ = Describe("Rule Metadata tests", func() {
 				Action: api.Allow,
 				Metadata: &api.RuleMetadata{Annotations: map[string]string{
 					"hometown": "Småland",
-					"random":   string(rv)}},
+					"random":   string(rv),
+				}},
 			}}
 			_, err = client.Profiles().Create(utils.Ctx, p, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())
@@ -153,9 +149,15 @@ var _ = Describe("Rule Metadata tests", func() {
 
 		It("should add comments to iptables", func() {
 			// Felix replaces anything other than "safe" shell characters with _
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"foo=hello_world\""))
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"hometown=Sm_land\""))
-			Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"random="))
+			if NFTMode() {
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("foo=hello_world"))
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("hometown=Sm_land"))
+				Eventually(getNFTables(tc.Felixes[0])).Should(ContainSubstring("random="))
+			} else {
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"foo=hello_world\""))
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"hometown=Sm_land\""))
+				Eventually(getIPTables(tc.Felixes[0].Name)).Should(ContainSubstring("-m comment --comment \"random="))
+			}
 		})
 
 		// This test case verifies that "interesting" annotations like newlines and unicode don't break
@@ -175,6 +177,14 @@ func getIPTables(name string) func() string {
 	return func() string {
 		cmd := utils.Command("docker", "exec", name, "iptables-save", "-c")
 		out, err := cmd.Output()
+		Expect(err).ToNot(HaveOccurred())
+		return string(out)
+	}
+}
+
+func getNFTables(f *infrastructure.Felix) func() string {
+	return func() string {
+		out, err := f.ExecOutput("nft", "list", "table", "ip", "calico")
 		Expect(err).ToNot(HaveOccurred())
 		return string(out)
 	}

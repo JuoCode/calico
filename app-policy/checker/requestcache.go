@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,28 +16,91 @@ package checker
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"sync"
 
-	authz "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/projectcalico/calico/app-policy/policystore"
-	"github.com/projectcalico/calico/app-policy/proto"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
+	log "github.com/projectcalico/calico/lib/std/log"
 )
 
-// requestCache contains the CheckRequest and cached copies of computed information about the request
+const SPIFFEIDPattern = "^spiffe://[^/]+/ns/([^/]+)/sa/([^/]+)$"
+
+// Levels the two aggregated conditions report at. Named so the tests build their stand-in
+// loggers from the same values rather than restating them, which would let the two drift.
+const (
+	missingIPSetsLevel         = log.LevelWarn
+	unparseablePrincipalsLevel = log.LevelError
+)
+
+var (
+	protocolMap = map[string]int{
+		"icmp": 1,
+		"tcp":  6,
+		"udp":  17,
+	}
+
+	spiffeIdRegExp     *regexp.Regexp
+	spiffeIdRegExpOnce = sync.Once{}
+
+	// A principal we cannot parse would otherwise log once for every flow it sources. Aggregating on
+	// the principal loses nothing: parseSpiffeID's only failure names the principal and the pattern
+	// it did not match, and that pattern is a constant.
+	unparseablePrincipals = log.NewAggregatingLogger("failed to parse principal", "principals",
+		log.OptLevel(unparseablePrincipalsLevel))
+
+	// A missing IP set is looked up once per rule that references it, for every flow the policy
+	// applies to, so one bad reference logs at flow rate. Aggregate rather than plain rate-limit so
+	// that the one line per window names every set that went missing, not just whichever one
+	// happened to trip the timer - with several missing at once that is the difference between
+	// seeing one stale reference and seeing that a whole sync is behind.
+	missingIPSets = log.NewAggregatingLogger("IPSet not found", "ipsets",
+		log.OptLevel(missingIPSetsLevel))
+)
+
 type requestCache struct {
-	Request              *authz.CheckRequest
-	store                *policystore.PolicyStore
-	source               *peer
-	destination          *peer
-	sourceNamespace      *namespace
-	destinationNamespace *namespace
+	Flow
+	store *policystore.PolicyStore
+
+	// Memoized string forms of per-flow values. The match functions need these for
+	// every rule that carries an IP set reference; recomputing them per rule dominates
+	// allocation when many policies apply to an endpoint.
+	srcIPStr       string
+	dstIPStr       string
+	srcIPProtoPort string
+	dstIPProtoPort string
+
+	// Memoized identity, indexed by flowSide. Resolving it parses a SPIFFE ID and copies
+	// two label maps, and the match functions ask for it once per rule.
+	identities [numFlowSides]identity
+
+	// Memoized L4 protocol. The Envoy adapter derives it from an enum name via a
+	// lowercase and a map lookup, and match() asks for it once per rule. Protocol 0
+	// is a value the data plane can send, so resolution needs its own flag.
+	protocol         int
+	protocolResolved bool
 }
 
-// peer is derived from the request Service Account and any label information we have about the account
-// in the PolicyStore
+// flowSide identifies which end of the flow an identity belongs to.
+type flowSide int
+
+const (
+	sourceSide flowSide = iota
+	destSide
+	numFlowSides
+)
+
+// identity is the resolved peer and namespace for one side of the flow. A nil peer means
+// the side carries no principal, or one that could not be parsed; both cases match any
+// rule, because Dikastes falls back on IP addresses for plain-text requests.
+type identity struct {
+	peer      *peer
+	namespace *namespace
+	resolved  bool
+}
+
 type peer struct {
 	Name      string
 	Namespace string
@@ -49,126 +112,168 @@ type namespace struct {
 	Labels map[string]string
 }
 
-// SPIFFE_ID_PATTERN is a regular expression to match SPIFFE ID URIs, e.g. spiffe://cluster.local/ns/default/sa/foo
-const SPIFFE_ID_PATTERN = "^spiffe://[^/]+/ns/([^/]+)/sa/([^/]+)$"
-
-var spiffeIdRegExp *regexp.Regexp
-var spiffeIdRegExpOnce = sync.Once{}
-
-func NewRequestCache(store *policystore.PolicyStore, req *authz.CheckRequest) (*requestCache, error) {
-	r := &requestCache{Request: req, store: store}
-	err := r.initPeers()
-	if err != nil {
-		return nil, err
+func NewRequestCache(store *policystore.PolicyStore, request Flow) *requestCache {
+	return &requestCache{
+		Flow:  request,
+		store: store,
 	}
-	return r, nil
 }
 
-// SourcePeer returns the cached source peer.
-func (r *requestCache) SourcePeer() peer {
-	return *r.source
+// getSrcPeer returns the source peer.
+func (r *requestCache) getSrcPeer() *peer {
+	return r.getIdentity(sourceSide).peer
 }
 
-// DestinationPeer returns the cached destination peer.
-func (r *requestCache) DestinationPeer() peer {
-	return *r.destination
+// getDstPeer returns the destination peer.
+func (r *requestCache) getDstPeer() *peer {
+	return r.getIdentity(destSide).peer
 }
 
-func (r *requestCache) SourceNamespace() namespace {
-	if r.sourceNamespace != nil {
-		return *r.sourceNamespace
-	}
-	src := r.initNamespace(r.source.Namespace)
-	r.sourceNamespace = src
-	return *src
+// getSrcNamespace returns the namespace of the source peer.
+func (r *requestCache) getSrcNamespace() *namespace {
+	return r.getIdentity(sourceSide).namespace
 }
 
-func (r *requestCache) DestinationNamespace() namespace {
-	if r.destinationNamespace != nil {
-		return *r.destinationNamespace
-	}
-	dst := r.initNamespace(r.destination.Namespace)
-	r.destinationNamespace = dst
-	return *dst
+// getDstNamespace returns the namespace of the destination peer.
+func (r *requestCache) getDstNamespace() *namespace {
+	return r.getIdentity(destSide).namespace
 }
 
-// initPeers initializes the source and destination peers.
-func (r *requestCache) initPeers() error {
-	src, err := r.initPeer(r.Request.GetAttributes().GetSource())
-	if err != nil {
-		return err
+// getIdentity returns the peer and namespace for one side of the flow, resolving them from
+// the request and the store on first use and memoizing the result for the rest of the
+// request.
+func (r *requestCache) getIdentity(side flowSide) identity {
+	id := &r.identities[side]
+	if id.resolved {
+		return *id
 	}
-	r.source = src
-	dst, err := r.initPeer(r.Request.GetAttributes().GetDestination())
-	if err != nil {
-		return err
+	id.resolved = true
+
+	principal, labels := r.GetSourcePrincipal(), r.GetSourceLabels()
+	if side == destSide {
+		principal, labels = r.GetDestPrincipal(), r.GetDestLabels()
 	}
-	r.destination = dst
-	return nil
+	if principal == nil {
+		return *id
+	}
+	if id.peer = r.initPeer(*principal, labels); id.peer != nil {
+		id.namespace = r.initNamespace(id.peer.Namespace)
+	}
+	return *id
 }
 
-func (r *requestCache) initPeer(aPeer *authz.AttributeContext_Peer) (*peer, error) {
-	peer, err := parseSpiffeID(aPeer.GetPrincipal())
-	if err != nil {
-		return nil, err
+// getSrcIPStr returns the source IP in string form, memoized across the request.
+func (r *requestCache) getSrcIPStr() string {
+	if r.srcIPStr == "" {
+		r.srcIPStr = r.GetSourceIP().String()
 	}
-	// Copy any labels from the request.
-	peer.Labels = make(map[string]string)
-	for k, v := range aPeer.GetLabels() {
-		peer.Labels[k] = v
-	}
+	return r.srcIPStr
+}
 
-	// If the service account is in the store, copy labels over.
-	id := proto.ServiceAccountID{Name: peer.Name, Namespace: peer.Namespace}
-	msg, ok := r.store.ServiceAccountByID[id]
-	if ok {
-		for k, v := range msg.GetLabels() {
-			peer.Labels[k] = v
+// getDstIPStr returns the destination IP in string form, memoized across the request.
+func (r *requestCache) getDstIPStr() string {
+	if r.dstIPStr == "" {
+		r.dstIPStr = r.GetDestIP().String()
+	}
+	return r.dstIPStr
+}
+
+// getSrcIPProtoPortStr returns the source "<IP>,<protocol>:<port>" key used for
+// IP+port set matching, memoized across the request.
+func (r *requestCache) getSrcIPProtoPortStr() string {
+	if r.srcIPProtoPort == "" {
+		r.srcIPProtoPort = ipProtoPortKey(r.getSrcIPStr(), r.GetProtocol(), r.GetSourcePort())
+	}
+	return r.srcIPProtoPort
+}
+
+// GetProtocol shadows the embedded Flow's method to memoize the protocol across the
+// request. Callers need not know: it returns what the Flow would have returned.
+func (r *requestCache) GetProtocol() int {
+	if !r.protocolResolved {
+		r.protocol = r.Flow.GetProtocol()
+		r.protocolResolved = true
+		if !validL4Protocol(r.protocol) {
+			// Warn here rather than in matchL4Protocol: an out-of-range protocol
+			// rejects every rule, so the check runs once per rule and even a
+			// suppressed rate-limited log takes the logger's lock.
+			rlogBadProtocol.Warnf("Unsupported L4 protocol: %d", r.protocol)
 		}
 	}
-	return &peer, nil
+	return r.protocol
 }
 
-func (r *requestCache) initNamespace(name string) *namespace {
-	ns := &namespace{Name: name}
-	// If the namespace is in the store, copy labels over.
-	id := proto.NamespaceID{Name: name}
-	msg, ok := r.store.NamespaceByID[id]
-	if ok {
-		ns.Labels = make(map[string]string)
-		for k, v := range msg.GetLabels() {
-			ns.Labels[k] = v
-		}
+// getDstIPProtoPortStr returns the destination "<IP>,<protocol>:<port>" key used for
+// IP+port set matching, memoized across the request.
+func (r *requestCache) getDstIPProtoPortStr() string {
+	if r.dstIPProtoPort == "" {
+		r.dstIPProtoPort = ipProtoPortKey(r.getDstIPStr(), r.GetProtocol(), r.GetDestPort())
 	}
-	return ns
+	return r.dstIPProtoPort
 }
 
-// GetIPSet returns the given IPSet from the store.
-func (r *requestCache) GetIPSet(ipset string) policystore.IPSet {
-	s, ok := r.store.IPSetByID[ipset]
+// ipProtoPortKey builds the member format Felix uses for IP+port IP sets, e.g.
+// "10.0.0.1,tcp:8080". An unnamed protocol leaves that field empty, which no
+// member can equal, so the lookup just misses.
+func ipProtoPortKey(ipStr string, protocol, port int) string {
+	return fmt.Sprintf("%s,%s:%d", ipStr, protocolMapL4[protocol], port)
+}
+
+// getIPSet returns the IPSet with the given ID.
+func (r *requestCache) getIPSet(id string) policystore.IPSet {
+	s, ok := r.store.IPSetByID[id]
 	if !ok {
-		log.WithField("ipset", ipset).Panic("could not find IP set")
+		missingIPSets.Record(id)
+		return nil
 	}
 	return s
 }
 
-// parseSpiffeId parses an Istio SPIFFE ID and extracts the service account name and namespace.
-func parseSpiffeID(id string) (peer peer, err error) {
-	if id == "" {
-		log.Debug("empty spiffe/plain text request.")
-		// Assume this is plain text.
-		return peer, nil
+// initNamespace initializes a namespace from the store.
+func (r *requestCache) initNamespace(name string) *namespace {
+	ns := &namespace{Name: name}
+	id := proto.NamespaceID{Name: name}
+	msg, ok := r.store.NamespaceByID[types.ProtoToNamespaceID(&id)]
+	if ok {
+		ns.Labels = make(map[string]string)
+		maps.Copy(ns.Labels, msg.GetLabels())
 	}
-	// Init the regexp the first time this is called, and store it in the package namespace.
+	return ns
+}
+
+// initPeer initializes the peer from the request. It first tries to parse the principal as a
+// SPIFFE ID. If that fails, it falls back to plain text.
+func (r *requestCache) initPeer(principal string, labels map[string]string) *peer {
+	peer, err := parseSpiffeID(principal)
+	if err != nil {
+		unparseablePrincipals.Record(principal)
+		return nil
+	}
+	peer.Labels = make(map[string]string)
+	maps.Copy(peer.Labels, labels)
+	id := proto.ServiceAccountID{Name: peer.Name, Namespace: peer.Namespace}
+	msg, ok := r.store.ServiceAccountByID[types.ProtoToServiceAccountID(&id)]
+	if ok {
+		maps.Copy(peer.Labels, msg.GetLabels())
+	}
+	return &peer
+}
+
+// parseSpiffeID parses a SPIFFE ID into a peer struct.
+func parseSpiffeID(id string) (p peer, err error) {
+	if id == "" {
+		log.Debug("empty spiffe/plain text request")
+		return p, nil
+	}
 	spiffeIdRegExpOnce.Do(func() {
-		spiffeIdRegExp, _ = regexp.Compile(SPIFFE_ID_PATTERN)
+		spiffeIdRegExp, _ = regexp.Compile(SPIFFEIDPattern)
 	})
 	match := spiffeIdRegExp.FindStringSubmatch(id)
 	if match == nil {
-		err = fmt.Errorf("expected match %s, got %s", SPIFFE_ID_PATTERN, id)
+		err = fmt.Errorf("expected match %s, got %s", SPIFFEIDPattern, id)
 	} else {
-		peer.Name = match[2]
-		peer.Namespace = match[1]
+		p.Name = match[2]
+		p.Namespace = match[1]
 	}
 	return
 }

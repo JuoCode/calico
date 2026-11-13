@@ -35,20 +35,53 @@ func SetMapSize(size int) {
 const (
 	KeySize    = 4
 	ValueSize  = 4 + 16 + 3*4 + 3*4 + 2*4
-	MaxEntries = 1000
+	MaxEntries = 1000 // must be the same as IFACE_STATE_MAP_SIZE in ifstate.h
 )
 
 const (
-	FlgWEP       = uint32(0x1)
-	FlgIPv4Ready = uint32(0x2)
-	FlgIPv6Ready = uint32(0x4)
-	FlgMax       = uint32(0x7)
+	FlgWEP        = uint32(0x1)
+	FlgIPv4Ready  = uint32(0x2)
+	FlgIPv6Ready  = uint32(0x4)
+	FlgHEP        = uint32(0x8)
+	FlgBond       = uint32(0x10)
+	FlgBondSlave  = uint32(0x20)
+	FlgVxlan      = uint32(0x40)
+	FlgIPIP       = uint32(0x80)
+	FlgWireguard  = uint32(0x100)
+	FlgL3         = uint32(0x200)
+	FlgNotManaged = uint32(0x400)
+	FlgMax        = uint32(0x7ff)
 )
 
 var flagsToStr = map[uint32]string{
-	FlgWEP:       "workload",
-	FlgIPv4Ready: "v4Ready",
-	FlgIPv6Ready: "v6Ready",
+	FlgWEP:        "workload",
+	FlgIPv4Ready:  "v4Ready",
+	FlgIPv6Ready:  "v6Ready",
+	FlgHEP:        "host",
+	FlgBond:       "bond",
+	FlgBondSlave:  "bondslave",
+	FlgVxlan:      "vxlan",
+	FlgIPIP:       "ipip",
+	FlgWireguard:  "wg",
+	FlgL3:         "l3",
+	FlgNotManaged: "notmanaged",
+}
+
+// FlagNames returns the human-readable names for the set bits in flags.
+// When no flags are set, returns ["host"] to match Value.String() semantics.
+func FlagNames(flags uint32) []string {
+	if flags == 0 {
+		return []string{"host"}
+	}
+	var names []string
+	for k := FlgWEP; k <= FlgMax; k *= 2 {
+		if flags&k != 0 {
+			if name, ok := flagsToStr[k]; ok {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
 }
 
 var MapParams = maps.MapParameters{

@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync"
 
-	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -32,15 +32,15 @@ func NewNodeCounter(sink api.SyncerCallbacks) *NodeCounter {
 
 type NodeCounter struct {
 	sync.Mutex
-	sink    api.SyncerCallbacks
-	inSync  bool
-	nodeMap map[string]bool
+	sink                 api.SyncerCallbacks
+	initialSyncCompleted bool
+	nodeMap              map[string]bool
 }
 
 func (c *NodeCounter) OnStatusUpdated(status api.SyncStatus) {
 	if status == api.InSync {
 		c.Lock()
-		c.inSync = true
+		c.initialSyncCompleted = true
 		c.Unlock()
 	}
 	c.sink.OnStatusUpdated(status)
@@ -50,7 +50,7 @@ func (c *NodeCounter) OnUpdates(updates []api.Update) {
 	for _, update := range updates {
 		switch k := update.Key.(type) {
 		case model.ResourceKey:
-			if k.Kind == v3.KindNode {
+			if k.Kind == internalapi.KindNode {
 				name := k.Name
 				switch update.UpdateType {
 				case api.UpdateTypeKVNew:
@@ -67,8 +67,8 @@ func (c *NodeCounter) OnUpdates(updates []api.Update) {
 func (c *NodeCounter) GetNumNodes() (int, error) {
 	c.Lock()
 	defer c.Unlock()
-	if !c.inSync {
-		return 0, fmt.Errorf("Node counter not yet in sync")
+	if !c.initialSyncCompleted {
+		return 0, fmt.Errorf("node counter not yet in sync")
 	}
 	return len(c.nodeMap), nil
 }

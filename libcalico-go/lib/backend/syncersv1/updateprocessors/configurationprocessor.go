@@ -26,7 +26,6 @@ import (
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
 const (
@@ -66,7 +65,13 @@ func NewConfigUpdateProcessor(
 ) watchersyncer.SyncerUpdateProcessor {
 	names := make(map[string]struct{}, specType.NumField())
 	for i := 0; i < specType.NumField(); i++ {
-		names[getConfigName(specType.Field(i))] = struct{}{}
+		name := getConfigName(specType.Field(i))
+		if name == "-" {
+			// Fields tagged with confignamev1:"-" are not config parameters
+			// (e.g. NodeSelector) and should be skipped.
+			continue
+		}
+		names[name] = struct{}{}
 	}
 	return &configUpdateProcessor{
 		specType:          specType,
@@ -86,12 +91,19 @@ type NodeConfigKeyFn func(node, name string) model.Key
 type GlobalConfigKeyFn func(name string) model.Key
 
 // Convert an arbitrary value to the value used in the v1 model.
-type ConfigFieldValueToV1ModelValue func(value interface{}) interface{}
+type ConfigFieldValueToV1ModelValue func(value any) any
 
 var (
 	globalConfigName        = "default"
 	perNodeConfigNamePrefix = "node."
 	annotationConfigPrefix  = "config.projectcalico.org/"
+
+	// selectorScopedSentinel is returned by extractNode when the resource
+	// is a selector-scoped FelixConfiguration (name is not "default" and
+	// does not start with "node."). These resources are handled directly
+	// by the ConfigBatcher via the raw v3 resource, not through the v1
+	// config key decomposition path.
+	selectorScopedSentinel = "\x00selector-scoped"
 )
 
 // configUpdateProcessor implements the SyncerUpdateProcessor interface for converting
@@ -138,6 +150,12 @@ func (c *configUpdateProcessor) processDeleted(kvp *model.KVPair) ([]*model.KVPa
 		return nil, err
 	}
 
+	// Selector-scoped resources are passed through with their original ResourceKey
+	// so the ConfigBatcher can handle them directly.
+	if node == selectorScopedSentinel {
+		return []*model.KVPair{kvp}, nil
+	}
+
 	kvps := make([]*model.KVPair, len(c.names)+len(c.additionalNames))
 	i := 0
 	for name := range c.names {
@@ -164,6 +182,12 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 		return nil, err
 	}
 
+	// Selector-scoped resources are passed through with their original ResourceKey
+	// so the ConfigBatcher can handle them directly.
+	if node == selectorScopedSentinel {
+		return []*model.KVPair{kvp}, nil
+	}
+
 	// Extract the config override annotations from the Metadata.  This in turn will validate that
 	// it is a resource in the value.
 	overrides, err := c.extractAnnotations(kvp)
@@ -183,10 +207,14 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 
 	// Create a KVP for each field in the Spec struct.
 	var kvps []*model.KVPair
-	numFields := len(c.names)
-	for i := 0; i < numFields; i++ {
+	numFields := c.specType.NumField()
+	for i := range numFields {
 		fieldInfo := c.specType.Field(i)
 		name := getConfigName(fieldInfo)
+		if name == "-" {
+			// Skip fields that are not config parameters (e.g. NodeSelector).
+			continue
+		}
 
 		key := c.createV1Key(node, name)
 		if key == nil {
@@ -208,9 +236,9 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 
 		// Extract the field value and dereference pointers, storing a nil value if the pointer is nil
 		// or if it's a zero length string.
-		var value interface{}
+		var value any
 		field := specValue.Field(i)
-		if field.Kind() == reflect.Ptr {
+		if field.Kind() == reflect.Pointer {
 			if !field.IsNil() {
 				value = field.Elem().Interface()
 			}
@@ -245,11 +273,11 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 					value = strings.Join(vt, ",")
 				case map[string]string:
 					// Make it a comma separate list of key value pairs
-					var kvp string
+					var kvp strings.Builder
 					for k, v := range vt {
-						kvp += k + "=" + v + ","
+						kvp.WriteString(k + "=" + v + ",")
 					}
-					value = kvp
+					value = kvp.String()
 				default:
 					value = fmt.Sprintf("%v", vt)
 				}
@@ -268,7 +296,7 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 	// on previous requests.  This ensures we send deletes for them in case our previous
 	// settings had it set.  The WatcherSyncer handles gracefully multiple deletes for
 	// the same key, so it doesn't matter if it wasn't previously set.
-	var value interface{}
+	var value any
 	for name := range c.additionalNames {
 		// If we have an override for this additional config option then use that value,
 		// otherwise leave the value as nil to ensure we delete the option if it was
@@ -330,12 +358,16 @@ func (c *configUpdateProcessor) extractAnnotations(kvp *model.KVPair) (map[strin
 	return overrides, nil
 }
 
-// extractNode returns the name of the Node for which this configuration is for.  A empty string
+// extractNode returns the name of the Node for which this configuration is for.  An empty string
 // indicates that this is global configuration.
 //
-// Currently the name of a configuration resource has a strict format.  It is either "default"
-// for the global default values, or "node.<nodename>" for the node specific vales.  Returns an
-// error if the name is in neither format.
+// The name of a configuration resource has the following formats:
+// - "default" for the global default values (returns "")
+// - "node.<nodename>" for the node specific values (returns "<nodename>")
+// - any other name for selector-scoped configuration (returns selectorScopedSentinel)
+//
+// Selector-scoped resources are not decomposed into individual config keys by the
+// configUpdateProcessor; they are handled separately by the ConfigBatcher.
 func (c *configUpdateProcessor) extractNode(key model.Key) (string, error) {
 	k, ok := key.(model.ResourceKey)
 	if !ok {
@@ -347,7 +379,9 @@ func (c *configUpdateProcessor) extractNode(key model.Key) (string, error) {
 	case strings.HasPrefix(k.Name, perNodeConfigNamePrefix):
 		return k.Name[len(perNodeConfigNamePrefix):], nil
 	default:
-		return "", cerrors.ErrorParsingDatastoreEntry{RawKey: k.Name}
+		// Selector-scoped FelixConfiguration; not processed by the config
+		// update processor into individual config keys.
+		return selectorScopedSentinel, nil
 	}
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,17 +29,20 @@ const (
 	MarkSeenFallThrough       = MarkSeen | 0x04000000
 	MarkSeenFallThroughMask   = MarkSeenMask | MarkSeenFallThrough
 	MarkSeenBypassForward     = MarkSeenBypass | 0x00300000
+	MarkSeenBypassXDP         = MarkSeenBypass | 0x00500000
 	MarkSeenBypassForwardMask = MarkSeenBypassMask | 0x00f00000
-	MarkSeenNATOutgoing       = MarkSeenBypass | 0x00800000
-	MarkSeenNATOutgoingMask   = MarkSeenBypassMask | 0x00f00000
+	MarkSeenNATOutgoing       = MarkSeen | 0x00800000
+	MarkSeenNATOutgoingMask   = MarkSeenMask | 0x00f00000
 	MarkSeenMASQ              = MarkSeenBypass | 0x00600000
 	MarkSeenMASQMask          = MarkSeenBypassMask | 0x00f00000
 	MarkSeenSkipFIB           = MarkSeen | 0x00100000
+	// The 0x00f00000 nibble is a code, independent of the bypass flag; compare it whole.
+	MarkSeenCodeMask = MarkSeenMask | 0x00f00000
 
 	MarkLinuxConntrackEstablished     = 0x08000000
 	MarkLinuxConntrackEstablishedMask = 0x08000000
 
-	MarkSeenToNatIfaceOut   = 0x41000000
+	MarkSeenTunnelKeySet    = 0x41000000
 	MarkSeenFromNatIfaceOut = 0x81000000
 
 	MarksMask uint32 = 0x1ff00000
@@ -54,6 +57,9 @@ const (
 	ProgIndexHostCtConflict
 	ProgIndexIcmpInnerNat
 	ProgIndexNewFlow
+	ProgIndexIPFrag
+	ProgIndexMaglev
+	ProgIndexTCPRst
 	ProgIndexMainDebug
 	ProgIndexPolicyDebug
 	ProgIndexAllowedDebug
@@ -62,6 +68,9 @@ const (
 	ProgIndexHostCtConflictDebug
 	ProgIndexIcmpInnerNatDebug
 	ProgIndexNewFlowDebug
+	ProgIndexIPFragDebug
+	ProgIndexMaglevDebug
+	ProgIndexTCPRstDebug
 	ProgIndexEndDebug
 	ProgIndexEnd
 
@@ -85,6 +94,9 @@ var ProgramNames = []string{
 	"calico_tc_host_ct_conflict",
 	"calico_tc_skb_icmp_inner_nat",
 	"calico_tc_skb_new_flow_entrypoint",
+	"calico_tc_skb_ipv4_frag",
+	"calico_tc_maglev",
+	"calico_tc_skb_send_tcp_rst",
 	/* ipv4 - debug */
 	"calico_tc_main",
 	"calico_tc_norm_pol_tail",
@@ -94,6 +106,9 @@ var ProgramNames = []string{
 	"calico_tc_host_ct_conflict",
 	"calico_tc_skb_icmp_inner_nat",
 	"calico_tc_skb_new_flow_entrypoint",
+	"calico_tc_skb_ipv4_frag",
+	"calico_tc_maglev",
+	"calico_tc_skb_send_tcp_rst",
 	/* ipv6 */
 	"calico_tc_main",
 	"calico_tc_norm_pol_tail",
@@ -103,6 +118,9 @@ var ProgramNames = []string{
 	"calico_tc_host_ct_conflict",
 	"calico_tc_skb_icmp_inner_nat",
 	"calico_tc_skb_new_flow_entrypoint",
+	"",
+	"calico_tc_maglev",
+	"calico_tc_skb_send_tcp_rst",
 	/* ipv6 - debug */
 	"calico_tc_main",
 	"calico_tc_norm_pol_tail",
@@ -112,6 +130,9 @@ var ProgramNames = []string{
 	"calico_tc_host_ct_conflict",
 	"calico_tc_skb_icmp_inner_nat",
 	"calico_tc_skb_new_flow_entrypoint",
+	"",
+	"calico_tc_maglev",
+	"calico_tc_skb_send_tcp_rst",
 }
 
 type ToOrFromEp string
@@ -126,7 +147,6 @@ type EndpointType string
 const (
 	EpTypeWorkload EndpointType = "workload"
 	EpTypeHost     EndpointType = "host"
-	EpTypeTunnel   EndpointType = "tunnel"
 	EpTypeL3Device EndpointType = "l3dev"
 	EpTypeNAT      EndpointType = "nat"
 	EpTypeLO       EndpointType = "lo"
@@ -136,34 +156,16 @@ func SectionName(endpointType EndpointType, fromOrTo ToOrFromEp) string {
 	return fmt.Sprintf("calico_%s_%s_ep", fromOrTo, endpointType)
 }
 
-func ProgFilename(ipVer int, epType EndpointType, toOrFrom ToOrFromEp, epToHostDrop, fib, dsr bool, logLevel string, btf bool) string {
+func ProgFilename(ipVer int, epType EndpointType, toOrFrom ToOrFromEp, epToHostDrop, dsr bool, logLevel string) string {
 	if epToHostDrop && (epType != EpTypeWorkload || toOrFrom == ToEp) {
 		// epToHostDrop only makes sense in the from-workload program.
 		logrus.Debug("Ignoring epToHostDrop, doesn't apply to this target")
 		epToHostDrop = false
 	}
 
-	// Should match CALI_FIB_LOOKUP_ENABLED in bpf.h
-	if fib {
-		toHost := (epType == EpTypeWorkload || epType == EpTypeHost || epType == EpTypeLO) && toOrFrom == FromEp
-		toHEP := (epType == EpTypeHost || epType == EpTypeLO) && toOrFrom == ToEp
-
-		realFIB := epType != EpTypeL3Device && (toHost || toHEP)
-
-		if !realFIB {
-			// FIB lookup only makes sense for traffic towards the host.
-			logrus.Debug("Ignoring fib enabled, doesn't apply to this target")
-		}
-		fib = realFIB
-	}
-
 	var hostDropPart string
 	if epType == EpTypeWorkload && epToHostDrop {
 		hostDropPart = "host_drop_"
-	}
-	fibPart := ""
-	if fib {
-		fibPart = "fib_"
 	}
 	dsrPart := ""
 	if dsr && ((epType == EpTypeWorkload && toOrFrom == FromEp) || (epType == EpTypeHost)) {
@@ -179,8 +181,6 @@ func ProgFilename(ipVer int, epType EndpointType, toOrFrom ToOrFromEp, epToHostD
 		epTypeShort = "wep"
 	case EpTypeHost:
 		epTypeShort = "hep"
-	case EpTypeTunnel:
-		epTypeShort = "tnl"
 	case EpTypeL3Device:
 		epTypeShort = "l3"
 	case EpTypeNAT:
@@ -188,16 +188,12 @@ func ProgFilename(ipVer int, epType EndpointType, toOrFrom ToOrFromEp, epToHostD
 	case EpTypeLO:
 		epTypeShort = "lo"
 	}
-	corePart := ""
-	if btf {
-		corePart = "_co-re"
-	}
-
+	var versionPart string
 	if ipVer == 6 {
-		corePart += "_v6"
+		versionPart = "_v6"
 	}
 
-	oFileName := fmt.Sprintf("%v_%v_%s%s%s%v%s.o",
-		toOrFrom, epTypeShort, hostDropPart, fibPart, dsrPart, logLevel, corePart)
+	oFileName := fmt.Sprintf("%v_%v_%s%s%v%s.o",
+		toOrFrom, epTypeShort, hostDropPart, dsrPart, logLevel, versionPart)
 	return oFileName
 }

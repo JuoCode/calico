@@ -17,12 +17,17 @@ package set
 import (
 	"bytes"
 	"fmt"
+	"iter"
 
 	log "github.com/sirupsen/logrus"
 )
 
 func New[T comparable]() Typed[T] {
 	return make(Typed[T])
+}
+
+func NewSize[T comparable](size int) Typed[T] {
+	return make(Typed[T], size)
 }
 
 // Empty returns a read-only set with no members.  Calls to Add etc. panic.
@@ -45,18 +50,21 @@ func FromArray[T comparable](membersArray []T) Typed[T] {
 type Typed[T comparable] map[T]v
 
 func (set Typed[T]) String() string {
+	return stringify(set)
+}
+
+func stringify[T any](set Set[T]) string {
 	var buf bytes.Buffer
 	_, _ = buf.WriteString("set.Set{")
 	first := true
-	set.Iter(func(item T) error {
+	for item := range set.All() {
 		if !first {
 			buf.WriteString(",")
 		} else {
 			first = false
 		}
 		_, _ = fmt.Fprint(&buf, item)
-		return nil
-	})
+	}
 	_, _ = buf.WriteString("}")
 	return buf.String()
 }
@@ -77,10 +85,9 @@ func (set Typed[T]) AddAll(itemArray []T) {
 
 // AddSet adds the contents of set "other" into the set.
 func (set Typed[T]) AddSet(other Set[T]) {
-	other.Iter(func(item T) error {
+	for item := range other.All() {
 		set.Add(item)
-		return nil
-	})
+	}
 }
 
 func (set Typed[T]) Discard(item T) {
@@ -113,6 +120,19 @@ loop:
 	}
 }
 
+// All returns an iterator for use with Go's range-over-func feature.
+// The iterator supports discarding from the set during iteration without panicking,
+// since the underlying map allows safe mutation during iteration.
+func (set Typed[T]) All() iter.Seq[T] {
+	return func(yield func(T) bool) {
+		for item := range set {
+			if !yield(item) {
+				return
+			}
+		}
+	}
+}
+
 func (set Typed[T]) Copy() Set[T] {
 	cpy := New[T]()
 	for item := range set {
@@ -141,13 +161,13 @@ func (set Typed[T]) Equals(other Set[T]) bool {
 }
 
 func (set Typed[T]) ContainsAll(other Set[T]) bool {
-	result := true
-	other.Iter(func(item T) error {
+	if other.Len() > set.Len() {
+		return false
+	}
+	for item := range other.All() {
 		if !set.Contains(item) {
-			result = false
-			return StopIteration
+			return false
 		}
-		return nil
-	})
-	return result
+	}
+	return true
 }

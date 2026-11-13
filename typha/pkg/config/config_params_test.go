@@ -15,17 +15,18 @@
 package config_test
 
 import (
-	"github.com/projectcalico/calico/typha/pkg/config"
-
 	"reflect"
+	"time"
 
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/typha/pkg/config"
 )
 
 var _ = DescribeTable("Config parsing",
-	func(key, value string, expected interface{}, errorExpected ...bool) {
+	func(key, value string, expected any, errorExpected ...bool) {
 		cfg := config.New()
 		_, err := cfg.UpdateFrom(map[string]string{key: value},
 			config.EnvironmentVariable)
@@ -81,6 +82,8 @@ var _ = DescribeTable("Config parsing",
 	Entry("PrometheusMetricsPort", "PrometheusMetricsPort", "1234", int(1234)),
 	Entry("PrometheusGoMetricsEnabled", "PrometheusGoMetricsEnabled", "false", false),
 	Entry("PrometheusProcessMetricsEnabled", "PrometheusProcessMetricsEnabled", "false", false),
+
+	Entry("ServerWriteTimeoutSecs", "ServerWriteTimeoutSecs", "123", 123*time.Second),
 )
 
 var _ = DescribeTable("Config validation",

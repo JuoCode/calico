@@ -27,6 +27,7 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/hook"
 	"github.com/projectcalico/calico/felix/bpf/libbpf"
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
+	bpfutils "github.com/projectcalico/calico/felix/bpf/utils"
 )
 
 const DetachedID = 0
@@ -84,112 +85,59 @@ func (ap *AttachPoint) Log() *log.Entry {
 	})
 }
 
-func (ap *AttachPoint) AlreadyAttached(object string) (int, bool) {
-	progID, err := ap.ProgramID()
+func (ap *AttachPoint) AlreadyAttached(object string) bool {
+	_, err := ap.ProgramID()
 	if err != nil {
 		ap.Log().Debugf("Couldn't get the attached XDP program ID. err=%v", err)
-		return -1, false
+		return false
 	}
-
-	somethingAttached, err := ap.IsAttached()
-	if err != nil {
-		ap.Log().Debugf("Failed to verify if any program is attached to interface. err=%v", err)
-		return -1, false
-	}
-
-	isAttached, err := bpf.AlreadyAttachedProg(ap, object, progID)
-	if err != nil {
-		ap.Log().Debugf("Failed to check if BPF program was already attached. err=%v", err)
-		return -1, false
-	}
-
-	if isAttached && somethingAttached {
-		return progID, true
-	}
-	return -1, false
+	return true
 }
 
-func ConfigureProgram(m *libbpf.Map, iface string, globalData *libbpf.XDPGlobalData) error {
+func (ap *AttachPoint) Configuration() *libbpf.XDPGlobalData {
+	globalData := &libbpf.XDPGlobalData{}
+	if ap.HookLayoutV4 != nil {
+		for p, i := range ap.HookLayoutV4 {
+			globalData.Jumps[p] = uint32(i)
+		}
+		globalData.Jumps[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV4)
+	}
+	if ap.HookLayoutV6 != nil {
+		for p, i := range ap.HookLayoutV6 {
+			globalData.JumpsV6[p] = uint32(i)
+		}
+		globalData.JumpsV6[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV6)
+	}
+	logIface := ap.Iface
+	if prefix := bpfutils.FVLogPrefix(); prefix != "" {
+		logIface = prefix + logIface
+	}
 	in := []byte("---------------")
-	copy(in, iface)
+	copy(in, logIface)
 	globalData.IfaceName = string(in)
 
-	if err := libbpf.XDPSetGlobals(m, globalData); err != nil {
-		return fmt.Errorf("failed to configure xdp: %w", err)
-	}
-
-	return nil
+	return globalData
 }
 
-type AttachResult int
-
-func (ar AttachResult) ProgID() int {
-	return int(ar)
-}
-
-func (ap *AttachPoint) AttachProgram() (bpf.AttachResult, error) {
+func (ap *AttachPoint) AttachProgram() error {
 	// By now the attach type specific generic set of programs is loaded and we
 	// only need to load and configure the preamble that will pass the
 	// configuration further to the selected set of programs.
 
-	binaryToLoad := path.Join(bpfdefs.ObjectDir, "xdp_preamble.o")
-
-	obj, err := libbpf.OpenObject(binaryToLoad)
-	if err != nil {
-		return nil, err
+	preambleName := "xdp_preamble.o"
+	if ap.NoTracePrintk {
+		preambleName = "xdp_preamble_notrace.o"
 	}
-	defer obj.Close()
-
-	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
-		mapName := m.Name()
-		if m.IsMapInternal() {
-			if strings.HasPrefix(mapName, ".rodata") {
-				continue
-			}
-			var globals libbpf.XDPGlobalData
-
-			if ap.HookLayoutV4 != nil {
-				for p, i := range ap.HookLayoutV4 {
-					globals.Jumps[p] = uint32(i)
-				}
-				globals.Jumps[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV4)
-			}
-			if ap.HookLayoutV6 != nil {
-				log.Infof("Sridhar layout6 %+v", ap.HookLayoutV6)
-				for p, i := range ap.HookLayoutV6 {
-					globals.JumpsV6[p] = uint32(i)
-				}
-				globals.JumpsV6[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV6)
-			}
-
-			if err := ConfigureProgram(m, ap.Iface, &globals); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		// TODO: We need to set map size here like tc.
-		pinDir := bpf.MapPinDir(m.Type(), mapName, ap.Iface, hook.XDP)
-		if err := m.SetPinPath(path.Join(pinDir, mapName)); err != nil {
-			return nil, fmt.Errorf("error pinning map %s: %w", mapName, err)
-		}
-	}
-
-	// Check if the bpf object is already attached, and we should skip re-attaching it
-	progID, isAttached := ap.AlreadyAttached(binaryToLoad)
-	if isAttached {
-		ap.Log().Infof("Programs already attached, skip reattaching %s", binaryToLoad)
-		return AttachResult(progID), nil
-	}
+	binaryToLoad := path.Join(bpfdefs.ObjectDir, preambleName)
 	ap.Log().Infof("Continue with attaching BPF program %s", binaryToLoad)
-
-	if err := obj.Load(); err != nil {
-		ap.Log().Warn("Failed to load program")
-		return nil, fmt.Errorf("error loading program: %w", err)
+	obj, err := bpf.LoadObject(binaryToLoad, ap.Configuration())
+	if err != nil {
+		return fmt.Errorf("error loading %s:%w", binaryToLoad, err)
 	}
 
 	oldID, err := ap.ProgramID()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get the attached XDP program ID: %w", err)
+		return fmt.Errorf("failed to get the attached XDP program ID: %w", err)
 	}
 
 	attachmentSucceeded := false
@@ -197,7 +145,7 @@ func (ap *AttachPoint) AttachProgram() (bpf.AttachResult, error) {
 		ap.Log().Debugf("Trying to attach XDP program in mode %v - old id: %v", mode, oldID)
 		// Force attach the program. If there is already a program attached, the replacement only
 		// succeed in the same mode of the current program.
-		progID, err = obj.AttachXDP(ap.Iface, ap.ProgramName(), oldID, unix.XDP_FLAGS_REPLACE|uint(mode))
+		progID, err := obj.AttachXDP(ap.Iface, ap.ProgramName(), oldID, unix.XDP_FLAGS_REPLACE|uint(mode))
 		if err != nil || progID == DetachedID || progID == oldID {
 			ap.Log().WithError(err).Warnf("Failed to attach to XDP program %s mode %v", ap.ProgramName(), mode)
 		} else {
@@ -208,11 +156,11 @@ func (ap *AttachPoint) AttachProgram() (bpf.AttachResult, error) {
 	}
 
 	if !attachmentSucceeded {
-		return nil, fmt.Errorf("failed to attach XDP program with program name %v to interface %v",
+		return fmt.Errorf("failed to attach XDP program with program name %v to interface %v",
 			ap.ProgramName(), ap.Iface)
 	}
 
-	return AttachResult(progID), nil
+	return nil
 }
 
 func (ap *AttachPoint) DetachProgram() error {
@@ -261,23 +209,13 @@ func (ap *AttachPoint) DetachProgram() error {
 	}
 
 	ap.Log().Infof("XDP program detached. program ID: %v", progID)
-
-	// Program is detached, now remove the json file we saved for it
-	if err = bpf.ForgetAttachedProg(ap.IfaceName(), hook.XDP); err != nil {
-		return fmt.Errorf("failed to delete hash of BPF program from disk: %w", err)
-	}
 	return nil
-}
-
-func (ap *AttachPoint) IsAttached() (bool, error) {
-	_, err := ap.ProgramID()
-	return err == nil, err
 }
 
 func (ap *AttachPoint) ProgramID() (int, error) {
 	progID, err := libbpf.GetXDPProgramID(ap.Iface)
 	if err != nil {
-		return -1, fmt.Errorf("Couldn't check for XDP program on iface %v: %w", ap.Iface, err)
+		return -1, fmt.Errorf("couldn't check for XDP program on iface %v: %w", ap.Iface, err)
 	}
 	return progID, nil
 }

@@ -1,0 +1,1673 @@
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package nftables
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os/exec"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+	"sigs.k8s.io/knftables"
+
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
+	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
+	"github.com/projectcalico/calico/felix/ipsets"
+	"github.com/projectcalico/calico/felix/iptables/cmdshim"
+	"github.com/projectcalico/calico/felix/nftables/nftrender"
+	"github.com/projectcalico/calico/lib/logrusr"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
+)
+
+// nftrender spells out the chain-name limit rather than importing knftables,
+// so that it stays buildable off Linux. Fail the build if the two ever drift.
+var (
+	_ [knftables.NameLengthMax - nftrender.MaxChainNameLength]struct{}
+	_ [nftrender.MaxChainNameLength - knftables.NameLengthMax]struct{}
+)
+
+const (
+	defaultTimeout = 30 * time.Second
+
+	// Object type names as returned by knftables' ListAll, used to index its
+	// result map.
+	objectTypeChain     = "chain"
+	objectTypeMap       = "map"
+	objectTypeFlowtable = "flowtable"
+
+	// How soon to re-assert the flowtable after pruning dropped a device, and how many times in a
+	// row we'll do it before falling back to the refresh timer. A device that is merely slow to
+	// appear is back within a retry or two; one that never appears - a workload endpoint whose
+	// veth is gone for good - mustn't keep us reprogramming forever.
+	FlowtablePruneRetryDelay = 5 * time.Second
+	MaxFlowtablePruneRetries = 5
+
+	// defaultCleanupRetryInterval paces cleanup retries when the refresh interval is disabled.
+	defaultCleanupRetryInterval = 180 * time.Second
+)
+
+type FlowTableHandler interface {
+	// SetWorkloadInterfaces updates the set of active workload interfaces. These are combined
+	// with any overlay device names to form the flowtable device list.
+	SetWorkloadInterfaces(ifces []string)
+
+	// SetOverlayDevices updates the set of overlay/tunnel devices (e.g. vxlan.calico, tunl0) to
+	// include in the flowtable. Only devices that currently exist in the kernel may be passed, or
+	// nft rejects the whole transaction.
+	SetOverlayDevices(devices []string)
+
+	// SetExternalDevices updates the set of host/external interfaces to include in the
+	// flowtable, so traffic forwarded between them and local workloads is offloaded.
+	SetExternalDevices(ifces []string)
+}
+
+var (
+	// Define the top-level chains for each table.
+	inputHook       = knftables.InputHook
+	forwardHook     = knftables.ForwardHook
+	outputHook      = knftables.OutputHook
+	preroutingHook  = knftables.PreroutingHook
+	postroutingHook = knftables.PostroutingHook
+
+	natType    = knftables.NATType
+	filterType = knftables.FilterType
+	routeType  = knftables.RouteType
+
+	// Each type of hook requires a specific filterPriority to be executed in the correct order.
+	// We also want to make sure that our priorities are unique, as to avoid unspecified ordering that can
+	// occur when two hooks share the same priority.
+	//
+	// Calico and kube-proxy share the following hooks, with relative priorities shown:
+	//
+	// INPUT:
+	// |------------|--------------|--------|
+	// | calico     | mangle-INPUT | -150
+	// | kube-proxy | filter-input | -110
+	// | calico     | filter-INPUT | 0
+	//
+	// FORWARD:
+	// |------------|----------------|--------|
+	// | calico     | mangle-FORWARD | -150
+	// | kube-proxy | filter-forward | -110
+	// | calico     | filter-FORWARD | 0
+	//
+	// OUTPUT:
+	// |------------|-------------------------|--------|
+	// | calico     | mangle-OUTPUT           | -150
+	// | kube-proxy | filter-output           | -110
+	// | calico     | filter-output-post-dnat | -90
+	// | calico     | filter-OUTPUT           | 0
+	//
+	// PREROUTING:
+	// |------------|-------------------|--------|
+	// | calico     | raw-PREROUTING    | -300
+	// | calico     | mangle-PREROUTING | -150
+	// | kube-proxy | filter-prerouting | -110
+	// | calico     | nat-PREROUTING    | -100
+	//
+	// POSTROUTING:
+	// |------------|--------------------|--------|
+	// | calico     | mangle-POSTROUTING | -150
+	// | kube-proxy | nat-postrouting    | 100
+	// | calico     | nat-POSTROUTING    | 110
+	//
+	// The full set of kube-proxy base chains can be found here:
+	// - https://github.com/kubernetes/kubernetes/blob/master/pkg/proxy/nftables/proxier.go
+	filterPriority = knftables.FilterPriority
+	rawPriority    = knftables.RawPriority
+	manglePriority = knftables.ManglePriority
+	snatPriority   = knftables.SNATPriority + "+10"
+	dnatPriority   = knftables.DNATPriority
+
+	// arpBaseChains defines the base chains for the ARP family table.
+	// The ARP family only supports the filter chain type (not nat or route),
+	// and only the input, output, and forward hooks.
+	arpBaseChains = map[string]knftables.Chain{
+		"filter-OUTPUT": {Name: "filter-OUTPUT", Hook: &outputHook, Type: &filterType, Priority: &filterPriority},
+	}
+
+	// Calico uses a single nftables table with a variety of hooks.
+	// The top level base chains are laid out below.
+	baseChains = map[string]knftables.Chain{
+		// Filter hook.
+		"filter-INPUT":   {Name: "filter-INPUT", Hook: &inputHook, Type: &filterType, Priority: &filterPriority},
+		"filter-FORWARD": {Name: "filter-FORWARD", Hook: &forwardHook, Type: &filterType, Priority: &filterPriority},
+		"filter-OUTPUT":  {Name: "filter-OUTPUT", Hook: &outputHook, Type: &filterType, Priority: &filterPriority},
+
+		// NAT hooks.
+		"nat-PREROUTING":  {Name: "nat-PREROUTING", Hook: &preroutingHook, Type: &natType, Priority: &dnatPriority},
+		"nat-INPUT":       {Name: "nat-INPUT", Hook: &inputHook, Type: &natType, Priority: &dnatPriority},
+		"nat-OUTPUT":      {Name: "nat-OUTPUT", Hook: &outputHook, Type: &natType, Priority: &snatPriority},
+		"nat-POSTROUTING": {Name: "nat-POSTROUTING", Hook: &postroutingHook, Type: &natType, Priority: &snatPriority},
+
+		// Mangle hooks.
+		"mangle-PREROUTING":  {Name: "mangle-PREROUTING", Hook: &preroutingHook, Type: &filterType, Priority: &manglePriority},
+		"mangle-INPUT":       {Name: "mangle-INPUT", Hook: &inputHook, Type: &filterType, Priority: &manglePriority},
+		"mangle-FORWARD":     {Name: "mangle-FORWARD", Hook: &forwardHook, Type: &filterType, Priority: &manglePriority},
+		"mangle-OUTPUT":      {Name: "mangle-OUTPUT", Hook: &outputHook, Type: &routeType, Priority: &manglePriority},
+		"mangle-POSTROUTING": {Name: "mangle-POSTROUTING", Hook: &postroutingHook, Type: &filterType, Priority: &manglePriority},
+
+		// Raw hooks.
+		"raw-PREROUTING": {Name: "raw-PREROUTING", Hook: &preroutingHook, Type: &filterType, Priority: &rawPriority},
+		"raw-OUTPUT":     {Name: "raw-OUTPUT", Hook: &outputHook, Type: &filterType, Priority: &rawPriority},
+	}
+
+	// Prometheus metrics.
+	countNumTransactions = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_nft_calls",
+		Help: "Number of nft rule write transactions.",
+	})
+	countNumTransactionErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_nft_errors",
+		Help: "Number of nft errors when writing rules.",
+	})
+	countNumListCalls = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_nft_list_calls",
+		Help: "Number of nft list calls.",
+	})
+	countNumListErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_nft_list_errors",
+		Help: "Number of nft list errors.",
+	})
+	gaugeNumChains = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_nft_chains",
+		Help: "Number of active nft chains in the Calico table.",
+	}, []string{"ip_version"})
+	gaugeNumRules = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_nft_rules",
+		Help: "Number of active nftables rules in the Calico table.",
+	}, []string{"ip_version"})
+	gaugeNumFlowtableDevices = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_nft_flowtable_devices",
+		Help: "Number of devices attached to the Calico nftables flowtable.",
+	}, []string{"ip_version"})
+	gaugeNumFlowtableMissingDevices = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "felix_nft_flowtable_missing_devices",
+		Help: "Number of desired Calico nftables flowtable devices that do not exist in the kernel.",
+	}, []string{"ip_version"})
+)
+
+func init() {
+	prometheus.MustRegister(countNumTransactions)
+	prometheus.MustRegister(countNumTransactionErrors)
+	prometheus.MustRegister(countNumListCalls)
+	prometheus.MustRegister(countNumListErrors)
+	prometheus.MustRegister(gaugeNumChains)
+	prometheus.MustRegister(gaugeNumRules)
+	prometheus.MustRegister(gaugeNumFlowtableDevices)
+	prometheus.MustRegister(gaugeNumFlowtableMissingDevices)
+}
+
+// NftablesTable is an implementation of the generictables.Table interface that programs nftables. It represents a
+// single nftables table.
+type NftablesTable struct {
+	dpsets.IPSetsDataplane
+	MapsDataplane
+
+	name      string
+	ipVersion uint8
+	family    knftables.Family
+	nft       knftables.Interface
+
+	// When true, the table will not program any rules or chains and insted functions
+	// solely to clean up any existing rules and chains that may be programmed.
+	disabled bool
+
+	// nextCleanupAttempt holds off a disabled table after a failure. Nothing else latches it, and a
+	// table we can't clean up would otherwise burn its whole retry budget on every apply.
+	nextCleanupAttempt time.Time
+
+	// baseChains is the set of base chains for this table. This is typically the
+	// package-level baseChains variable, but for ARP family tables it uses arpBaseChains.
+	baseChainDefs map[string]knftables.Chain
+
+	// For rendering rules and chains.
+	render NFTRenderer
+
+	// featureDetector detects the features of the dataplane.
+	featureDetector environment.FeatureDetectorIface
+
+	// chainToInsertedRules maps from chain name to a list of rules to be inserted at the start
+	// of that chain.  Rules are written with rule hash comments.  The Table cleans up inserted
+	// rules with unknown hashes.
+	chainToInsertedRules map[string][]generictables.Rule
+
+	// chainToAppendRules maps from chain name to a list of rules to be appended at the end
+	// of that chain.
+	chainToAppendedRules map[string][]generictables.Rule
+
+	dirtyBaseChains set.Set[string]
+
+	// chainNameToChain contains the desired state of our chains, indexed by
+	// chain name.
+	chainNameToChain map[string]*generictables.Chain
+
+	// chainRefCounts counts the number of chains that refer to a given chain.  Transitive
+	// reachability isn't tracked but testing whether a chain is referenced does allow us to
+	// avoid programming unreferenced leaf chains (for example, policies that aren't used in
+	// this table).
+	chainRefCounts map[string]int
+	dirtyChains    set.Set[string]
+
+	inSyncWithDataPlane bool
+
+	// overlayDevices contains the names of tunnel/overlay devices (e.g., vxlan.calico, tunl0)
+	// that should be included in the flowtable device list.
+	overlayDevices []string
+
+	// workloadInterfaces contains the names of active workload interfaces, updated by the
+	// endpoint manager via SetWorkloadInterfaces.
+	workloadInterfaces []string
+
+	// externalDevices contains host/external interface names (matched against the configured
+	// data-interface pattern) to include in the flowtable device list.
+	externalDevices []string
+
+	// flowtableDevices is the combined, sorted list of all devices for the flowtable.
+	// Updated when either overlayDevices or workloadInterfaces changes.
+	flowtableDevices []string
+
+	// flowtableEnabled is set by the setters below, which only fire when offload is enabled. It lets
+	// resyncs re-assert the flowtable even when the device list is empty.
+	flowtableEnabled bool
+
+	// flowtableDirty is true when the flowtable needs reconciling: created or updated when offload
+	// is enabled, or deleted when it is disabled but a flowtable lingers from a previous run.
+	flowtableDirty bool
+
+	// flowtablePruneRetries counts consecutive Applies that left the flowtable dirty because
+	// pruning dropped a device. Bounded by MaxFlowtablePruneRetries.
+	flowtablePruneRetries int
+
+	// flowtableCounter programs the flowtable's counter flag, from TableOptions.
+	flowtableCounter bool
+
+	// chainToDataplaneHashes contains the rule hashes that we think are in the dataplane.
+	// it is updated when we write to the dataplane but it can also be read back and compared
+	// to what we calculate from chainToContents.
+	chainToDataplaneHashes map[string][]string
+
+	// recreatePending is set by queueTableRecreate after repeated programming failures.
+	recreatePending bool
+
+	// hashCommentPrefix holds the prefix that we prepend to our rule-tracking hashes.
+	hashCommentPrefix string
+
+	// ourChainsRegexp matches the names of chains that belong to this specific table.
+	ourChainsRegexp *regexp.Regexp
+
+	// Record when we did our most recent reads and writes of the table.  We use these to
+	// calculate the next time we should force a refresh.
+	lastReadTime    time.Time
+	refreshInterval time.Duration
+
+	// Estimates for the time taken to do an nftables read / write.
+	// When an nft command exceeds the one of these we update them immediately.
+	// When a  nft command takes less time we decay them exponentially.
+	peakNftablesReadTime  time.Duration
+	peakNftablesWriteTime time.Duration
+
+	logCxt               *logrus.Entry
+	updateRateLimitedLog *logrusr.RateLimitedLogger
+
+	gaugeNumChains                  prometheus.Gauge
+	gaugeNumRules                   prometheus.Gauge
+	gaugeNumFlowtableDevices        prometheus.Gauge
+	gaugeNumFlowtableMissingDevices prometheus.Gauge
+
+	// Factory for making commands, used by UTs to shim exec.Command().
+	newCmd cmdshim.CmdFactory
+
+	// Shims for time.XXX functions:
+	timeSleep func(d time.Duration)
+	timeNow   func() time.Time
+
+	// listInterfaces returns the names of interfaces that currently exist in the kernel.
+	// Defaults to net.Interfaces(); overridable in tests.
+	listInterfaces func() ([]string, error)
+
+	onStillAlive func()
+	opReporter   logrusr.OpRecorder
+	reason       string
+
+	contextTimeout time.Duration
+}
+
+type TableOptions struct {
+	// NewDataplane is an optional function to override the creation of the knftables client,
+	// used for testing.
+	NewDataplane NewNftablesDataplaneFn
+
+	// Disabled can be set to true when running in iptables mode, triggering a cleanup
+	// of any Calico nftables content.
+	Disabled bool
+
+	RefreshInterval time.Duration
+
+	// SleepOverride for tests, if non-nil, replacement for time.Sleep()
+	SleepOverride func(d time.Duration)
+
+	// NowOverride for tests, if non-nil, replacement for time.Now()
+	NowOverride func() time.Time
+
+	// LookPathOverride for tests, if non-nil, replacement for exec.LookPath()
+	LookPathOverride func(file string) (string, error)
+
+	// ListInterfacesOverride for tests, if non-nil, replaces the net.Interfaces()-based
+	// lister used to prune the flowtable device list against kernel truth.
+	ListInterfacesOverride func() ([]string, error)
+
+	// FlowtableCounter keeps conntrack accounting up to date for offloaded flows. Only set it
+	// when the kernel supports the flag.
+	FlowtableCounter bool
+
+	// Thunk to call periodically when doing a long-running operation.
+	OnStillAlive func()
+
+	// OpRecorder to tell when we do resyncs etc.
+	OpRecorder logrusr.OpRecorder
+}
+
+func NewTable(
+	name string,
+	ipVersion uint8,
+	hashPrefix string,
+	featureDetector environment.FeatureDetectorIface,
+	options TableOptions,
+	required bool,
+) *NftablesTable {
+	// Match the chain names that we program dynamically, which all start with "cali",
+	// as well as the base chains that we program which start with "nat", "filter", "mangle", "raw".
+	ourChainsRegexp := regexp.MustCompile("^(cali|nat|filter|mangle|raw)-.*")
+
+	nftFamily := knftables.IPv4Family
+	ipsetFamily := ipsets.IPFamilyV4
+	if ipVersion == 6 {
+		nftFamily = knftables.IPv6Family
+		ipsetFamily = ipsets.IPFamilyV6
+	}
+
+	logFields := logrus.Fields{
+		"ipVersion": ipVersion,
+		"table":     name,
+	}
+
+	return newTable(
+		name, ipVersion, hashPrefix, featureDetector, options, required,
+		ourChainsRegexp, baseChains, nftFamily, ipsetFamily,
+		logFields, fmt.Sprintf("%d", ipVersion),
+	)
+}
+
+// NewARPTable creates a new NftablesTable in the ARP family. This is used for
+// proxy ARP suppression, preventing the host from responding to ARP requests
+// from workloads for their own IPs. The ARP family table has a single
+// filter-OUTPUT base chain.
+func NewARPTable(
+	name string,
+	hashPrefix string,
+	featureDetector environment.FeatureDetectorIface,
+	options TableOptions,
+	required bool,
+) *NftablesTable {
+	// Match dynamically-programmed chains ("cali-arp-*" for workload and dispatch chains)
+	// and base chains ("filter-OUTPUT", prefixed by the table layer name).
+	ourChainsRegexp := regexp.MustCompile("^(cali|filter)-.*")
+
+	logFields := logrus.Fields{
+		"ipVersion": 4,
+		"table":     name,
+		"family":    "arp",
+	}
+
+	return newTable(
+		name, 4, hashPrefix, featureDetector, options, required,
+		ourChainsRegexp, arpBaseChains, knftables.ARPFamily, ipsets.IPFamilyV4,
+		logFields, "arp",
+	)
+}
+
+// newTable is the shared constructor for both NewTable and NewARPTable. The two
+// public constructors differ only in the nftables family, base chain set,
+// chain-ownership regexp, and logging labels; everything else is identical.
+func newTable(
+	name string,
+	ipVersion uint8,
+	hashPrefix string,
+	featureDetector environment.FeatureDetectorIface,
+	options TableOptions,
+	required bool,
+	ourChainsRegexp *regexp.Regexp,
+	baseChainDefs map[string]knftables.Chain,
+	nftFamily knftables.Family,
+	ipsetFamily ipsets.IPFamily,
+	logFields logrus.Fields,
+	gaugeLabel string,
+) *NftablesTable {
+	// Pre-populate the insert and append table with empty lists for each kernel chain.  Ensures that we
+	// clean up any chains that we hooked on a previous run.
+	inserts := map[string][]generictables.Rule{}
+	appends := map[string][]generictables.Rule{}
+	chainNameToChain := map[string]*generictables.Chain{}
+	dirtyBaseChains := set.New[string]()
+	refcounts := map[string]int{}
+
+	if !options.Disabled {
+		// Only add the base chains if the table is enabled.
+		for _, baseChain := range baseChainDefs {
+			inserts[baseChain.Name] = []generictables.Rule{}
+			appends[baseChain.Name] = []generictables.Rule{}
+			chainNameToChain[baseChain.Name] = &generictables.Chain{
+				Name:  baseChain.Name,
+				Rules: []generictables.Rule{},
+			}
+			dirtyBaseChains.Add(baseChain.Name)
+
+			// Base chains are referred to by definition.
+			refcounts[baseChain.Name] += 1
+		}
+	}
+
+	// Allow override of time.Sleep() for test purposes.
+	newCmd := cmdshim.NewRealCmd
+	sleep := time.Sleep
+	if options.SleepOverride != nil {
+		sleep = options.SleepOverride
+	}
+	now := time.Now
+	if options.NowOverride != nil {
+		now = options.NowOverride
+	}
+	listInterfaces := realInterfaceNames
+	if options.ListInterfacesOverride != nil {
+		listInterfaces = options.ListInterfacesOverride
+	}
+
+	if options.NewDataplane == nil {
+		options.NewDataplane = knftables.New
+	}
+
+	nft, err := options.NewDataplane(nftFamily, name)
+	if err != nil {
+		if required {
+			logrus.WithError(err).Panic("Failed to create knftables client")
+		} else {
+			logrus.WithError(err).Info("Failed to create knftables client")
+			return nil
+		}
+	}
+	ipv := ipsets.NewIPVersionConfig(ipsetFamily, ipsets.IPSetNamePrefix, nil, nil)
+
+	table := &NftablesTable{
+		IPSetsDataplane:        NewIPSets(ipv, nft, options.OpRecorder),
+		name:                   name,
+		family:                 nftFamily,
+		nft:                    nft,
+		baseChainDefs:          baseChainDefs,
+		render:                 NewNFTRenderer(hashPrefix, ipVersion),
+		ipVersion:              ipVersion,
+		featureDetector:        featureDetector,
+		chainToInsertedRules:   inserts,
+		chainToAppendedRules:   appends,
+		dirtyBaseChains:        dirtyBaseChains,
+		chainNameToChain:       chainNameToChain,
+		chainRefCounts:         refcounts,
+		dirtyChains:            set.New[string](),
+		chainToDataplaneHashes: map[string][]string{},
+		logCxt:                 logrus.WithFields(logFields),
+		updateRateLimitedLog: logrusr.NewRateLimitedLogger(
+			logrusr.OptInterval(30*time.Second),
+			logrusr.OptBurst(100),
+		).WithFields(logFields),
+		hashCommentPrefix: hashPrefix,
+		ourChainsRegexp:   ourChainsRegexp,
+
+		refreshInterval: options.RefreshInterval,
+
+		newCmd:    newCmd,
+		timeSleep: sleep,
+		timeNow:   now,
+
+		listInterfaces: listInterfaces,
+
+		flowtableCounter: options.FlowtableCounter,
+
+		gaugeNumChains:                  gaugeNumChains.WithLabelValues(gaugeLabel),
+		gaugeNumRules:                   gaugeNumRules.WithLabelValues(gaugeLabel),
+		gaugeNumFlowtableDevices:        gaugeNumFlowtableDevices.WithLabelValues(gaugeLabel),
+		gaugeNumFlowtableMissingDevices: gaugeNumFlowtableMissingDevices.WithLabelValues(gaugeLabel),
+		opReporter:                      options.OpRecorder,
+
+		disabled: options.Disabled,
+
+		contextTimeout: defaultTimeout,
+	}
+	table.MapsDataplane = NewMaps(
+		ipv,
+		nft,
+		table.increfChain,
+		table.decrefChain,
+		options.OpRecorder,
+	)
+
+	if options.OnStillAlive != nil {
+		table.onStillAlive = options.OnStillAlive
+	} else {
+		table.onStillAlive = func() {}
+	}
+
+	return table
+}
+
+func (n *NftablesTable) Name() string {
+	return n.name
+}
+
+func (n *NftablesTable) IPVersion() uint8 {
+	return n.ipVersion
+}
+
+// CleanUp implements generictables.CleanupTable. A disabled table has no chains to program, so
+// when nftables is disabled an ordinary apply deletes the whole table. That's safe because we
+// don't share the Calico table with any other writers.
+func (n *NftablesTable) CleanUp() time.Duration {
+	return n.Apply()
+}
+
+// SetOverlayDevices sets the overlay/tunnel device names that should be included in the
+// flowtable device list. Called by the flowtable manager as tunnel devices come up and go
+// down, so only devices that currently exist are passed through.
+func (t *NftablesTable) SetOverlayDevices(devices []string) {
+	t.overlayDevices = slices.Clone(devices)
+	t.enableFlowtable()
+}
+
+// SetWorkloadInterfaces updates the set of active workload interfaces for the flowtable.
+// Called by the endpoint manager when workload endpoints change.
+func (t *NftablesTable) SetWorkloadInterfaces(ifces []string) {
+	t.workloadInterfaces = slices.Clone(ifces)
+	t.enableFlowtable()
+}
+
+// SetExternalDevices updates the set of host/external interfaces for the flowtable. Called by
+// the flowtable manager as matching interfaces come up and go down.
+func (t *NftablesTable) SetExternalDevices(ifces []string) {
+	t.externalDevices = slices.Clone(ifces)
+	t.enableFlowtable()
+}
+
+// GaugeNumFlowtableDevices exposes the felix_nft_flowtable_devices gauge for this table, for
+// use by tests outside this package.
+func (t *NftablesTable) GaugeNumFlowtableDevices() prometheus.Gauge {
+	return t.gaugeNumFlowtableDevices
+}
+
+// GaugeNumFlowtableMissingDevices exposes the felix_nft_flowtable_missing_devices gauge for tests.
+func (t *NftablesTable) GaugeNumFlowtableMissingDevices() prometheus.Gauge {
+	return t.gaugeNumFlowtableMissingDevices
+}
+
+// enableFlowtable turns on offload and recalculates the device list. The first enable marks
+// the flowtable dirty even when there are no devices, so the always-present FORWARD rule has
+// a flowtable to reference.
+func (t *NftablesTable) enableFlowtable() {
+	if !t.flowtableEnabled {
+		t.flowtableEnabled = true
+		t.flowtableDirty = true
+	}
+	t.recalcFlowtableDevices()
+}
+
+// recalcFlowtableDevices combines overlay and workload interfaces into a sorted device list.
+// If the list changed, it marks the flowtable as dirty for the next Apply().
+func (t *NftablesTable) recalcFlowtableDevices() {
+	combined := make([]string, 0, len(t.overlayDevices)+len(t.workloadInterfaces)+len(t.externalDevices))
+	combined = append(combined, t.overlayDevices...)
+	combined = append(combined, t.workloadInterfaces...)
+	combined = append(combined, t.externalDevices...)
+	sort.Strings(combined)
+	combined = slices.Compact(combined)
+	if !slices.Equal(t.flowtableDevices, combined) {
+		t.flowtableDevices = combined
+		t.flowtableDirty = true
+	}
+}
+
+// realInterfaceNames returns the names of every network interface currently present in the
+// kernel, via a single netlink dump.
+func realInterfaceNames() ([]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		names = append(names, iface.Name)
+	}
+	return names, nil
+}
+
+// pruneToExistingDevices drops any device that the kernel no longer has, and reports whether it
+// dropped anything. A flowtable that references a missing device fails the whole nft
+// transaction, and the device lists we're given are fed asynchronously (endpoint manager,
+// ifacemonitor), so they can still name a veth that CNI already deleted.
+//
+// We deliberately ask the kernel rather than reusing ifacemonitor's cache: that cache is exactly
+// what's stale during this race - it hasn't processed the RTM_DELLINK yet - so consulting it
+// would tell us what we already believe. One netlink dump per programming pass is cheap next to
+// the transaction it protects, and it beats a per-device lookup once a node has a few hundred
+// workloads.
+//
+// On a listing error we fall open and return the list unchanged: a transient failure to read
+// interfaces shouldn't wipe offload from every device.
+func (t *NftablesTable) pruneToExistingDevices(devices []string) ([]string, bool) {
+	if len(devices) == 0 {
+		return devices, false
+	}
+	names, err := t.listInterfaces()
+	if err != nil {
+		t.logCxt.WithError(err).Warn("Failed to list interfaces while pruning flowtable devices; keeping cached list")
+		return devices, false
+	}
+
+	existing := set.FromArray(names)
+	pruned := make([]string, 0, len(devices))
+	var dropped []string
+	for _, d := range devices {
+		if existing.Contains(d) {
+			pruned = append(pruned, d)
+		} else {
+			dropped = append(dropped, d)
+		}
+	}
+	if len(dropped) > 0 {
+		t.logCxt.WithField("devices", dropped).Info("Pruned flowtable devices that no longer exist in the kernel")
+	}
+	return pruned, len(dropped) > 0
+}
+
+// InsertOrAppendRules sets the rules that should be inserted into or appended
+// to the given base chain (depending on the chain insert mode).  See
+// also AppendRules, which can be used to record additional rules that are
+// always appended.
+func (t *NftablesTable) InsertOrAppendRules(chainName string, rules []generictables.Rule) {
+	if t.disabled {
+		logrus.WithField("chainName", chainName).Panic("BUG: Attempted to insert rules into a disabled table")
+	}
+
+	t.logCxt.WithField("chainName", chainName).Debug("Updating rule insertions")
+	oldRules := t.chainToInsertedRules[chainName]
+	t.chainToInsertedRules[chainName] = rules
+	numRulesDelta := len(rules) - len(oldRules)
+	t.gaugeNumRules.Add(float64(numRulesDelta))
+	t.dirtyBaseChains.Add(chainName)
+
+	// Update the chain with the new rules.
+	if chain := t.chainNameToChain[chainName]; chain != nil {
+		chain.Rules = rules
+	}
+
+	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
+	// avoid marking a still-referenced chain as dirty.
+	t.maybeIncrefReferredChains(chainName, rules)
+	t.maybeDecrefReferredChains(chainName, oldRules)
+}
+
+// AppendRules sets the rules to be appended to a given non-Calico chain.
+// These rules are always appended, even if chain insert mode is "insert".
+// If chain insert mode is "append", these rules are appended after any
+// rules added with InsertOrAppendRules.
+func (t *NftablesTable) AppendRules(chainName string, rules []generictables.Rule) {
+	if t.disabled {
+		logrus.WithField("chainName", chainName).Panic("BUG: Attempted to append rules into a disabled table")
+	}
+
+	t.logCxt.WithField("chainName", chainName).Debug("Updating rule appends")
+	oldRules := t.chainToAppendedRules[chainName]
+	t.chainToAppendedRules[chainName] = rules
+	numRulesDelta := len(rules) - len(oldRules)
+	t.gaugeNumRules.Add(float64(numRulesDelta))
+	t.dirtyBaseChains.Add(chainName)
+
+	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
+	// avoid marking a still-referenced chain as dirty.
+	t.maybeIncrefReferredChains(chainName, rules)
+	t.maybeDecrefReferredChains(chainName, oldRules)
+}
+
+func (t *NftablesTable) UpdateChains(chains []*generictables.Chain) {
+	for _, chain := range chains {
+		t.UpdateChain(chain)
+	}
+}
+
+func (t *NftablesTable) UpdateChain(chain *generictables.Chain) {
+	if t.disabled {
+		logrus.WithField("chainName", chain.Name).Panic("BUG: Attempted to update chain in a disabled table")
+	}
+
+	t.logCxt.WithField("chainName", chain.Name).Debug("Adding chain to available set.")
+	oldNumRules := 0
+
+	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
+	// avoid marking a still-referenced chain as dirty.
+	t.maybeIncrefReferredChains(chain.Name, chain.Rules)
+	if oldChain := t.chainNameToChain[chain.Name]; oldChain != nil {
+		oldNumRules = len(oldChain.Rules)
+		t.maybeDecrefReferredChains(chain.Name, oldChain.Rules)
+	}
+	t.chainNameToChain[chain.Name] = chain
+	numRulesDelta := len(chain.Rules) - oldNumRules
+	t.gaugeNumRules.Add(float64(numRulesDelta))
+	if t.chainIsReferenced(chain.Name) {
+		t.markChainDirty(chain.Name)
+	}
+}
+
+func (t *NftablesTable) RemoveChains(chains []*generictables.Chain) {
+	for _, chain := range chains {
+		t.RemoveChainByName(chain.Name)
+	}
+}
+
+func (t *NftablesTable) RemoveChainByName(name string) {
+	t.logCxt.WithField("chainName", name).Debug("Removing chain from available set.")
+	if oldChain, known := t.chainNameToChain[name]; known {
+		t.gaugeNumRules.Sub(float64(len(oldChain.Rules)))
+		t.maybeDecrefReferredChains(name, oldChain.Rules)
+		delete(t.chainNameToChain, name)
+		if t.chainIsReferenced(name) {
+			t.markChainDirty(name)
+		}
+	}
+}
+
+func (t *NftablesTable) chainIsReferenced(name string) bool {
+	return t.chainRefCounts[name] > 0
+}
+
+// maybeIncrefReferredChains checks whether the named chain is referenced;
+// if so, it increfs all child chains.  If a child chain becomes newly
+// referenced, its children are increffed recursively.
+func (t *NftablesTable) maybeIncrefReferredChains(chainName string, rules []generictables.Rule) {
+	if !t.chainIsReferenced(chainName) {
+		return
+	}
+	for _, r := range rules {
+		if ref, ok := r.Action.(nftrender.Referrer); ok {
+			t.increfChain(ref.ReferencedChain())
+		}
+	}
+}
+
+// maybeDecrefReferredChains checks whether the named chain is referenced;
+// if so, it decrefs all child chains.  If a child chain becomes newly
+// unreferenced, its children are decreffed recursively.
+func (t *NftablesTable) maybeDecrefReferredChains(chainName string, rules []generictables.Rule) {
+	if !t.chainIsReferenced(chainName) {
+		return
+	}
+	for _, r := range rules {
+		if ref, ok := r.Action.(nftrender.Referrer); ok {
+			t.decrefChain(ref.ReferencedChain())
+		}
+	}
+}
+
+// increfChain increments the refcount of the given chain; if the refcount transitions from 0,
+// marks the chain dirty so it will be programmed.
+func (t *NftablesTable) increfChain(chainName string) {
+	t.logCxt.WithField("chainName", chainName).Debug("Incref chain")
+	t.chainRefCounts[chainName] += 1
+	if t.chainRefCounts[chainName] == 1 {
+		t.updateRateLimitedLog.WithField("chainName", chainName).Info("Chain became referenced, marking it for programming")
+		t.markChainDirty(chainName)
+		if chain := t.chainNameToChain[chainName]; chain != nil {
+			// Recursively incref chains that this chain refers to.  If
+			// chain == nil then the chain is likely about to be added, in
+			// which case we'll handle this whe the chain is added.
+			t.maybeIncrefReferredChains(chainName, chain.Rules)
+		}
+	}
+}
+
+// decrefChain decrements the refcount of the given chain; if the refcount transitions to 0,
+// marks the chain dirty so it will be cleaned up.
+func (t *NftablesTable) decrefChain(chainName string) {
+	t.logCxt.WithField("chainName", chainName).Debug("Decref chain")
+	if t.chainRefCounts[chainName] == 1 {
+		t.updateRateLimitedLog.WithField("chainName", chainName).Info("Chain no longer referenced, marking it for removal")
+		if chain := t.chainNameToChain[chainName]; chain != nil {
+			// Recursively decref chains that this chain refers to.  If
+			// chain == nil then the chain has probably already been deleted
+			// in which case we'll already have done the decrefs.
+			t.maybeDecrefReferredChains(chainName, chain.Rules)
+		}
+		delete(t.chainRefCounts, chainName)
+		t.markChainDirty(chainName)
+		return
+	}
+
+	// Chain still referenced, just decrement.
+	t.chainRefCounts[chainName] -= 1
+}
+
+func (t *NftablesTable) loadDataplaneState() {
+	// List all of our table's objects in a single nft invocation, giving us the
+	// map and chain names without a separate List call for each type.
+	listCtx, listCancel := context.WithTimeout(context.Background(), t.contextTimeout)
+	defer listCancel()
+	countNumListCalls.Inc()
+	allObjects, err := t.nft.ListAll(listCtx)
+	if err != nil {
+		if !knftables.IsNotFound(err) {
+			// A transient list failure shouldn't be treated as an empty table:
+			// that would clear our in-memory view and trigger spurious
+			// reprogramming. Skip this resync and try again on the next one.
+			countNumListErrors.Inc()
+			t.logCxt.WithError(err).Warn("Failed to list nftables objects, skipping resync")
+			return
+		}
+		// Table doesn't exist yet. Carry on with no objects so we program it
+		// from scratch.
+		t.logCxt.Debug("Table not found in dataplane, nothing to load.")
+	}
+
+	// If the flowtable's presence in the dataplane doesn't match whether offload is enabled, it
+	// needs reconciling: created when enabled but missing, or deleted when disabled but present.
+	hasFlowtable := slices.Contains(allObjects[objectTypeFlowtable], dataplanedefs.FlowtableName)
+	if t.flowtableEnabled != hasFlowtable {
+		t.flowtableDirty = true
+	}
+
+	// Sync maps using the pre-fetched map names. Give the maps resync its own
+	// timeout so a slow one doesn't eat into the chain read below.
+	mapsCtx, mapsCancel := context.WithTimeout(context.Background(), t.contextTimeout)
+	defer mapsCancel()
+	if err := t.LoadDataplaneState(mapsCtx, allObjects[objectTypeMap]); err != nil {
+		t.logCxt.WithError(err).Warn("Failed to load maps state")
+	}
+
+	// Refresh the cache of feature data.
+	t.featureDetector.RefreshFeatures()
+
+	// Load the hashes from the dataplane.
+	t.logCxt.Debug("Loading current nftables state and checking it is correct.")
+	t.opReporter.RecordOperation(fmt.Sprintf("resync-%v-v%d", t.name, t.ipVersion))
+
+	t.lastReadTime = t.timeNow()
+
+	dataplaneHashes := t.getHashesFromDataplane(allObjects[objectTypeChain])
+
+	// Check that the rules we think we've programmed are still there and mark any inconsistent
+	// chains for refresh.
+	for chainName, expectedHashes := range t.chainToDataplaneHashes {
+		logCxt := t.logCxt.WithField("chainName", chainName)
+		if t.isDirty(chainName) {
+			// Already an update pending for this chain; no point in flagging it as
+			// out-of-sync.
+			logCxt.Debug("Skipping known-dirty chain")
+			continue
+		}
+		if !t.ourChainsRegexp.MatchString(chainName) {
+			// This doesn't match the regex for chains programmed by us. Mark it as dirty so
+			// that we clean it up on the next apply.
+			logCxt.WithField("chain", chainName).Warn("Found chain that doesn't belong to us, marking for cleanup")
+			t.markChainDirty(chainName)
+		} else {
+			// One of our chains, should match exactly.
+			dpHashes := dataplaneHashes[chainName]
+			if !reflect.DeepEqual(dpHashes, expectedHashes) {
+				logCxt.WithFields(logrus.Fields{
+					"dpHashes":       dpHashes,
+					"expectedHashes": expectedHashes,
+				}).Warn("Detected out-of-sync Calico chain, marking for resync")
+				t.markChainDirty(chainName)
+			}
+		}
+	}
+
+	// Now scan for chains that shouldn't be there and mark for deletion.
+	t.logCxt.Debug("Scanning for unexpected nftables chains")
+	for chainName := range dataplaneHashes {
+		logCxt := t.logCxt.WithField("chainName", chainName)
+		if t.isDirty(chainName) {
+			// Already an update pending for this chain.
+			logCxt.Debug("Skipping known-dirty chain")
+			continue
+		}
+		if _, ok := t.chainToDataplaneHashes[chainName]; ok {
+			// Chain expected, we'll have checked its contents above.
+			logCxt.Debug("Skipping expected chain")
+			continue
+		}
+
+		// Chain exists in dataplane but not in memory, mark as dirty so we'll clean it up.
+		logCxt.WithField("chainName", chainName).Info("Found unexpected chain, marking for cleanup")
+		t.markChainDirty(chainName)
+	}
+
+	t.logCxt.Debug("Finished loading nftables state")
+	t.chainToDataplaneHashes = dataplaneHashes
+	t.inSyncWithDataPlane = true
+}
+
+// markChainDirty marks the given chain as dirty, causing it to be re-written on the next Apply.
+// It handles adding the chain to dirtyBaseChains if it's a base chain, otherwise to dirtyChains.
+func (t *NftablesTable) markChainDirty(chainName string) {
+	if _, isBase := t.baseChainDefs[chainName]; isBase {
+		t.dirtyBaseChains.Add(chainName)
+	} else {
+		t.dirtyChains.Add(chainName)
+	}
+}
+
+// isDirty returns true if the given chain is marked as dirty.
+func (t *NftablesTable) isDirty(chainName string) bool {
+	return t.dirtyBaseChains.Contains(chainName) || t.dirtyChains.Contains(chainName)
+}
+
+// expectedHashesForInsertAppendChain calculates the expected hashes for a whole top-level chain
+// given our inserts and appends. Hashes for inserted rules are calculated first.
+// To avoid recalculation, it returns the inserted rule hashes as a second output and appended rule hashes
+// a third output.
+func (t *NftablesTable) expectedHashesForInsertAppendChain(chainName string) (allHashes, ourInsertedHashes, ourAppendedHashes []string) {
+	insertedRules := t.chainToInsertedRules[chainName]
+	appendedRules := t.chainToAppendedRules[chainName]
+	allHashes = make([]string, len(insertedRules)+len(appendedRules))
+	features := t.featureDetector.GetFeatures()
+	if len(insertedRules) > 0 {
+		ourInsertedHashes = CalculateRuleHashes(chainName, insertedRules, features)
+	}
+	if len(appendedRules) > 0 {
+		// Add *append* to chainName to produce a unique hash in case append chain/rules are same
+		// as insert chain/rules above.
+		ourAppendedHashes = CalculateRuleHashes(chainName+"*appends*", appendedRules, features)
+	}
+	offset := 0
+	for i, hash := range ourInsertedHashes {
+		allHashes[i+offset] = hash
+	}
+
+	offset = len(insertedRules)
+	for i, hash := range ourAppendedHashes {
+		allHashes[i+offset] = hash
+	}
+	return
+}
+
+// getHashesFromDataplane loads the current state of our table and parses out the rule
+// hashes we add as comments. The returned map contains an entry for each chain in the
+// table; each entry is the slice of rule hashes for that chain, in order. A rule with no
+// hash comment (e.g. a rule another process added to a chain we hook) is represented by an
+// empty string.
+//
+// If chainNames is non-nil, it is used directly (e.g. from a prior ListAll call) rather than
+// issuing a separate List("chain") call.
+func (t *NftablesTable) getHashesFromDataplane(chainNames []string) map[string][]string {
+	retries := 3
+	retryDelay := 100 * time.Millisecond
+
+	// Retry a few times before we panic.  This deals with any transient errors and it prevents
+	// us from spamming a panic into the log when we're being gracefully shut down by a SIGTERM.
+	for {
+		t.onStillAlive()
+		hashes, err := t.attemptToGetHashesFromDataplane(chainNames)
+		if err != nil {
+			countNumListErrors.Inc()
+			var stderr string
+			if ee, ok := err.(*exec.ExitError); ok {
+				stderr = string(ee.Stderr)
+			}
+			t.logCxt.WithError(err).WithField("stderr", stderr).Warn("nftables command failed")
+			if retries > 0 {
+				retries--
+				t.timeSleep(retryDelay)
+				retryDelay *= 2
+			} else {
+				t.logCxt.Panic("nftables command failed after retries")
+			}
+			continue
+		}
+		return hashes
+	}
+}
+
+// attemptToGetHashesFromDataplane reads nftables state and extracts our rule hashes.
+// If chainNames is non-nil, it is used directly (from a prior ListAll call). If nil,
+// chain names are fetched via a separate List("chain") call.
+func (t *NftablesTable) attemptToGetHashesFromDataplane(chainNames []string) (hashes map[string][]string, err error) {
+	startTime := t.timeNow()
+	defer func() {
+		saveDuration := t.timeNow().Sub(startTime)
+		t.peakNftablesReadTime = t.peakNftablesReadTime * 99 / 100
+		if saveDuration > t.peakNftablesReadTime {
+			t.logCxt.WithField("duration", saveDuration).Debug("Updating nftables peak duration.")
+			t.peakNftablesReadTime = saveDuration
+		}
+	}()
+
+	t.logCxt.Debug("Attempting to get hashes from nftables")
+
+	hashes = make(map[string][]string)
+
+	ctx, cancel := context.WithTimeout(context.Background(), t.contextTimeout)
+	defer cancel()
+
+	if chainNames == nil {
+		// List chains separately, as chains may exist without rules.
+		countNumListCalls.Inc()
+		chainNames, err = t.nft.List(ctx, objectTypeChain)
+		if err != nil {
+			if knftables.IsNotFound(err) {
+				// No chains means the table isn't programmed yet, so there are
+				// no hashes to read. Return an empty map rather than an error.
+				t.logCxt.Debug("No chains in dataplane, table not programmed yet.")
+				err = nil
+				return
+			}
+			countNumListErrors.Inc()
+			return nil, err
+		}
+	}
+
+	for _, chain := range chainNames {
+		hashes[chain] = []string{}
+	}
+
+	// List rules and extract the hashes.
+	allRules, err := t.nft.ListRules(ctx, "")
+	if err != nil {
+		if knftables.IsNotFound(err) {
+			err = nil
+			return
+		}
+		return nil, err
+	}
+
+	for _, rule := range allRules {
+		if rule.Comment != nil {
+			// The rule has a comment, extract the hash.
+			hash := strings.TrimPrefix(strings.Split(*rule.Comment, ";")[0], t.hashCommentPrefix)
+			hashes[rule.Chain] = append(hashes[rule.Chain], hash)
+		} else {
+			// Otherwise, this rule has no hash and may not be ours. We don't expect these in our chains,
+			// but might appear if someone else has modified our table.
+			hashes[rule.Chain] = append(hashes[rule.Chain], "")
+		}
+	}
+	return
+}
+
+func (t *NftablesTable) InvalidateDataplaneCache(reason string) {
+	logCxt := t.logCxt.WithField("reason", reason)
+	if !t.inSyncWithDataPlane {
+		logCxt.Debug("Would invalidate dataplane cache but it was already invalid.")
+		return
+	}
+	logCxt.Debug("Invalidating dataplane cache")
+	t.inSyncWithDataPlane = false
+	t.reason = reason
+
+	// Re-assert an enabled flowtable on the next resync (its device list may have drifted). The
+	// disabled case is left to loadDataplaneState, which only marks it dirty if one actually exists.
+	t.flowtableDirty = t.flowtableEnabled
+}
+
+func (t *NftablesTable) Apply() (rescheduleAfter time.Duration) {
+	now := t.timeNow()
+	defer func() {
+		if time.Since(now) > time.Second {
+			t.logCxt.WithFields(logrus.Fields{
+				"applyTime":      time.Since(now),
+				"reasonForApply": t.reason,
+			}).Info("Updating nftables took >1s")
+		}
+	}()
+
+	if t.disabled && now.Before(t.nextCleanupAttempt) {
+		return t.nextCleanupAttempt.Sub(now)
+	}
+
+	// We _think_ we're in sync, check if there are any reasons to think we might
+	// not be in sync.
+	lastReadToNow := now.Sub(t.lastReadTime)
+	if t.refreshInterval > 0 && lastReadToNow > t.refreshInterval {
+		// Too long since we've forced a refresh.
+		t.InvalidateDataplaneCache("refresh timer")
+	}
+
+	// Retry until we succeed. This could be a transient programming error. It's also possible that we're bugged
+	// and trying to write bad data so we give up eventually.
+	retries := 10
+	backoffTime := 1 * time.Millisecond
+	failedAtLeastOnce := false
+	for {
+		if !t.inSyncWithDataPlane {
+			// We have reason to believe that our picture of the dataplane is out of
+			// sync.  Refresh it.  This may mark more chains as dirty.
+			t.loadDataplaneState()
+		}
+		t.onStillAlive()
+
+		if err := t.applyUpdates(); err != nil {
+			if retries > 0 {
+				if retries < 6 && !t.disabled {
+					// If we hit multiple failures in a row, rebuild the table from scratch on the next
+					// iteration. This can help in case we are trying to make a change that is
+					// incompatible with the current table state.
+					t.logCxt.Warn("Queueing table recreate due to prior nftables programming error")
+					t.queueTableRecreate()
+				} else {
+					// Reload the data plane state in case we're out of sync.
+					t.loadDataplaneState()
+				}
+
+				retries--
+				t.logCxt.WithError(err).Warn("Failed to program nftables, will retry")
+				t.timeSleep(backoffTime)
+				backoffTime *= 2
+				t.logCxt.WithError(err).Warn("Retrying...")
+				failedAtLeastOnce = true
+				continue
+			} else if t.disabled {
+				// A table we only sweep, so its state moves under us and there is nothing of ours
+				// left to enforce. Retry on the next pass rather than taking Felix down.
+				t.logCxt.WithError(err).Warn("Failed to clean up nftables, will retry on the next refresh")
+				t.InvalidateDataplaneCache("cleanup failed")
+				return t.scheduleCleanupRetry(now)
+			} else {
+				t.logCxt.WithError(err).Error("Failed to program nftables, loading diags before panic.")
+				t.dumpTableState()
+				t.logCxt.WithError(err).Panic("Failed to program nftables, giving up after retries")
+			}
+		}
+		if failedAtLeastOnce {
+			t.logCxt.Warn("Succeeded after retry.")
+		}
+		break
+	}
+
+	t.gaugeNumChains.Set(float64(len(t.chainRefCounts)))
+
+	// Check whether we need to be rescheduled and how soon.
+	if t.refreshInterval > 0 {
+		lastReadToNow = now.Sub(t.lastReadTime)
+
+		// Refresh interval is set, start with that.
+		logrus.WithFields(logrus.Fields{
+			"lastReadToNow":   lastReadToNow,
+			"refreshInterval": t.refreshInterval,
+		}).Debug("Calculating reschedule time")
+		rescheduleAfter = t.refreshInterval - lastReadToNow
+	}
+
+	// A flowtable left dirty is waiting on a device to appear, so come back for it promptly
+	// instead of waiting out the refresh interval (which may be disabled entirely).
+	if t.flowtableDirty && (rescheduleAfter == 0 || rescheduleAfter > FlowtablePruneRetryDelay) {
+		rescheduleAfter = FlowtablePruneRetryDelay
+	}
+	return
+}
+
+// scheduleCleanupRetry holds this table off until the next attempt is due, and returns how long
+// that is.
+func (t *NftablesTable) scheduleCleanupRetry(now time.Time) time.Duration {
+	delay := t.refreshInterval
+	if delay <= 0 {
+		delay = defaultCleanupRetryInterval
+	}
+	t.nextCleanupAttempt = now.Add(delay)
+	return delay
+}
+
+// queueTableRecreate arranges for the next applyUpdates to delete and re-add the table in the same
+// transaction that rewrites the whole ruleset, so the table is never left without its base chains.
+func (t *NftablesTable) queueTableRecreate() {
+	if t.recreatePending {
+		// Already queued, and the desired state cannot change mid-retry, so nothing to redo.
+		return
+	}
+	t.recreatePending = true
+
+	// Nothing in the table survives the recreate, so drop our view of it and mark everything we
+	// want back as dirty.
+	t.chainToDataplaneHashes = map[string][]string{}
+	t.dirtyChains = set.New[string]()
+	for chainName := range t.chainNameToChain {
+		if _, present := t.desiredStateOfChain(chainName); present {
+			t.markChainDirty(chainName)
+		}
+	}
+	for chainName := range t.baseChainDefs {
+		t.dirtyBaseChains.Add(chainName)
+	}
+	t.flowtableDirty = t.flowtableEnabled
+
+	// We already know what the table will contain, so there is nothing to be gained from reading
+	// it back before the retry.
+	t.inSyncWithDataPlane = true
+}
+
+func (t *NftablesTable) applyUpdates() error {
+	// If needed, detect the dataplane features.
+	features := t.featureDetector.GetFeatures()
+
+	// Start a new nftables transaction.
+	tx := t.nft.NewTransaction()
+
+	// Set when the flowtable needs another pass, so the dirty-clear at the end of this function
+	// leaves flowtableDirty set for the next Apply.
+	keepFlowtableDirty := false
+
+	// Get the set of map updates we need to make. We'll interleave these with the chain updates.
+	// in the correct order. Namely:
+	// - Create any new maps.
+	// - Create any new chains / rules.
+	// - Add elements to maps.
+	// The recreate below takes the sets and maps with it, and each layer tracks its own view of
+	// what it programmed. Drop those views here, next to the recreate they depend on, so the two
+	// cannot get out of step.
+	if t.recreatePending && !t.disabled {
+		t.QueueResync()
+		t.InvalidateMapsCache()
+	}
+
+	mapUpdates := t.MapUpdates()
+
+	if !t.disabled {
+		if t.recreatePending {
+			// nftables commits the whole transaction or none of it, so folding the recreate in with
+			// the rewrite below means the table is never left standing without its base chains. The
+			// leading Add keeps the Delete from failing if the table is already gone.
+			tx.Add(&knftables.Table{})
+			tx.Delete(&knftables.Table{})
+			tx.Add(&knftables.Table{})
+		} else if len(t.chainToDataplaneHashes) == 0 {
+			// Table is enabled, but doesn't exist in the dataplane yet.
+			tx.Add(&knftables.Table{})
+		}
+	}
+
+	// Add in any new maps we need to create.
+	for _, newMap := range mapUpdates.MapsToCreate {
+		tx.Add(newMap)
+	}
+
+	// Remove any map elements that should no longer exist. Do this before deleting chains
+	// in case the map elements reference them.
+	for _, mapElement := range mapUpdates.MembersToDel {
+		tx.Delete(mapElement)
+	}
+
+	if !t.disabled {
+		// Also make sure our base chains exist.
+		for _, c := range t.baseChainDefs {
+			// Make a copy.
+			baseChain := c
+			if _, ok := t.chainToDataplaneHashes[baseChain.Name]; !ok {
+				// Chain doesn't exist in dataplane, mark it for creation.
+				tx.Add(&baseChain)
+			}
+		}
+	}
+
+	// The FORWARD chain references "flow offload @calico" whenever offload is enabled, so the
+	// flowtable must exist before we write those rules (Add acts as create-or-update, and works
+	// even with no devices). The delete for the disabled case is deferred to the end of the
+	// transaction, after the referencing rule has been flushed away.
+	if t.flowtableDirty && t.flowtableEnabled {
+		devices, dropped := t.pruneToExistingDevices(t.flowtableDevices)
+		prio := knftables.FilterIngressPriority
+		tx.Add(&knftables.Flowtable{
+			Name:     dataplanedefs.FlowtableName,
+			Priority: &prio,
+			Devices:  devices,
+			Counter:  knftables.PtrTo(t.flowtableCounter),
+		})
+		t.gaugeNumFlowtableDevices.Set(float64(len(devices)))
+		t.gaugeNumFlowtableMissingDevices.Set(float64(len(t.flowtableDevices) - len(devices)))
+
+		// Pruning is symmetric: it also drops a device that hasn't appeared yet, which happens
+		// when we learn about a workload before its veth is created. Nothing re-dirties the
+		// flowtable when the device does show up - the desired list never changed - so stay dirty
+		// and re-assert shortly rather than leaving the device unoffloaded until the next resync.
+		if dropped && t.flowtablePruneRetries < MaxFlowtablePruneRetries {
+			t.flowtablePruneRetries++
+			keepFlowtableDirty = true
+		}
+	}
+
+	// Make a pass over the dirty chains and generate a forward reference for any that we're about to update.
+	// Writing a forward reference ensures that the chain exists and that it is empty.
+	for chainName := range t.dirtyChains.All() {
+		t.logCxt.WithField("chainName", chainName).Debug("Checking dirty chain")
+		if _, present := t.desiredStateOfChain(chainName); !present {
+			// About to delete this chain, flush it first to sever dependencies.
+			t.logCxt.WithFields(logrus.Fields{
+				"chainName": chainName,
+			}).Debug("Flushing chain before deletion")
+			tx.Flush(&knftables.Chain{Name: chainName})
+		} else if _, ok := t.chainToDataplaneHashes[chainName]; !ok {
+			// Chain doesn't exist in dataplane, mark it for creation.
+			t.logCxt.WithFields(logrus.Fields{
+				"chainName": chainName,
+			}).Debug("Adding chain")
+			tx.Add(&knftables.Chain{Name: chainName})
+		}
+	}
+
+	// Make a second pass over the dirty chains.  This time, we write out the rule
+	// changes.  We rewrite each changed chain wholesale - flush it and re-add all of
+	// its rules in this transaction - rather than diffing rule by rule.  nftables
+	// applies the flush and the adds atomically, so there's no window where the chain
+	// is empty.  Rewriting wholesale means we never need individual rule handles,
+	// which in turn lets us skip the full dataplane reload that recovering those
+	// handles used to require (see the post-write handling below).  Felix recomputes
+	// the whole chain on any change anyway, so these chains are small.
+	newHashes := map[string][]string{}
+	for chainName := range t.dirtyChains.All() {
+		chain, ok := t.desiredStateOfChain(chainName)
+		if !ok {
+			continue
+		}
+		previousHashes := t.chainToDataplaneHashes[chainName]
+		currentHashes := t.render.RuleHashes(chain, features)
+		newHashes[chainName] = currentHashes
+
+		if slices.Equal(currentHashes, previousHashes) {
+			// Chain is already in sync; nothing to write.
+			continue
+		}
+
+		// Make sure any sets the chain references exist before we add rules that use
+		// them, or nft will reject the transaction.
+		for _, setName := range chain.IPSetNames() {
+			if set := t.IPSetsDataplane.(*IPSets).NFTablesSet(setName); set != nil {
+				tx.Add(set)
+			} else {
+				t.logCxt.WithFields(logrus.Fields{
+					"chain": chainName,
+					"set":   setName,
+				}).Warn("IP Set for chain has not yet been received by data plane")
+			}
+		}
+
+		// Flush the existing chain before re-adding its rules.  A chain that isn't in
+		// the dataplane yet was just created (empty) in the pass above, so there's
+		// nothing to flush.
+		if _, existed := t.chainToDataplaneHashes[chainName]; existed {
+			tx.Flush(&knftables.Chain{Name: chainName})
+		}
+		for i, hash := range currentHashes {
+			tx.Add(t.render.Render(chainName, hash, chain.Rules[i], features))
+		}
+	}
+
+	// Now calculate nftables updates for our inserted and appended rules, which are used to hook top-level chains.
+	for chainName := range t.dirtyBaseChains.All() {
+		previousHashes := t.chainToDataplaneHashes[chainName]
+
+		// Calculate the hashes for our inserted and appended rules.
+		newChainHashes, newInsertedRuleHashes, newAppendedRuleHashes := t.expectedHashesForInsertAppendChain(chainName)
+
+		if reflect.DeepEqual(newChainHashes, previousHashes) {
+			// Chain is in sync, skip to next one.
+			continue
+		}
+
+		// For simplicity, if we've discovered that we're out-of-sync, remove all our
+		// rules from this chain, then re-insert/re-append them below.
+		tx.Flush(&knftables.Chain{Name: chainName})
+		t.logCxt.WithField("chainName", chainName).Info("Flushing chain")
+
+		// Add inserted rules if there are any.
+		rules := t.chainToInsertedRules[chainName]
+		if len(rules) > 0 {
+			t.logCxt.Debug("Rendering rules.")
+			for i := 0; i < len(rules); i++ {
+				tx.Add(t.render.Render(chainName, newInsertedRuleHashes[i], rules[i], features))
+			}
+		}
+
+		// Add appended rules if there are any.
+		rules = t.chainToAppendedRules[chainName]
+		if len(rules) > 0 {
+			t.logCxt.Debug("Rendering specific append rules.")
+			for i := 0; i < len(rules); i++ {
+				tx.Add(t.render.Render(chainName, newAppendedRuleHashes[i], rules[i], features))
+			}
+		}
+
+		newHashes[chainName] = newChainHashes
+		// We don't delete the items from the set until after programming succeeds.
+	}
+
+	// Now that chains + rules are added, we can add map elements. We do this afterwards in case
+	// they reference chains that we've just added.
+	for _, element := range mapUpdates.MembersToAdd {
+		tx.Add(element)
+	}
+
+	// Do deletions at the end.  This ensures that we don't try to delete any chains that
+	// are still referenced (because we'll have removed the references in the modify pass
+	// above).
+	for chainName := range t.dirtyChains.All() {
+		if _, ok := t.desiredStateOfChain(chainName); !ok {
+			// Chain deletion
+			t.logCxt.WithFields(logrus.Fields{
+				"chainName": chainName,
+			}).Debug("Deleting chain that is no longer needed")
+			tx.Delete(&knftables.Chain{Name: chainName})
+			newHashes[chainName] = nil
+		}
+	}
+
+	// Delete any maps that may have been referenced by rules above.
+	for _, m := range mapUpdates.MapsToDelete {
+		tx.Delete(m)
+	}
+
+	// Delete any flowtable left over from a previous run now that offload is disabled. This has
+	// to happen after the chain updates above: nft refuses to delete a flowtable while the
+	// FORWARD rule that references it ("flow offload @calico") still exists, so the delete only
+	// succeeds once that rule has been flushed.
+	if t.flowtableDirty && !t.flowtableEnabled {
+		tx.Delete(&knftables.Flowtable{Name: dataplanedefs.FlowtableName})
+		t.gaugeNumFlowtableDevices.Set(0)
+		t.gaugeNumFlowtableMissingDevices.Set(0)
+	}
+
+	if t.disabled && len(t.chainToDataplaneHashes) != 0 {
+		// Table is disabled, but exists in the dataplane - delete it.
+		tx.Delete(&knftables.Table{})
+	}
+
+	wroteToDataplane := tx.NumOperations() > 0
+	if !wroteToDataplane {
+		t.logCxt.Debug("Update ended up being no-op, skipping call to nftables.")
+	} else {
+		// Run the transaction.
+		t.opReporter.RecordOperation(fmt.Sprintf("update-%v-v%d", t.name, t.ipVersion))
+
+		if logrus.IsLevelEnabled(logrus.TraceLevel) {
+			t.logCxt.Tracef("Updating nftables: %s", tx.String())
+		}
+
+		if err := t.runTransaction(tx); err != nil {
+			t.dumpTableState()
+			t.logCxt.WithError(err).WithField("tx", tx.String()).Error("Failed to run nft transaction")
+			return fmt.Errorf("error performing nft transaction: %s", err)
+		}
+
+		// Update Map implementation after successful nftables transaction.
+		t.FinishMapUpdates(mapUpdates)
+	}
+
+	// Now we've successfully updated nftables, clear the dirty sets.  We do this even if we
+	// found there was nothing to do above, since we may have found out that a dirty chain
+	// was actually a no-op update.
+	t.dirtyChains = set.New[string]()
+	t.dirtyBaseChains = set.New[string]()
+	t.recreatePending = false
+	if !keepFlowtableDirty {
+		t.flowtableDirty = false
+
+		// A stale count would shorten the retry budget of the next prune.
+		t.flowtablePruneRetries = 0
+	}
+
+	// Store off the updates.
+	for chainName, hashes := range newHashes {
+		if hashes == nil {
+			delete(t.chainToDataplaneHashes, chainName)
+		} else {
+			t.chainToDataplaneHashes[chainName] = hashes
+		}
+	}
+
+	// We rewrite chains wholesale (flush + re-add) rather than patching rules by
+	// handle, so an enabled table never needs to read the dataplane back after a
+	// write: our in-memory hashes already record what we programmed, and the
+	// periodic refresh (refreshInterval) still catches any out-of-band drift.
+	// Skipping the reload is the whole point - it's an O(total rules) re-read and
+	// JSON parse of the entire table, and at scale it dominated every sync.
+	//
+	// A disabled table is the exception: it exists only to clean up leftover state
+	// when switching to iptables mode, and it reloads after a write so it can see
+	// how much remains to delete. Once nothing is left we stop (len == 0).
+	if wroteToDataplane && t.disabled && len(t.chainToDataplaneHashes) != 0 {
+		t.InvalidateDataplaneCache("post-write")
+	}
+	return nil
+}
+
+// dumpTableState logs our table's current contents for debugging after a
+// programming failure. We scope this to our own table rather than using
+// "nft list ruleset" to avoid parsing objects from other tables that may
+// contain udata written by a newer nft, which can crash older nft binaries.
+// See #11750.
+func (t *NftablesTable) dumpTableState() {
+	cmd := t.newCmd("nft", "list", "table", string(t.family), t.name)
+	output, err := cmd.Output()
+	if err != nil {
+		t.logCxt.WithError(err).Error("Failed to load nftables table state")
+		return
+	}
+	t.logCxt.WithField("tableState", string(output)).Error("Current nftables table state")
+}
+
+func (t *NftablesTable) runTransaction(tx *knftables.Transaction) error {
+	startTime := t.timeNow()
+	defer func() {
+		restoreDuration := t.timeNow().Sub(startTime)
+		t.peakNftablesWriteTime = t.peakNftablesWriteTime * 99 / 100
+		if restoreDuration > t.peakNftablesWriteTime {
+			logrus.WithField("duration", restoreDuration).Debug("Updating nftables write-time peak duration.")
+			t.peakNftablesWriteTime = restoreDuration
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), t.contextTimeout)
+	defer cancel()
+	countNumTransactions.Inc()
+	err := t.nft.Run(ctx, tx)
+	if err != nil {
+		countNumTransactionErrors.Inc()
+	}
+	return err
+}
+
+// CheckRulesPresent returns list of rules with the hashes that are already
+// programmed. Return value of nil means that none of the rules are present.
+func (t *NftablesTable) CheckRulesPresent(chain string, rules []generictables.Rule) []generictables.Rule {
+	features := t.featureDetector.GetFeatures()
+	hashes := CalculateRuleHashes(chain, rules, features)
+
+	// Pass nil so the helper lists chains itself. This is a one-off rule check,
+	// not a full resync where we already have the chain names to hand.
+	dpHashes := t.getHashesFromDataplane(nil)
+	dpHashesSet := set.New[string]()
+	for _, h := range dpHashes[chain] {
+		dpHashesSet.Add(h)
+	}
+
+	var present []generictables.Rule
+	for i, r := range rules {
+		if dpHashesSet.Contains(hashes[i]) {
+			present = append(present, r)
+		}
+	}
+
+	return present
+}
+
+// InsertRulesNow insets the given rules immediately without removing or syncing
+// other rules. This is primarily useful when bootstrapping and we cannot wait
+// until we have the full state.
+func (t *NftablesTable) InsertRulesNow(chain string, rules []generictables.Rule) error {
+	if t.disabled {
+		// We should never be inserting rules when the table is disabled.
+		logrus.WithField("chain", chain).Panic("BUG: InsertRulesNow called on disabled table.")
+	}
+
+	features := t.featureDetector.GetFeatures()
+	hashes := CalculateRuleHashes(chain, rules, features)
+
+	tx := t.nft.NewTransaction()
+	tx.Add(&knftables.Table{})
+	if baseChain, ok := t.baseChainDefs[chain]; ok {
+		tx.Add(&baseChain)
+	}
+	for i, r := range rules {
+		tx.Insert(t.render.Render(chain, hashes[i], r, features))
+	}
+
+	// Run the transaction.
+	if err := t.runTransaction(tx); err != nil {
+		t.logCxt.WithField("tx", tx.String()).Error("Failed to run InsertRulesNow nft transaction")
+		return fmt.Errorf("error performing InsertRulesNow nft transaction: %s", err)
+	}
+
+	return nil
+}
+
+// desiredStateOfChain returns the given chain, if and only if it exists in the cache and it is referenced by some
+// other chain.  If the chain doesn't exist or it is not referenced, returns nil and false.
+func (t *NftablesTable) desiredStateOfChain(chainName string) (chain *generictables.Chain, present bool) {
+	if !t.chainIsReferenced(chainName) {
+		return
+	}
+	chain, present = t.chainNameToChain[chainName]
+	return
+}
+
+func CalculateRuleHashes(chainName string, rules []generictables.Rule, features *environment.Features) []string {
+	chain := generictables.Chain{
+		Name:  chainName,
+		Rules: rules,
+	}
+	return NewNFTRenderer("", 4).RuleHashes(&chain, features)
+}

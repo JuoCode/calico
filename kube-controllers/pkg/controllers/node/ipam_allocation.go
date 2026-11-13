@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,15 @@ package node
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/accounting"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/vmipam"
 )
 
 func newBlockReleaseTracker(gracePeriod *time.Duration) *blockReleaseTracker {
@@ -158,12 +162,25 @@ func (a *allocation) fields() log.Fields {
 		f["pod"] = fmt.Sprintf("%s/%s", ns, pod)
 	}
 
+	if a.isVMAllocation() {
+		ns := a.attrs[ipam.AttributeNamespace]
+		vmi := a.attrs[ipam.AttributeVMIName]
+		if ns != "" && vmi != "" {
+			f["vmi"] = fmt.Sprintf("%s/%s", ns, vmi)
+		}
+	}
+
 	return f
 }
 
+// node is the Calico node the GC files the allocation under: its owner's node, or stoppedVMNode for a VM address
+// that no node holds. It must not change while the allocation is registered.
 func (a *allocation) node() string {
 	if node, ok := a.attrs[ipam.AttributeNode]; ok {
 		return node
+	}
+	if a.isVMAllocation() {
+		return stoppedVMNode
 	}
 	return ""
 }
@@ -221,6 +238,20 @@ func (a *allocation) isPodIP() bool {
 	return ns != "" && pod != ""
 }
 
+// isVMAllocation is whether the address belongs to a KubeVirt VM. Its owner names the VMI while a virt-launcher
+// pod runs. A stopped VM keeps its address with no owner, so only its handle marks it.
+func (a *allocation) isVMAllocation() bool {
+	if _, ok := a.attrs[ipam.AttributeVMIName]; ok {
+		return true
+	}
+	return !a.hasOwner() && strings.Contains(a.handle, vmipam.VMHandleInfix)
+}
+
+// hasOwner is whether IPAM records an active owner for the address.
+func (a *allocation) hasOwner() bool {
+	return len(a.attrs) > 0
+}
+
 func (a *allocation) isTunnelAddress() bool {
 	ipip := a.attrs[ipam.AttributeType] == ipam.AttributeTypeIPIP
 	vxlan := a.attrs[ipam.AttributeType] == ipam.AttributeTypeVXLAN
@@ -231,5 +262,93 @@ func (a *allocation) isTunnelAddress() bool {
 }
 
 func (a *allocation) isWindowsReserved() bool {
-	return a.handle == ipam.WindowsReservedHandle
+	return a.handle == accounting.WindowsReservedHandle
+}
+
+func newAllocationState() *allocationState {
+	return &allocationState{
+		allocationsByNode: map[string]map[string]*allocation{},
+		dirtyNodes:        map[string]struct{}{},
+	}
+}
+
+// allocationState is a helper struct to track in-memory representation of actual IPAM allocations.
+// It uses internal indexing of IPAM state to provide more efficient lookups than the raw IPAM data model.
+type allocationState struct {
+	// allocationsByNode maps a node name to a map of allocations keyed by a unique identifier.
+	allocationsByNode map[string]map[string]*allocation
+
+	// dirtyNodes tracks which nodes have had their IPAM data modified since the last sync.
+	dirtyNodes map[string]struct{}
+}
+
+// allocate marks an allocation as being allocated.
+func (t *allocationState) allocate(a *allocation) {
+	if _, ok := t.allocationsByNode[a.node()]; !ok {
+		t.allocationsByNode[a.node()] = map[string]*allocation{}
+	}
+	t.allocationsByNode[a.node()][a.id()] = a
+
+	// Mark the node as dirty.
+	t.markDirty(a.node(), "new allocation")
+}
+
+func (t *allocationState) iter(f func(string, map[string]*allocation)) {
+	for node, allocations := range t.allocationsByNode {
+		f(node, allocations)
+	}
+}
+
+func (t *allocationState) iterDirty(f func(string, map[string]*allocation)) {
+	for node := range t.dirtyNodes {
+		if allocations, ok := t.allocationsByNode[node]; ok {
+			f(node, allocations)
+		} else {
+			f(node, nil)
+		}
+	}
+}
+
+func (t *allocationState) markDirtyPodDeleted(pod *v1.Pod) {
+	t.markDirty(pod.Spec.NodeName, "Pod deleted")
+}
+
+func (t *allocationState) markDirty(node string, reason string) {
+	if node == "" {
+		return
+	}
+	if _, ok := t.dirtyNodes[node]; !ok {
+		log.WithFields(log.Fields{
+			"node":   node,
+			"reason": reason,
+		}).Debug("Marking node as dirty")
+		t.dirtyNodes[node] = struct{}{}
+	}
+}
+
+// markClean removes a single node from the dirty set after it has been
+// successfully processed.
+func (t *allocationState) markClean(node string, reason string) {
+	if _, ok := t.dirtyNodes[node]; ok {
+		log.WithFields(log.Fields{"node": node, "reason": reason}).Debug("Node is no longer dirty")
+		delete(t.dirtyNodes, node)
+	}
+}
+
+// release marks an allocation as not being allocated.
+func (t *allocationState) release(a *allocation) {
+	if _, ok := t.allocationsByNode[a.node()]; !ok {
+		return
+	}
+
+	// Delete the allocation.
+	delete(t.allocationsByNode[a.node()], a.id())
+
+	// Mark the node as dirty.
+	t.markDirty(a.node(), "allocation released")
+
+	// Check if the node is empty and clean it up if so.
+	if len(t.allocationsByNode[a.node()]) == 0 {
+		delete(t.allocationsByNode, a.node())
+	}
 }

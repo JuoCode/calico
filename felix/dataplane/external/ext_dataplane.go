@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@ import (
 	"os"
 	"os/exec"
 
-	pb "github.com/gogo/protobuf/proto"
 	log "github.com/sirupsen/logrus"
+	pb "google.golang.org/protobuf/proto"
 
 	_ "github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/proto"
@@ -91,7 +91,7 @@ type extDataplaneConn struct {
 	nextSeqNumber uint64
 }
 
-func (c *extDataplaneConn) RecvMessage() (msg interface{}, err error) {
+func (c *extDataplaneConn) RecvMessage() (msg any, err error) {
 	buf := make([]byte, 8)
 	_, err = io.ReadFull(c.fromDataplane, buf)
 	if err != nil {
@@ -110,7 +110,7 @@ func (c *extDataplaneConn) RecvMessage() (msg interface{}, err error) {
 	if err != nil {
 		return
 	}
-	log.WithField("envelope", envelope).Debug("Received message from dataplane.")
+	log.WithField("envelope", envelope.String()).Debug("Received message from dataplane.")
 
 	switch payload := envelope.Payload.(type) {
 	case *proto.FromDataplane_ProcessStatusUpdate:
@@ -133,7 +133,7 @@ func (c *extDataplaneConn) RecvMessage() (msg interface{}, err error) {
 	return
 }
 
-func (fc *extDataplaneConn) SendMessage(msg interface{}) error {
+func (fc *extDataplaneConn) SendMessage(msg any) error {
 	log.Debugf("Writing msg (%v) to felix: %#v", fc.nextSeqNumber, msg)
 
 	envelope, err := WrapPayloadWithEnvelope(msg, fc.nextSeqNumber)
@@ -169,7 +169,7 @@ func (fc *extDataplaneConn) SendMessage(msg interface{}) error {
 	return nil
 }
 
-func WrapPayloadWithEnvelope(msg interface{}, seqNo uint64) (*proto.ToDataplane, error) {
+func WrapPayloadWithEnvelope(msg any, seqNo uint64) (*proto.ToDataplane, error) {
 	// Wrap the payload message in an envelope so that protobuf takes care of deserialising
 	// it as the correct type.
 	envelope := &proto.ToDataplane{
@@ -206,14 +206,6 @@ func WrapPayloadWithEnvelope(msg interface{}, seqNo uint64) (*proto.ToDataplane,
 		envelope.Payload = &proto.ToDataplane_HostMetadataUpdate{HostMetadataUpdate: msg}
 	case *proto.HostMetadataRemove:
 		envelope.Payload = &proto.ToDataplane_HostMetadataRemove{HostMetadataRemove: msg}
-	case *proto.HostMetadataV6Update:
-		envelope.Payload = &proto.ToDataplane_HostMetadataV6Update{HostMetadataV6Update: msg}
-	case *proto.HostMetadataV6Remove:
-		envelope.Payload = &proto.ToDataplane_HostMetadataV6Remove{HostMetadataV6Remove: msg}
-	case *proto.HostMetadataV4V6Update:
-		envelope.Payload = &proto.ToDataplane_HostMetadataV4V6Update{HostMetadataV4V6Update: msg}
-	case *proto.HostMetadataV4V6Remove:
-		envelope.Payload = &proto.ToDataplane_HostMetadataV4V6Remove{HostMetadataV4V6Remove: msg}
 	case *proto.IPAMPoolUpdate:
 		envelope.Payload = &proto.ToDataplane_IpamPoolUpdate{IpamPoolUpdate: msg}
 	case *proto.IPAMPoolRemove:
@@ -252,7 +244,7 @@ func WrapPayloadWithEnvelope(msg interface{}, seqNo uint64) (*proto.ToDataplane,
 		envelope.Payload = &proto.ToDataplane_ServiceRemove{ServiceRemove: msg}
 
 	default:
-		return nil, fmt.Errorf("Unknown message type: %T", msg)
+		return nil, fmt.Errorf("unknown message type: %T", msg)
 	}
 
 	return envelope, nil

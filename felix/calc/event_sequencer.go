@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,29 +15,46 @@
 package calc
 
 import (
-	"fmt"
+	"maps"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/ip"
-	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
 	"github.com/projectcalico/calico/felix/multidict"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
-type EventHandler func(message interface{})
+type EventHandler func(message any)
 
 type configInterface interface {
 	UpdateFrom(map[string]string, config.Source) (changed bool, err error)
 	RawValues() map[string]string
 	ToConfigUpdate() *proto.ConfigUpdate
+}
+
+// Struct for additional data that feeds into proto.WorkloadEndpoint but is computed rather
+// than stored on resource's database.
+type EndpointComputedDataKind string
+type EndpointComputedData interface {
+	ApplyTo(*proto.WorkloadEndpoint)
+}
+
+// EndpointUpdate contains information about updates applied to the endpoint.
+type endpointUpdate struct {
+	endpoint     any
+	computedData []EndpointComputedData
+	peerData     *EndpointBGPPeer
+	tierInfo     []TierInfo
 }
 
 // EventSequencer buffers and coalesces updates from the calculation graph then flushes them
@@ -49,31 +66,27 @@ type EventSequencer struct {
 	// updates and generate updates in dependency order.
 	pendingAddedIPSets           map[string]proto.IPSetUpdate_IPSetType
 	pendingRemovedIPSets         set.Set[string]
-	pendingAddedIPSetMembers     multidict.Multidict[string, labelindex.IPSetMember]
-	pendingRemovedIPSetMembers   multidict.Multidict[string, labelindex.IPSetMember]
+	pendingAddedIPSetMembers     multidict.Multidict[string, ipsetmember.IPSetMember]
+	pendingRemovedIPSetMembers   multidict.Multidict[string, ipsetmember.IPSetMember]
 	pendingPolicyUpdates         map[model.PolicyKey]*ParsedRules
 	pendingPolicyDeletes         set.Set[model.PolicyKey]
 	pendingProfileUpdates        map[model.ProfileRulesKey]*ParsedRules
 	pendingProfileDeletes        set.Set[model.ProfileRulesKey]
 	pendingEncapUpdate           *config.Encapsulation
-	pendingEndpointUpdates       map[model.Key]interface{}
-	pendingEndpointTierUpdates   map[model.Key][]TierInfo
+	pendingEndpointUpdates       map[model.Key]endpointUpdate
 	pendingEndpointDeletes       set.Set[model.Key]
-	pendingHostIPUpdates         map[string]*net.IP
-	pendingHostIPDeletes         set.Set[string]
-	pendingHostIPv6Updates       map[string]*net.IP
-	pendingHostIPv6Deletes       set.Set[string]
-	pendingHostMetadataUpdates   map[string]*hostInfo
+	pendingHostMetadataUpdates   map[string]*HostInfo
 	pendingHostMetadataDeletes   set.Set[string]
 	pendingIPPoolUpdates         map[ip.CIDR]*model.IPPool
 	pendingIPPoolDeletes         set.Set[ip.CIDR]
 	pendingNotReady              bool
 	pendingGlobalConfig          map[string]string
+	pendingSelectorConfig        map[string]string
 	pendingHostConfig            map[string]string
-	pendingServiceAccountUpdates map[proto.ServiceAccountID]*proto.ServiceAccountUpdate
-	pendingServiceAccountDeletes set.Set[proto.ServiceAccountID]
-	pendingNamespaceUpdates      map[proto.NamespaceID]*proto.NamespaceUpdate
-	pendingNamespaceDeletes      set.Set[proto.NamespaceID]
+	pendingServiceAccountUpdates map[types.ServiceAccountID]*proto.ServiceAccountUpdate
+	pendingServiceAccountDeletes set.Set[types.ServiceAccountID]
+	pendingNamespaceUpdates      map[types.NamespaceID]*proto.NamespaceUpdate
+	pendingNamespaceDeletes      set.Set[types.NamespaceID]
 	pendingRouteUpdates          map[routeID]*proto.RouteUpdate
 	pendingRouteDeletes          set.Set[routeID]
 	pendingVTEPUpdates           map[string]*proto.VXLANTunnelEndpointUpdate
@@ -93,8 +106,8 @@ type EventSequencer struct {
 	sentHostIPv6s       set.Set[string]
 	sentHosts           set.Set[string]
 	sentIPPools         set.Set[ip.CIDR]
-	sentServiceAccounts set.Set[proto.ServiceAccountID]
-	sentNamespaces      set.Set[proto.NamespaceID]
+	sentServiceAccounts set.Set[types.ServiceAccountID]
+	sentNamespaces      set.Set[types.NamespaceID]
 	sentRoutes          set.Set[routeID]
 	sentVTEPs           set.Set[string]
 	sentWireguard       set.Set[string]
@@ -104,11 +117,18 @@ type EventSequencer struct {
 	Callback EventHandler
 }
 
-type hostInfo struct {
-	ip4Addr  *net.IPNet
-	ip6Addr  *net.IPNet
+type HostInfo struct {
+	ip4Addr  string
+	ip6Addr  string
 	labels   map[string]string
 	asnumber string
+}
+
+func (h *HostInfo) equals(a *HostInfo) bool {
+	return h.ip4Addr == a.ip4Addr &&
+		h.ip6Addr == a.ip6Addr &&
+		h.asnumber == a.asnumber &&
+		maps.Equal(h.labels, a.labels)
 }
 
 type serviceID struct {
@@ -116,43 +136,28 @@ type serviceID struct {
 	Namespace string
 }
 
-// func (buf *EventSequencer) HasPendingUpdates() {
-//	return buf.pendingAddedIPSets.Len() > 0 ||
-//		buf.pendingRemovedIPSets.Len() > 0 ||
-//		buf.pendingAddedIPSetMembers.Len() > 0 ||
-//		buf.pendingRemovedIPSetMembers.Len() > 0 ||
-//		len(buf.pendingPolicyUpdates) > 0 ||
-//		buf.pendingPolicyDeletes.Len() > 0 ||
-//
-// }
-
 func NewEventSequencer(conf configInterface) *EventSequencer {
 	buf := &EventSequencer{
 		config:                     conf,
 		pendingAddedIPSets:         map[string]proto.IPSetUpdate_IPSetType{},
 		pendingRemovedIPSets:       set.New[string](),
-		pendingAddedIPSetMembers:   multidict.New[string, labelindex.IPSetMember](),
-		pendingRemovedIPSetMembers: multidict.New[string, labelindex.IPSetMember](),
+		pendingAddedIPSetMembers:   multidict.New[string, ipsetmember.IPSetMember](),
+		pendingRemovedIPSetMembers: multidict.New[string, ipsetmember.IPSetMember](),
 
 		pendingPolicyUpdates:         map[model.PolicyKey]*ParsedRules{},
 		pendingPolicyDeletes:         set.New[model.PolicyKey](),
 		pendingProfileUpdates:        map[model.ProfileRulesKey]*ParsedRules{},
 		pendingProfileDeletes:        set.New[model.ProfileRulesKey](),
-		pendingEndpointUpdates:       map[model.Key]interface{}{},
-		pendingEndpointTierUpdates:   map[model.Key][]TierInfo{},
+		pendingEndpointUpdates:       map[model.Key]endpointUpdate{},
 		pendingEndpointDeletes:       set.New[model.Key](),
-		pendingHostIPUpdates:         map[string]*net.IP{},
-		pendingHostIPDeletes:         set.New[string](),
-		pendingHostIPv6Updates:       map[string]*net.IP{},
-		pendingHostIPv6Deletes:       set.New[string](),
-		pendingHostMetadataUpdates:   map[string]*hostInfo{},
+		pendingHostMetadataUpdates:   map[string]*HostInfo{},
 		pendingHostMetadataDeletes:   set.New[string](),
 		pendingIPPoolUpdates:         map[ip.CIDR]*model.IPPool{},
 		pendingIPPoolDeletes:         set.New[ip.CIDR](),
-		pendingServiceAccountUpdates: map[proto.ServiceAccountID]*proto.ServiceAccountUpdate{},
-		pendingServiceAccountDeletes: set.New[proto.ServiceAccountID](),
-		pendingNamespaceUpdates:      map[proto.NamespaceID]*proto.NamespaceUpdate{},
-		pendingNamespaceDeletes:      set.New[proto.NamespaceID](),
+		pendingServiceAccountUpdates: map[types.ServiceAccountID]*proto.ServiceAccountUpdate{},
+		pendingServiceAccountDeletes: set.New[types.ServiceAccountID](),
+		pendingNamespaceUpdates:      map[types.NamespaceID]*proto.NamespaceUpdate{},
+		pendingNamespaceDeletes:      set.New[types.NamespaceID](),
 		pendingRouteUpdates:          map[routeID]*proto.RouteUpdate{},
 		pendingRouteDeletes:          set.New[routeID](),
 		pendingVTEPUpdates:           map[string]*proto.VXLANTunnelEndpointUpdate{},
@@ -171,8 +176,8 @@ func NewEventSequencer(conf configInterface) *EventSequencer {
 		sentHostIPv6s:       set.New[string](),
 		sentHosts:           set.New[string](),
 		sentIPPools:         set.New[ip.CIDR](),
-		sentServiceAccounts: set.New[proto.ServiceAccountID](),
-		sentNamespaces:      set.New[proto.NamespaceID](),
+		sentServiceAccounts: set.New[types.ServiceAccountID](),
+		sentNamespaces:      set.New[types.NamespaceID](),
 		sentRoutes:          set.New[routeID](),
 		sentVTEPs:           set.New[string](),
 		sentWireguard:       set.New[string](),
@@ -215,7 +220,7 @@ func (buf *EventSequencer) OnIPSetRemoved(setID string) {
 	buf.pendingRemovedIPSetMembers.DiscardKey(setID)
 }
 
-func (buf *EventSequencer) OnIPSetMemberAdded(setID string, member labelindex.IPSetMember) {
+func (buf *EventSequencer) OnIPSetMemberAdded(setID string, member ipsetmember.IPSetMember) {
 	log.Debugf("IP set %v now contains %v", setID, member)
 	sent := buf.sentIPSets.Contains(setID)
 	_, updatePending := buf.pendingAddedIPSets[setID]
@@ -229,7 +234,7 @@ func (buf *EventSequencer) OnIPSetMemberAdded(setID string, member labelindex.IP
 	}
 }
 
-func (buf *EventSequencer) OnIPSetMemberRemoved(setID string, member labelindex.IPSetMember) {
+func (buf *EventSequencer) OnIPSetMemberRemoved(setID string, member ipsetmember.IPSetMember) {
 	log.Debugf("IP set %v no longer contains %v", setID, member)
 	sent := buf.sentIPSets.Contains(setID)
 	_, updatePending := buf.pendingAddedIPSets[setID]
@@ -257,8 +262,9 @@ func (buf *EventSequencer) flushReadyFlag() {
 
 type DatastoreNotReady struct{}
 
-func (buf *EventSequencer) OnConfigUpdate(globalConfig, hostConfig map[string]string) {
+func (buf *EventSequencer) OnConfigUpdate(globalConfig, selectorConfig, hostConfig map[string]string) {
 	buf.pendingGlobalConfig = globalConfig
+	buf.pendingSelectorConfig = selectorConfig
 	buf.pendingHostConfig = hostConfig
 }
 
@@ -267,11 +273,16 @@ func (buf *EventSequencer) flushConfigUpdate() {
 		return
 	}
 	logCxt := log.WithFields(log.Fields{
-		"global": buf.pendingGlobalConfig,
-		"host":   buf.pendingHostConfig,
+		"global":   buf.pendingGlobalConfig,
+		"selector": buf.pendingSelectorConfig,
+		"host":     buf.pendingHostConfig,
 	})
 	logCxt.Info("Possible config update.")
 	globalChanged, err := buf.config.UpdateFrom(buf.pendingGlobalConfig, config.DatastoreGlobal)
+	if err != nil {
+		logCxt.WithError(err).Panic("Failed to parse config update")
+	}
+	selectorChanged, err := buf.config.UpdateFrom(buf.pendingSelectorConfig, config.DatastorePerSelector)
 	if err != nil {
 		logCxt.WithError(err).Panic("Failed to parse config update")
 	}
@@ -279,12 +290,13 @@ func (buf *EventSequencer) flushConfigUpdate() {
 	if err != nil {
 		logCxt.WithError(err).Panic("Failed to parse config update")
 	}
-	if globalChanged || hostChanged {
+	if globalChanged || selectorChanged || hostChanged {
 		rawConfig := buf.config.RawValues()
 		log.WithField("merged", rawConfig).Info("Config changed. Sending ConfigUpdate message.")
 		buf.Callback(buf.config.ToConfigUpdate())
 	}
 	buf.pendingGlobalConfig = nil
+	buf.pendingSelectorConfig = nil
 	buf.pendingHostConfig = nil
 }
 
@@ -302,12 +314,18 @@ func (buf *EventSequencer) flushPolicyUpdates() {
 }
 
 func ParsedRulesToActivePolicyUpdate(key model.PolicyKey, rules *ParsedRules) *proto.ActivePolicyUpdate {
+	var perfHints []string
+	for _, hint := range rules.PerformanceHints {
+		perfHints = append(perfHints, string(hint))
+	}
 	return &proto.ActivePolicyUpdate{
 		Id: &proto.PolicyID{
-			Tier: "default",
-			Name: key.Name,
+			Name:      key.Name,
+			Namespace: key.Namespace,
+			Kind:      key.Kind,
 		},
 		Policy: &proto.Policy{
+			Tier:      rules.Tier,
 			Namespace: rules.Namespace,
 			InboundRules: parsedRulesToProtoRules(
 				rules.InboundRules,
@@ -320,6 +338,7 @@ func ParsedRulesToActivePolicyUpdate(key model.PolicyKey, rules *ParsedRules) *p
 			Untracked:        rules.Untracked,
 			PreDnat:          rules.PreDNAT,
 			OriginalSelector: rules.OriginalSelector,
+			PerfHints:        perfHints,
 		},
 	}
 }
@@ -332,16 +351,17 @@ func (buf *EventSequencer) OnPolicyInactive(key model.PolicyKey) {
 }
 
 func (buf *EventSequencer) flushPolicyDeletes() {
-	buf.pendingPolicyDeletes.Iter(func(item model.PolicyKey) error {
+	for item := range buf.pendingPolicyDeletes.All() {
 		buf.Callback(&proto.ActivePolicyRemove{
 			Id: &proto.PolicyID{
-				Tier: "default",
-				Name: item.Name,
+				Name:      item.Name,
+				Namespace: item.Namespace,
+				Kind:      item.Kind,
 			},
 		})
 		buf.sentPolicies.Discard(item)
-		return set.RemoveItem
-	})
+		buf.pendingPolicyDeletes.Discard(item)
+	}
 }
 
 func (buf *EventSequencer) OnProfileActive(key model.ProfileRulesKey, rules *ParsedRules) {
@@ -379,23 +399,71 @@ func (buf *EventSequencer) OnProfileInactive(key model.ProfileRulesKey) {
 }
 
 func (buf *EventSequencer) flushProfileDeletes() {
-	buf.pendingProfileDeletes.Iter(func(item model.ProfileRulesKey) error {
+	for item := range buf.pendingProfileDeletes.All() {
 		buf.Callback(&proto.ActiveProfileRemove{
 			Id: &proto.ProfileID{
 				Name: item.Name,
 			},
 		})
 		buf.sentProfiles.Discard(item)
-		return set.RemoveItem
-	})
+		buf.pendingProfileDeletes.Discard(item)
+	}
 }
 
-func ModelWorkloadEndpointToProto(ep *model.WorkloadEndpoint, tiers []*proto.TierInfo) *proto.WorkloadEndpoint {
+func ModelWorkloadEndpointToProto(ep *model.WorkloadEndpoint, computedData []EndpointComputedData, peerData *EndpointBGPPeer, tiers []*proto.TierInfo) *proto.WorkloadEndpoint {
 	mac := ""
 	if ep.Mac != nil {
 		mac = ep.Mac.String()
 	}
-	return &proto.WorkloadEndpoint{
+	var (
+		qosControls *proto.QoSControls
+		qosPolicies []*proto.QoSPolicy
+	)
+	if ep.QoSControls != nil {
+		qosControls = &proto.QoSControls{
+			IngressBandwidth:      ep.QoSControls.IngressBandwidth,
+			EgressBandwidth:       ep.QoSControls.EgressBandwidth,
+			IngressBurst:          ep.QoSControls.IngressBurst,
+			EgressBurst:           ep.QoSControls.EgressBurst,
+			IngressPeakrate:       ep.QoSControls.IngressPeakrate,
+			EgressPeakrate:        ep.QoSControls.EgressPeakrate,
+			IngressMinburst:       ep.QoSControls.IngressMinburst,
+			EgressMinburst:        ep.QoSControls.EgressMinburst,
+			IngressPacketRate:     ep.QoSControls.IngressPacketRate,
+			EgressPacketRate:      ep.QoSControls.EgressPacketRate,
+			IngressPacketBurst:    ep.QoSControls.IngressPacketBurst,
+			EgressPacketBurst:     ep.QoSControls.EgressPacketBurst,
+			IngressMaxConnections: ep.QoSControls.IngressMaxConnections,
+			EgressMaxConnections:  ep.QoSControls.EgressMaxConnections,
+		}
+
+		if ep.QoSControls.DSCP != nil {
+			qosPolicies = append(qosPolicies, &proto.QoSPolicy{
+				Dscp: int32(ep.QoSControls.DSCP.ToUint8()),
+			})
+		}
+	}
+
+	var localBGPPeer *proto.LocalBGPPeer
+	if peerData != nil {
+		localBGPPeer = &proto.LocalBGPPeer{
+			BgpPeerName: peerData.v3PeerName,
+		}
+	}
+
+	var skipRedir *proto.WorkloadBpfSkipRedir
+	// BPF ingress redirect should be skipped for VM workloads and workloads that have ingress BW QoS configured
+	if isVMWorkload(ep.Labels) || (ep.QoSControls != nil && (ep.QoSControls.IngressBandwidth > 0 || ep.QoSControls.IngressPacketRate > 0)) {
+		skipRedir = &proto.WorkloadBpfSkipRedir{Ingress: true}
+	}
+	if ep.QoSControls != nil && (ep.QoSControls.EgressBandwidth > 0 || ep.QoSControls.EgressPacketRate > 0) {
+		if skipRedir == nil {
+			skipRedir = &proto.WorkloadBpfSkipRedir{}
+		}
+		skipRedir.Egress = true
+	}
+
+	wep := &proto.WorkloadEndpoint{
 		State:                      ep.State,
 		Name:                       ep.Name,
 		Mac:                        mac,
@@ -407,10 +475,27 @@ func ModelWorkloadEndpointToProto(ep *model.WorkloadEndpoint, tiers []*proto.Tie
 		Ipv6Nat:                    natsToProtoNatInfo(ep.IPv6NAT),
 		AllowSpoofedSourcePrefixes: netsToStrings(ep.AllowSpoofedSourcePrefixes),
 		Annotations:                ep.Annotations,
+		QosControls:                qosControls,
+		LocalBgpPeer:               localBGPPeer,
+		SkipRedir:                  skipRedir,
+		QosPolicies:                qosPolicies,
+		LiveMigrationVmiName:       vmiNameFromLabels(ep.Labels),
 	}
+
+	for _, cd := range computedData {
+		cd.ApplyTo(wep)
+	}
+
+	return wep
 }
 
 func ModelHostEndpointToProto(ep *model.HostEndpoint, tiers, untrackedTiers, preDNATTiers []*proto.TierInfo, forwardTiers []*proto.TierInfo) *proto.HostEndpoint {
+	var qosPolicies []*proto.QoSPolicy
+	if ep.QoSControls != nil && ep.QoSControls.DSCP != nil {
+		qosPolicies = append(qosPolicies, &proto.QoSPolicy{
+			Dscp: int32(ep.QoSControls.DSCP.ToUint8()),
+		})
+	}
 	return &proto.HostEndpoint{
 		Name:              ep.Name,
 		ExpectedIpv4Addrs: ipsToStrings(ep.ExpectedIPv4Addrs),
@@ -420,42 +505,52 @@ func ModelHostEndpointToProto(ep *model.HostEndpoint, tiers, untrackedTiers, pre
 		UntrackedTiers:    untrackedTiers,
 		PreDnatTiers:      preDNATTiers,
 		ForwardTiers:      forwardTiers,
+		QosPolicies:       qosPolicies,
 	}
 }
 
-func (buf *EventSequencer) OnEndpointTierUpdate(key model.Key,
-	endpoint interface{},
+func (buf *EventSequencer) OnEndpointTierUpdate(
+	endpointKey model.EndpointKey,
+	endpoint model.Endpoint,
+	computedData []EndpointComputedData,
+	peerData *EndpointBGPPeer,
 	filteredTiers []TierInfo,
 ) {
 	if endpoint == nil {
 		// Deletion. Squash any queued updates.
-		delete(buf.pendingEndpointUpdates, key)
-		delete(buf.pendingEndpointTierUpdates, key)
-		if buf.sentEndpoints.Contains(key) {
+		delete(buf.pendingEndpointUpdates, endpointKey)
+		if buf.sentEndpoints.Contains(endpointKey) {
 			// We'd previously sent an update, so we need to send a deletion.
-			buf.pendingEndpointDeletes.Add(key)
+			buf.pendingEndpointDeletes.Add(endpointKey)
 		}
 	} else {
 		// Update.
-		buf.pendingEndpointDeletes.Discard(key)
-		buf.pendingEndpointUpdates[key] = endpoint
-		buf.pendingEndpointTierUpdates[key] = filteredTiers
+		buf.pendingEndpointDeletes.Discard(endpointKey)
+		buf.pendingEndpointUpdates[endpointKey] = endpointUpdate{
+			endpoint:     endpoint,
+			computedData: computedData,
+			peerData:     peerData,
+			tierInfo:     filteredTiers,
+		}
 	}
 }
 
 func (buf *EventSequencer) flushEndpointTierUpdates() {
-	for key, endpoint := range buf.pendingEndpointUpdates {
-		tiers, untrackedTiers, preDNATTiers, forwardTiers := tierInfoToProtoTierInfo(buf.pendingEndpointTierUpdates[key])
+	for key, endpointUpdate := range buf.pendingEndpointUpdates {
+		endpoint := endpointUpdate.endpoint
+
+		tiers, untrackedTiers, preDNATTiers, forwardTiers := tierInfoToProtoTierInfo(endpointUpdate.tierInfo)
 		switch key := key.(type) {
 		case model.WorkloadEndpointKey:
 			wlep := endpoint.(*model.WorkloadEndpoint)
+
 			buf.Callback(&proto.WorkloadEndpointUpdate{
 				Id: &proto.WorkloadEndpointID{
 					OrchestratorId: key.OrchestratorID,
 					WorkloadId:     key.WorkloadID,
 					EndpointId:     key.EndpointID,
 				},
-				Endpoint: ModelWorkloadEndpointToProto(wlep, tiers),
+				Endpoint: ModelWorkloadEndpointToProto(wlep, endpointUpdate.computedData, endpointUpdate.peerData, tiers),
 			})
 		case model.HostEndpointKey:
 			hep := endpoint.(*model.HostEndpoint)
@@ -470,12 +565,11 @@ func (buf *EventSequencer) flushEndpointTierUpdates() {
 		buf.sentEndpoints.Add(key)
 		// And clean up the pending buffer.
 		delete(buf.pendingEndpointUpdates, key)
-		delete(buf.pendingEndpointTierUpdates, key)
 	}
 }
 
 func (buf *EventSequencer) flushEndpointTierDeletes() {
-	buf.pendingEndpointDeletes.Iter(func(item model.Key) error {
+	for item := range buf.pendingEndpointDeletes.All() {
 		switch key := item.(type) {
 		case model.WorkloadEndpointKey:
 			buf.Callback(&proto.WorkloadEndpointRemove{
@@ -493,8 +587,8 @@ func (buf *EventSequencer) flushEndpointTierDeletes() {
 			})
 		}
 		buf.sentEndpoints.Discard(item)
-		return set.RemoveItem
-	})
+		buf.pendingEndpointDeletes.Discard(item)
+	}
 }
 
 func (buf *EventSequencer) OnEncapUpdate(encap config.Encapsulation) {
@@ -502,6 +596,7 @@ func (buf *EventSequencer) OnEncapUpdate(encap config.Encapsulation) {
 		"IPIPEnabled":    encap.IPIPEnabled,
 		"VXLANEnabled":   encap.VXLANEnabled,
 		"VXLANEnabledV6": encap.VXLANEnabledV6,
+		"NoEncapNeeded":  encap.NoEncapNeeded,
 	}).Debug("Encapsulation update")
 	buf.pendingEncapUpdate = &encap
 }
@@ -512,112 +607,30 @@ func (buf *EventSequencer) flushEncapUpdate() {
 			IpipEnabled:    buf.pendingEncapUpdate.IPIPEnabled,
 			VxlanEnabled:   buf.pendingEncapUpdate.VXLANEnabled,
 			VxlanEnabledV6: buf.pendingEncapUpdate.VXLANEnabledV6,
+			// Note, "NoEncapEnabled" should have been named "NoEncapNeeded", but we
+			// can't change this now in the proto API, as 3rd parties might be relying
+			// on it.
+			NoEncapEnabled: buf.pendingEncapUpdate.NoEncapNeeded,
 		})
 		buf.pendingEncapUpdate = nil
 	}
 }
 
-func (buf *EventSequencer) OnHostIPUpdate(hostname string, ip *net.IP) {
+func (buf *EventSequencer) OnHostMetadataUpdate(hostname string, info *HostInfo) {
 	log.WithFields(log.Fields{
 		"hostname": hostname,
-		"ip":       ip,
-	}).Debug("HostIP update")
-	buf.pendingHostIPDeletes.Discard(hostname)
-	buf.pendingHostIPUpdates[hostname] = ip
-}
-
-func (buf *EventSequencer) flushHostIPUpdates() {
-	for hostname, hostIP := range buf.pendingHostIPUpdates {
-		buf.Callback(&proto.HostMetadataUpdate{
-			Hostname: hostname,
-			Ipv4Addr: hostIP.IP.String(),
-		})
-		buf.sentHostIPs.Add(hostname)
-		delete(buf.pendingHostIPUpdates, hostname)
-	}
-}
-
-func (buf *EventSequencer) OnHostIPRemove(hostname string) {
-	log.WithField("hostname", hostname).Debug("HostIP removed")
-	delete(buf.pendingHostIPUpdates, hostname)
-	if buf.sentHostIPs.Contains(hostname) {
-		buf.pendingHostIPDeletes.Add(hostname)
-	}
-}
-
-func (buf *EventSequencer) flushHostIPDeletes() {
-	buf.pendingHostIPDeletes.Iter(func(item string) error {
-		buf.Callback(&proto.HostMetadataRemove{
-			Hostname: item,
-		})
-		buf.sentHostIPs.Discard(item)
-		return set.RemoveItem
-	})
-}
-
-func (buf *EventSequencer) OnHostIPv6Update(hostname string, ip *net.IP) {
-	log.WithFields(log.Fields{
-		"hostname": hostname,
-		"ip":       ip,
-	}).Debug("Host IPv6 update")
-	buf.pendingHostIPv6Deletes.Discard(hostname)
-	buf.pendingHostIPv6Updates[hostname] = ip
-}
-
-func (buf *EventSequencer) flushHostIPv6Updates() {
-	for hostname, hostIP := range buf.pendingHostIPv6Updates {
-		buf.Callback(&proto.HostMetadataV6Update{
-			Hostname: hostname,
-			Ipv6Addr: hostIP.IP.String(),
-		})
-		buf.sentHostIPv6s.Add(hostname)
-		delete(buf.pendingHostIPv6Updates, hostname)
-	}
-}
-
-func (buf *EventSequencer) OnHostIPv6Remove(hostname string) {
-	log.WithField("hostname", hostname).Debug("Host IPv6 removed")
-	delete(buf.pendingHostIPv6Updates, hostname)
-	if buf.sentHostIPv6s.Contains(hostname) {
-		buf.pendingHostIPv6Deletes.Add(hostname)
-	}
-}
-
-func (buf *EventSequencer) flushHostIPv6Deletes() {
-	buf.pendingHostIPv6Deletes.Iter(func(item string) error {
-		buf.Callback(&proto.HostMetadataV6Remove{
-			Hostname: item,
-		})
-		buf.sentHostIPv6s.Discard(item)
-		return set.RemoveItem
-	})
-}
-
-func (buf *EventSequencer) OnHostMetadataUpdate(hostname string, ip4 *net.IPNet, ip6 *net.IPNet, asnumber string, labels map[string]string) {
-	log.WithFields(log.Fields{
-		"hostname": hostname,
-		"ip4":      ip4,
-		"ip6":      ip6,
-		"labels":   labels,
-		"asnumber": asnumber,
+		"update":   info,
 	}).Debug("Host update")
 	buf.pendingHostMetadataDeletes.Discard(hostname)
-	buf.pendingHostMetadataUpdates[hostname] = &hostInfo{ip4Addr: ip4, ip6Addr: ip6, labels: labels, asnumber: asnumber}
+	buf.pendingHostMetadataUpdates[hostname] = info
 }
 
 func (buf *EventSequencer) flushHostUpdates() {
 	for hostname, hostInfo := range buf.pendingHostMetadataUpdates {
-		var ip4str, ip6str string
-		if hostInfo.ip4Addr.IP != nil {
-			ip4str = hostInfo.ip4Addr.String()
-		}
-		if hostInfo.ip6Addr.IP != nil {
-			ip6str = hostInfo.ip6Addr.String()
-		}
-		buf.Callback(&proto.HostMetadataV4V6Update{
+		buf.Callback(&proto.HostMetadataUpdate{
 			Hostname: hostname,
-			Ipv4Addr: ip4str,
-			Ipv6Addr: ip6str,
+			Ipv4Addr: hostInfo.ip4Addr,
+			Ipv6Addr: hostInfo.ip6Addr,
 			Asnumber: hostInfo.asnumber,
 			Labels:   hostInfo.labels,
 		})
@@ -635,13 +648,13 @@ func (buf *EventSequencer) OnHostMetadataRemove(hostname string) {
 }
 
 func (buf *EventSequencer) flushHostDeletes() {
-	buf.pendingHostMetadataDeletes.Iter(func(item string) error {
-		buf.Callback(&proto.HostMetadataV4V6Remove{
+	for item := range buf.pendingHostMetadataDeletes.All() {
+		buf.Callback(&proto.HostMetadataRemove{
 			Hostname: item,
 		})
 		buf.sentHosts.Discard(item)
-		return set.RemoveItem
-	})
+		buf.pendingHostMetadataDeletes.Discard(item)
+	}
 }
 
 func (buf *EventSequencer) OnIPPoolUpdate(key model.IPPoolKey, pool *model.IPPool) {
@@ -649,20 +662,25 @@ func (buf *EventSequencer) OnIPPoolUpdate(key model.IPPoolKey, pool *model.IPPoo
 		"key":  key,
 		"pool": pool,
 	}).Debug("IPPool update")
-	cidr := ip.CIDRFromCalicoNet(key.CIDR)
+	cidr := ip.CIDRFromPrefix(key.CIDR)
 	buf.pendingIPPoolDeletes.Discard(cidr)
 	buf.pendingIPPoolUpdates[cidr] = pool
 }
 
 func (buf *EventSequencer) flushIPPoolUpdates() {
 	for key, pool := range buf.pendingIPPoolUpdates {
+		allowedUses := make([]string, len(pool.AllowedUses))
+		for i, u := range pool.AllowedUses {
+			allowedUses[i] = string(u)
+		}
 		buf.Callback(&proto.IPAMPoolUpdate{
 			Id: cidrToIPPoolID(key),
 			Pool: &proto.IPAMPool{
-				Cidr:       pool.CIDR.String(),
-				Masquerade: pool.Masquerade,
-				IpipMode:   string(pool.IPIPMode),
-				VxlanMode:  string(pool.VXLANMode),
+				Cidr:        pool.CIDR.String(),
+				Masquerade:  pool.Masquerade,
+				IpipMode:    string(pool.IPIPMode),
+				VxlanMode:   string(pool.VXLANMode),
+				AllowedUses: allowedUses,
 			},
 		})
 		buf.sentIPPools.Add(key)
@@ -721,7 +739,7 @@ func (buf *EventSequencer) flushHostWireguardUpdates() {
 
 func (buf *EventSequencer) OnIPPoolRemove(key model.IPPoolKey) {
 	log.WithField("key", key).Debug("IPPool removed")
-	cidr := ip.CIDRFromCalicoNet(key.CIDR)
+	cidr := ip.CIDRFromPrefix(key.CIDR)
 	delete(buf.pendingIPPoolUpdates, cidr)
 	if buf.sentIPPools.Contains(cidr) {
 		buf.pendingIPPoolDeletes.Add(cidr)
@@ -729,17 +747,17 @@ func (buf *EventSequencer) OnIPPoolRemove(key model.IPPoolKey) {
 }
 
 func (buf *EventSequencer) flushIPPoolDeletes() {
-	buf.pendingIPPoolDeletes.Iter(func(key ip.CIDR) error {
+	for key := range buf.pendingIPPoolDeletes.All() {
 		buf.Callback(&proto.IPAMPoolRemove{
 			Id: cidrToIPPoolID(key),
 		})
 		buf.sentIPPools.Discard(key)
-		return set.RemoveItem
-	})
+		buf.pendingIPPoolDeletes.Discard(key)
+	}
 }
 
 func (buf *EventSequencer) flushHostWireguardDeletes() {
-	buf.pendingWireguardDeletes.Iter(func(key string) error {
+	for key := range buf.pendingWireguardDeletes.All() {
 		log.WithField("nodename", key).Debug("Processing pending wireguard delete")
 		if buf.sentWireguard.Contains(key) {
 			log.Debug("Sending IPv4 wireguard endpoint remove")
@@ -755,8 +773,8 @@ func (buf *EventSequencer) flushHostWireguardDeletes() {
 			})
 			buf.sentWireguardV6.Discard(key)
 		}
-		return set.RemoveItem
-	})
+		buf.pendingWireguardDeletes.Discard(key)
+	}
 	log.Debug("Done flushing wireguard removes")
 }
 
@@ -764,8 +782,8 @@ func (buf *EventSequencer) flushAddedIPSets() {
 	for setID, setType := range buf.pendingAddedIPSets {
 		log.WithField("setID", setID).Debug("Flushing added IP set")
 		members := make([]string, 0)
-		buf.pendingAddedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
-			members = append(members, memberToProto(member))
+		buf.pendingAddedIPSetMembers.Iter(setID, func(member ipsetmember.IPSetMember) {
+			members = append(members, member.ToProtobufFormat())
 		})
 		buf.pendingAddedIPSetMembers.DiscardKey(setID)
 		buf.Callback(&proto.IPSetUpdate{
@@ -776,21 +794,6 @@ func (buf *EventSequencer) flushAddedIPSets() {
 		buf.sentIPSets.Add(setID)
 		delete(buf.pendingAddedIPSets, setID)
 	}
-}
-
-func memberToProto(member labelindex.IPSetMember) string {
-	switch member.Protocol {
-	case labelindex.ProtocolNone:
-		return member.CIDR.String()
-	case labelindex.ProtocolTCP:
-		return fmt.Sprintf("%s,tcp:%d", member.CIDR.Addr(), member.PortNumber)
-	case labelindex.ProtocolUDP:
-		return fmt.Sprintf("%s,udp:%d", member.CIDR.Addr(), member.PortNumber)
-	case labelindex.ProtocolSCTP:
-		return fmt.Sprintf("%s,sctp:%d", member.CIDR.Addr(), member.PortNumber)
-	}
-	log.WithField("member", member).Panic("Unknown IP set member type")
-	return ""
 }
 
 func (buf *EventSequencer) Flush() {
@@ -829,10 +832,6 @@ func (buf *EventSequencer) Flush() {
 	// as well do deletions first to minimise occupancy.
 	buf.flushHostWireguardDeletes()
 	buf.flushHostWireguardUpdates()
-	buf.flushHostIPDeletes()
-	buf.flushHostIPUpdates()
-	buf.flushHostIPv6Deletes()
-	buf.flushHostIPv6Updates()
 	buf.flushHostDeletes()
 	buf.flushHostUpdates()
 	buf.flushIPPoolDeletes()
@@ -849,7 +848,7 @@ func (buf *EventSequencer) Flush() {
 }
 
 func (buf *EventSequencer) flushRemovedIPSets() {
-	buf.pendingRemovedIPSets.Iter(func(setID string) (err error) {
+	for setID := range buf.pendingRemovedIPSets.All() {
 		log.Debugf("Flushing IP set remove: %v", setID)
 		buf.Callback(&proto.IPSetRemove{
 			Id: setID,
@@ -858,8 +857,7 @@ func (buf *EventSequencer) flushRemovedIPSets() {
 		buf.pendingAddedIPSetMembers.DiscardKey(setID)
 		buf.pendingRemovedIPSets.Discard(setID)
 		buf.sentIPSets.Discard(setID)
-		return
-	})
+	}
 	log.Debugf("Done flushing IP set removes")
 }
 
@@ -874,11 +872,11 @@ func (buf *EventSequencer) flushAddsOrRemoves(setID string) {
 	deltaUpdate := proto.IPSetDeltaUpdate{
 		Id: setID,
 	}
-	buf.pendingAddedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
-		deltaUpdate.AddedMembers = append(deltaUpdate.AddedMembers, memberToProto(member))
+	buf.pendingAddedIPSetMembers.Iter(setID, func(member ipsetmember.IPSetMember) {
+		deltaUpdate.AddedMembers = append(deltaUpdate.AddedMembers, member.ToProtobufFormat())
 	})
-	buf.pendingRemovedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
-		deltaUpdate.RemovedMembers = append(deltaUpdate.RemovedMembers, memberToProto(member))
+	buf.pendingRemovedIPSetMembers.Iter(setID, func(member ipsetmember.IPSetMember) {
+		deltaUpdate.RemovedMembers = append(deltaUpdate.RemovedMembers, member.ToProtobufFormat())
 	})
 	buf.pendingAddedIPSetMembers.DiscardKey(setID)
 	buf.pendingRemovedIPSetMembers.DiscardKey(setID)
@@ -887,7 +885,7 @@ func (buf *EventSequencer) flushAddsOrRemoves(setID string) {
 
 func (buf *EventSequencer) OnServiceAccountUpdate(update *proto.ServiceAccountUpdate) {
 	// We trust the caller not to send us an update with nil ID, so safe to dereference.
-	id := *update.Id
+	id := types.ProtoToServiceAccountID(update.Id)
 	log.WithFields(log.Fields{
 		"key":    id,
 		"labels": update.GetLabels(),
@@ -896,7 +894,7 @@ func (buf *EventSequencer) OnServiceAccountUpdate(update *proto.ServiceAccountUp
 	buf.pendingServiceAccountUpdates[id] = update
 }
 
-func (buf *EventSequencer) OnServiceAccountRemove(id proto.ServiceAccountID) {
+func (buf *EventSequencer) OnServiceAccountRemove(id types.ServiceAccountID) {
 	log.WithFields(log.Fields{
 		"key": id,
 	}).Debug("ServiceAccount removed")
@@ -908,27 +906,27 @@ func (buf *EventSequencer) OnServiceAccountRemove(id proto.ServiceAccountID) {
 
 func (buf *EventSequencer) flushServiceAccounts() {
 	// Order doesn't matter, but send removes first to reduce max occupancy
-	buf.pendingServiceAccountDeletes.Iter(func(id proto.ServiceAccountID) error {
-		msg := proto.ServiceAccountRemove{Id: &id}
+	for id := range buf.pendingServiceAccountDeletes.All() {
+		protoID := types.ServiceAccountIDToProto(id)
+		msg := proto.ServiceAccountRemove{Id: protoID}
 		buf.Callback(&msg)
 		buf.sentServiceAccounts.Discard(id)
-		return nil
-	})
+	}
 	buf.pendingServiceAccountDeletes.Clear()
 	for _, msg := range buf.pendingServiceAccountUpdates {
 		buf.Callback(msg)
-		id := msg.Id
+		id := types.ProtoToServiceAccountID(msg.GetId())
 		// We safely dereferenced the Id in OnServiceAccountUpdate before adding it to the pending updates map, so
 		// it is safe to do so here.
-		buf.sentServiceAccounts.Add(*id)
+		buf.sentServiceAccounts.Add(id)
 	}
-	buf.pendingServiceAccountUpdates = make(map[proto.ServiceAccountID]*proto.ServiceAccountUpdate)
+	buf.pendingServiceAccountUpdates = make(map[types.ServiceAccountID]*proto.ServiceAccountUpdate)
 	log.Debug("Done flushing Service Accounts")
 }
 
 func (buf *EventSequencer) OnNamespaceUpdate(update *proto.NamespaceUpdate) {
 	// We trust the caller not to send us an update with nil ID, so safe to dereference.
-	id := *update.Id
+	id := types.ProtoToNamespaceID(update.GetId())
 	log.WithFields(log.Fields{
 		"key":    id,
 		"labels": update.GetLabels(),
@@ -937,7 +935,7 @@ func (buf *EventSequencer) OnNamespaceUpdate(update *proto.NamespaceUpdate) {
 	buf.pendingNamespaceUpdates[id] = update
 }
 
-func (buf *EventSequencer) OnNamespaceRemove(id proto.NamespaceID) {
+func (buf *EventSequencer) OnNamespaceRemove(id types.NamespaceID) {
 	log.WithFields(log.Fields{
 		"key": id,
 	}).Debug("Namespace removed")
@@ -968,34 +966,51 @@ func (buf *EventSequencer) OnGlobalBGPConfigUpdate(cfg *v3.BGPConfiguration) {
 	buf.pendingGlobalBGPConfig = &proto.GlobalBGPConfigUpdate{}
 	if cfg != nil {
 		for _, block := range cfg.Spec.ServiceClusterIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceClusterCidrs = append(buf.pendingGlobalBGPConfig.ServiceClusterCidrs, block.CIDR)
 		}
 		for _, block := range cfg.Spec.ServiceExternalIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceExternalCidrs = append(buf.pendingGlobalBGPConfig.ServiceExternalCidrs, block.CIDR)
 		}
 		for _, block := range cfg.Spec.ServiceLoadBalancerIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceLoadbalancerCidrs = append(buf.pendingGlobalBGPConfig.ServiceLoadbalancerCidrs, block.CIDR)
 		}
+		buf.pendingGlobalBGPConfig.LocalWorkloadPeeringIpV4 = cfg.Spec.LocalWorkloadPeeringIPV4
+		buf.pendingGlobalBGPConfig.LocalWorkloadPeeringIpV6 = cfg.Spec.LocalWorkloadPeeringIPV6
 	}
 }
 
 func (buf *EventSequencer) flushNamespaces() {
 	// Order doesn't matter, but send removes first to reduce max occupancy
-	buf.pendingNamespaceDeletes.Iter(func(id proto.NamespaceID) error {
-		msg := proto.NamespaceRemove{Id: &id}
+	for id := range buf.pendingNamespaceDeletes.All() {
+		protoID := types.NamespaceIDToProto(id)
+		msg := proto.NamespaceRemove{Id: protoID}
 		buf.Callback(&msg)
 		buf.sentNamespaces.Discard(id)
-		return nil
-	})
+	}
 	buf.pendingNamespaceDeletes.Clear()
 	for _, msg := range buf.pendingNamespaceUpdates {
 		buf.Callback(msg)
-		id := msg.Id
+		id := types.ProtoToNamespaceID(msg.GetId())
 		// We safely dereferenced the Id in OnNamespaceUpdate before adding it to the pending updates map, so
 		// it is safe to do so here.
-		buf.sentNamespaces.Add(*id)
+		buf.sentNamespaces.Add(id)
 	}
-	buf.pendingNamespaceUpdates = make(map[proto.NamespaceID]*proto.NamespaceUpdate)
+	buf.pendingNamespaceUpdates = make(map[types.NamespaceID]*proto.NamespaceUpdate)
 	log.Debug("Done flushing Namespaces")
 }
 
@@ -1015,12 +1030,11 @@ func (buf *EventSequencer) OnVTEPRemove(dst string) {
 }
 
 func (buf *EventSequencer) flushVTEPRemoves() {
-	buf.pendingVTEPDeletes.Iter(func(node string) error {
+	for node := range buf.pendingVTEPDeletes.All() {
 		msg := proto.VXLANTunnelEndpointRemove{Node: node}
 		buf.Callback(&msg)
 		buf.sentVTEPs.Discard(node)
-		return nil
-	})
+	}
 	buf.pendingVTEPDeletes.Clear()
 	log.Debug("Done flushing VTEP removes")
 }
@@ -1064,12 +1078,11 @@ func (buf *EventSequencer) flushRouteAdds() {
 }
 
 func (buf *EventSequencer) flushRouteRemoves() {
-	buf.pendingRouteDeletes.Iter(func(id routeID) error {
+	for id := range buf.pendingRouteDeletes.All() {
 		msg := proto.RouteRemove{Dst: id.dst}
 		buf.Callback(&msg)
 		buf.sentRoutes.Discard(id)
-		return nil
-	})
+	}
 	buf.pendingRouteDeletes.Clear()
 	log.Debug("Done flushing route deletes")
 }
@@ -1104,15 +1117,14 @@ func (buf *EventSequencer) OnServiceRemove(update *proto.ServiceRemove) {
 
 func (buf *EventSequencer) flushServices() {
 	// Order doesn't matter, but send removes first to reduce max occupancy
-	buf.pendingServiceDeletes.Iter(func(id serviceID) error {
+	for id := range buf.pendingServiceDeletes.All() {
 		msg := &proto.ServiceRemove{
 			Name:      id.Name,
 			Namespace: id.Namespace,
 		}
 		buf.Callback(msg)
 		buf.sentServices.Discard(id)
-		return nil
-	})
+	}
 	buf.pendingServiceDeletes.Clear()
 	for _, msg := range buf.pendingServiceUpdates {
 		buf.Callback(msg)
@@ -1133,28 +1145,35 @@ func cidrToIPPoolID(cidr ip.CIDR) string {
 }
 
 func addPolicyToTierInfo(pol *PolKV, tierInfo *proto.TierInfo, egressAllowed bool) {
+	id := proto.PolicyID{
+		Name:      pol.Key.Name,
+		Namespace: pol.Key.Namespace,
+		Kind:      pol.Key.Kind,
+	}
 	if pol.GovernsIngress() {
-		tierInfo.IngressPolicies = append(tierInfo.IngressPolicies, pol.Key.Name)
+		tierInfo.IngressPolicies = append(tierInfo.IngressPolicies, &id)
 	}
 	if egressAllowed && pol.GovernsEgress() {
-		tierInfo.EgressPolicies = append(tierInfo.EgressPolicies, pol.Key.Name)
+		tierInfo.EgressPolicies = append(tierInfo.EgressPolicies, &id)
 	}
 }
 
 func tierInfoToProtoTierInfo(filteredTiers []TierInfo) (normalTiers, untrackedTiers, preDNATTiers, forwardTiers []*proto.TierInfo) {
 	if len(filteredTiers) > 0 {
 		for _, ti := range filteredTiers {
-			untrackedTierInfo := &proto.TierInfo{Name: ti.Name}
-			preDNATTierInfo := &proto.TierInfo{Name: ti.Name}
-			forwardTierInfo := &proto.TierInfo{Name: ti.Name}
-			normalTierInfo := &proto.TierInfo{Name: ti.Name}
+			// For untracked and preDNAT tiers, DefautlAction must be Pass, to make sure policies in the normal tier
+			// are also checked.
+			untrackedTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(v3.Pass)}
+			preDNATTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(v3.Pass)}
+			forwardTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(ti.DefaultAction)}
+			normalTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(ti.DefaultAction)}
 			for _, pol := range ti.OrderedPolicies {
-				if pol.Value.DoNotTrack {
+				if pol.Value.DoNotTrack() {
 					addPolicyToTierInfo(&pol, untrackedTierInfo, true)
-				} else if pol.Value.PreDNAT {
+				} else if pol.Value.PreDNAT() {
 					addPolicyToTierInfo(&pol, preDNATTierInfo, false)
 				} else {
-					if pol.Value.ApplyOnForward {
+					if pol.Value.ApplyOnForward() {
 						addPolicyToTierInfo(&pol, forwardTierInfo, true)
 					}
 					addPolicyToTierInfo(&pol, normalTierInfo, true)
@@ -1203,4 +1222,27 @@ func natsToProtoNatInfo(nats []model.IPNAT) []*proto.NatInfo {
 		}
 	}
 	return protoNats
+}
+
+func isVMWorkload(labels uniquelabels.Map) bool {
+	if val, ok := labels.GetString("kubevirt.io"); ok {
+		if val == "virt-launcher" {
+			return true
+		}
+	}
+	return false
+}
+
+// vmiNameFromLabels extracts the KubeVirt VMI name from a pod's labels.
+// Prefers "vmi.kubevirt.io/id" (KubeVirt >= 1.7, reliable) and falls back
+// to "vm.kubevirt.io/name" (all versions, less reliable: uses hostname,
+// truncates without hashing).
+func vmiNameFromLabels(labels uniquelabels.Map) string {
+	if val, ok := labels.GetString(kubevirtv1.VirtualMachineInstanceIDLabel); ok {
+		return val
+	}
+	if val, ok := labels.GetString(kubevirtv1.DeprecatedVirtualMachineNameLabel); ok {
+		return val
+	}
+	return ""
 }

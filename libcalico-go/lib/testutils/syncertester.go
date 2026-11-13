@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,27 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package testutils
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	gomegatypes "github.com/onsi/gomega/types"
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
-
-	gomegatypes "github.com/onsi/gomega/types"
-
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
@@ -71,6 +71,7 @@ type SyncerTester struct {
 	onUpdates   [][]api.Update
 	updates     []api.Update
 	parseErrors []parseError
+	connErrors  []error
 }
 
 // OnStatusUpdated updates the current status and then blocks until a call to
@@ -78,6 +79,7 @@ type SyncerTester struct {
 func (st *SyncerTester) OnStatusUpdated(status api.SyncStatus) {
 	defer GinkgoRecover()
 	st.lock.Lock()
+	log.WithField("status", status).Info("OnStatusUpdated")
 	current := st.status
 	st.status = status
 	st.statusChanged = true
@@ -99,6 +101,28 @@ func (st *SyncerTester) OnStatusUpdated(status api.SyncStatus) {
 	// to unblock the processing.
 	st.statusBlocker.Wait()
 	log.Infof("OnStatusUpdated now unblocked waiting for: %s", status)
+}
+
+// SyncFailed stores a sync failed message.
+func (st *SyncerTester) SyncFailed(err error) {
+	defer GinkgoRecover()
+
+	func() {
+		// Store the updates and onUpdates.
+		st.lock.Lock()
+		defer st.lock.Unlock()
+		st.connErrors = append(st.connErrors, err)
+	}()
+
+	// We may need to block if the test has blocked the main event processing.
+	st.updateBlocker.Wait()
+}
+
+// ParseFailed just stores the parse failure.
+func (st *SyncerTester) ParseFailed(rawKey string, rawValue string) {
+	st.lock.Lock()
+	defer st.lock.Unlock()
+	st.parseErrors = append(st.parseErrors, parseError{rawKey: rawKey, rawValue: rawValue})
 }
 
 // OnUpdates just stores the update and asserts the state of the cache and the update.
@@ -140,6 +164,8 @@ func (st *SyncerTester) OnUpdates(updates []api.Update) {
 				Expect(st.cache).To(HaveKey(k))
 				Expect(u.Value).NotTo(BeNil())
 				st.cache[k] = CacheEntry{KVPair: u.KVPair}
+			default:
+				Fail(fmt.Sprintf("Unknown update type: %v", u.UpdateType))
 			}
 
 			// Check that KeyFromDefaultPath supports parsing the path again;
@@ -153,13 +179,6 @@ func (st *SyncerTester) OnUpdates(updates []api.Update) {
 
 	// We may need to block if the test has blocked the main event processing.
 	st.updateBlocker.Wait()
-}
-
-// ParseFailed just stores the parse failure.
-func (st *SyncerTester) ParseFailed(rawKey string, rawValue string) {
-	st.lock.Lock()
-	defer st.lock.Unlock()
-	st.parseErrors = append(st.parseErrors, parseError{rawKey: rawKey, rawValue: rawValue})
 }
 
 // ExpectStatusUpdate verifies a status update message has been received.  This should only
@@ -178,7 +197,7 @@ func (st *SyncerTester) ExpectStatusUpdate(status api.SyncStatus, timeout ...tim
 	} else {
 		EventuallyWithOffset(1, cs, timeout[0], "1ms").Should(Equal(status))
 	}
-	ConsistentlyWithOffset(1, cs).Should(Equal(status))
+	ConsistentlyWithOffset(1, cs, "10ms", "1ms").Should(Equal(status))
 
 	log.Infof("Status is at expected status: %s", status)
 
@@ -205,6 +224,29 @@ func (st *SyncerTester) ExpectStatusUnchanged() {
 	}
 	EventuallyWithOffset(1, sc, "6s", "1ms").Should(BeFalse())
 	ConsistentlyWithOffset(1, sc).Should(BeFalse(), "Status changed unexpectedly")
+}
+
+// ExpectConnErrors verifies the supplied connection errors were received.
+func (st *SyncerTester) ExpectConnErrors(errs []error, timeout ...time.Duration) {
+	log.Infof("Expecting errors of: %v", errs)
+	ce := func() []error {
+		st.lock.Lock()
+		defer st.lock.Unlock()
+		return st.connErrors[:]
+	}
+	if len(timeout) == 0 {
+		EventuallyWithOffset(1, ce, "6s", "1ms").Should(Equal(errs))
+	} else {
+		EventuallyWithOffset(1, ce, timeout[0], "1ms").Should(Equal(errs))
+	}
+	ConsistentlyWithOffset(1, ce).Should(Equal(errs))
+
+	log.Infof("Connection errors are as expected: %v", errs)
+
+	// Reset the received errors.
+	st.lock.Lock()
+	st.connErrors = nil
+	st.lock.Unlock()
 }
 
 // ExpectCacheSize verifies that the cache size is as expected. If this fails, the entire cache is included in the
@@ -239,7 +281,7 @@ func (st *SyncerTester) ExpectData(kvp model.KVPair) {
 
 // ExpectPath verifies that a KVPair with a specified path is in the cache. This will mark the cache entry as "Seen".
 func (st *SyncerTester) ExpectPath(path string) {
-	kv := func() interface{} {
+	kv := func() any {
 		return st.GetCacheKVPair(path)
 	}
 	EventuallyWithOffset(1, kv, "6s", "20ms").ShouldNot(BeNil())
@@ -251,7 +293,7 @@ func (st *SyncerTester) ExpectValueMatches(k model.Key, match gomegatypes.Gomega
 	key, err := model.KeyToDefaultPath(k)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 
-	value := func() interface{} {
+	value := func() any {
 		return st.GetCacheValue(key)
 	}
 
@@ -282,7 +324,7 @@ func (st *SyncerTester) GetCacheKVPair(k string) *model.KVPair {
 }
 
 // GetCacheValue returns the value of the KVPair from the cache or nil if not present.
-func (st *SyncerTester) GetCacheValue(k string) interface{} {
+func (st *SyncerTester) GetCacheValue(k string) any {
 	st.lock.Lock()
 	defer st.lock.Unlock()
 	return st.cache[k].Value
@@ -293,9 +335,7 @@ func (st *SyncerTester) CacheSnapshot() map[string]CacheEntry {
 	st.lock.Lock()
 	defer st.lock.Unlock()
 	cacheCopy := map[string]CacheEntry{}
-	for k, v := range st.cache {
-		cacheCopy[k] = v
-	}
+	maps.Copy(cacheCopy, st.cache)
 	return cacheCopy
 }
 
@@ -327,7 +367,7 @@ func (st *SyncerTester) hasUpdates(expectedUpdates []api.Update, checkOrder bool
 	updateAsKey := func(update api.Update) string {
 		path, err := model.KeyToDefaultPath(update.Key)
 		Expect(err).NotTo(HaveOccurred())
-		return fmt.Sprintf("%s;%s", update.UpdateType, path)
+		return fmt.Sprintf("%v;%s", update.UpdateType, path)
 	}
 
 	// removeFromActualUpdatesMap removes the update from the map, and returns an error if not found. It will remove
@@ -377,11 +417,8 @@ func (st *SyncerTester) hasUpdates(expectedUpdates []api.Update, checkOrder bool
 
 	// If we need to check the order, let's do that now - failing at the first miss.
 	if checkOrder {
-		num := len(actualUpdates)
-		if len(expectedUpdates) < num {
-			num = len(expectedUpdates)
-		}
-		for i := 0; i < num; i++ {
+		num := min(len(expectedUpdates), len(actualUpdates))
+		for i := range num {
 			if !updatesEqual(actualUpdates[i], expectedUpdates[i]) {
 				errs = append(errs, fmt.Sprintf(
 					"Incorrect order of updates at index %d;\nExpected:\n%v;\nReceived:\n%v",
@@ -427,6 +464,26 @@ func (st *SyncerTester) ExpectUpdates(expectedUpdates []api.Update, checkOrder b
 	defer st.lock.Unlock()
 	st.updates = nil
 	st.onUpdates = nil
+}
+
+// HasUpdates checks whether the updates have been received, returning an error if not. This does not remove the
+// updates from the cache.
+func (st *SyncerTester) HasUpdates(expectedUpdates []api.Update, checkOrder bool, sanitizer ...func(u []api.Update) []api.Update) error {
+	var sfn func(u []api.Update) []api.Update
+	if len(sanitizer) == 1 {
+		sfn = sanitizer[0]
+	} else if len(sanitizer) > 1 {
+		log.Panic("Multiple sanitizers passed in - only one expected")
+	}
+	if sfn == nil {
+		sfn = st.DefaultSanitizer
+	}
+
+	// Sanitize the expected updates.
+	expectedUpdates = sfn(expectedUpdates)
+
+	// Wait for the sanitized cache updates to match the sanitized expected updates.
+	return st.hasUpdates(expectedUpdates, checkOrder, sfn)
 }
 
 // ExpectOnUpdates tests which onUpdate events were received.
@@ -520,11 +577,11 @@ type resource interface {
 // flakey.
 func isExternallyControlled(key model.Key) bool {
 	switch key.(type) {
-	case model.WireguardKey, model.HostConfigKey, model.HostIPKey:
+	case model.WireguardKey, model.HostConfigKey:
 		return true
 	case model.ResourceKey:
 		switch key.(model.ResourceKey).Kind {
-		case libapiv3.KindNode, model.KindKubernetesEndpointSlice, model.KindKubernetesService:
+		case internalapi.KindNode, model.KindKubernetesEndpointSlice, model.KindKubernetesService:
 			return true
 		}
 	}
@@ -546,7 +603,7 @@ func updatesEqual(actual, expected api.Update) bool {
 // update - this makes writing tests simpler.
 func kvpsEqual(actual, expected model.KVPair) bool {
 	if !reflect.DeepEqual(expected.Key, actual.Key) {
-		log.Debug("Keys are not equal: %#v != %#v", expected.Key, actual.Key)
+		log.Debugf("Keys are not equal: %#v != %#v", expected.Key, actual.Key)
 		return false
 	}
 	if expected.UID != nil && (actual.UID == nil || *actual.UID != *expected.UID) {
@@ -640,6 +697,7 @@ func kvpsEqual(actual, expected model.KVPair) bool {
 		// We should ignore the actual value of the field.
 		actual.Value.(*model.AllocationBlock).SequenceNumber = 0
 		actual.Value.(*model.AllocationBlock).SequenceNumberForAllocation = nil
+		actual.Value.(*model.AllocationBlock).AffinityClaimTime = nil
 
 		return reflect.DeepEqual(actual.Value, expected.Value)
 	default:

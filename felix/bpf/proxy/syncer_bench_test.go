@@ -23,9 +23,6 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/felix/cachingmap"
-
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,6 +31,7 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/mock"
 	"github.com/projectcalico/calico/felix/bpf/nat"
+	"github.com/projectcalico/calico/felix/cachingmap"
 )
 
 func makeSvcEpsPair(svcIdx, epCnt, port int, opts ...K8sServicePortOption) (k8sp.ServicePort, []k8sp.Endpoint) {
@@ -45,8 +43,8 @@ func makeSvcEpsPair(svcIdx, epCnt, port int, opts ...K8sServicePortOption) (k8sp
 	)
 
 	eps := make([]k8sp.Endpoint, epCnt)
-	for j := 0; j < epCnt; j++ {
-		eps[j] = &k8sp.BaseEndpointInfo{Endpoint: fmt.Sprintf("11.1.1.1:%d", j+1)}
+	for j := range epCnt {
+		eps[j] = NewEndpointInfo("11.1.1.1", j+1)
 	}
 
 	return svc, eps
@@ -67,7 +65,7 @@ func makeState(svcCnt, epCnt int, opts ...K8sServicePortOption) DPSyncerState {
 		EpsMap: make(k8sp.EndpointsMap, epCnt),
 	}
 
-	for i := 0; i < svcCnt; i++ {
+	for i := range svcCnt {
 		sk := makeSvcKey(i)
 		state.SvcMap[sk], state.EpsMap[sk] = makeSvcEpsPair(i, epCnt, 1234, opts...)
 	}
@@ -93,7 +91,7 @@ func stateToBPFMaps(state DPSyncerState) (
 		Expect(err).NotTo(HaveOccurred())
 
 		for i, ep := range eps {
-			port, _ := ep.Port()
+			port := ep.Port()
 			bk := nat.NewNATBackendKey(id, uint32(i))
 			bv := nat.NewNATBackendValue(net.ParseIP(ep.IP()), uint16(port))
 			err := be.Update(bk[:], bv[:])
@@ -166,15 +164,18 @@ func runBenchmarkServiceUpdate(b *testing.B, svcCnt, epCnt int, mockMaps bool, o
 
 	b.StopTimer()
 	state := makeState(svcCnt, epCnt, opts...)
-
+	maglevLUTSize := 31
 	if mockMaps {
 		syncer, err = NewSyncer(4,
 			[]net.IP{net.IPv4(1, 1, 1, 1)},
 			&mock.DummyMap{},
 			&mock.DummyMap{},
 			&mock.DummyMap{},
+			&mock.DummyMap{},
 			NewRTCache(),
 			nil,
+			maglevLUTSize,
+			0,
 		)
 		Expect(err).ShouldNot(HaveOccurred())
 	} else {
@@ -190,8 +191,11 @@ func runBenchmarkServiceUpdate(b *testing.B, svcCnt, epCnt int, mockMaps bool, o
 			&mock.DummyMap{},
 			&mock.DummyMap{},
 			&mock.DummyMap{},
+			&mock.DummyMap{},
 			NewRTCache(),
 			nil,
+			maglevLUTSize,
+			0,
 		)
 		Expect(err).ShouldNot(HaveOccurred())
 	}
@@ -234,7 +238,7 @@ func BenchmarkServiceUpdate(b *testing.B) {
 
 	dynaNodePort := func() K8sServicePortOption {
 		np := 0
-		return func(s interface{}) {
+		return func(s any) {
 			np = (np + 1) % 30000
 			K8sSvcWithNodePort(30000 + np)(s)
 		}

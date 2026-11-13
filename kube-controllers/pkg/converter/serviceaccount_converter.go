@@ -18,12 +18,11 @@ import (
 	"fmt"
 
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 )
 
 type serviceAccountConverter struct {
@@ -34,7 +33,7 @@ func NewServiceAccountConverter() Converter {
 	return &serviceAccountConverter{}
 }
 
-func (nc *serviceAccountConverter) Convert(k8sObj interface{}) (interface{}, error) {
+func (nc *serviceAccountConverter) Convert(k8sObj any) (any, error) {
 	c := conversion.NewConverter()
 	serviceAccount, ok := k8sObj.(*v1.ServiceAccount)
 	if !ok {
@@ -63,7 +62,7 @@ func (nc *serviceAccountConverter) Convert(k8sObj interface{}) (interface{}, err
 // GetKey returns name of the Profile as its key.  For Profiles
 // backed by Kubernetes serviceaccounts and managed by this controller, the name
 // is of format `ksa.namespace.name`.
-func (nc *serviceAccountConverter) GetKey(obj interface{}) string {
+func (nc *serviceAccountConverter) GetKey(obj any) string {
 	profile := obj.(api.Profile)
 	return profile.Name
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2016,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,35 +21,35 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/ptr"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
-	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator"
-	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator/clients"
 	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
-
 	"github.com/projectcalico/calico/node/pkg/calicoclient"
+	"github.com/projectcalico/calico/node/pkg/health"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/startup/autodetection"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/startup/autodetection/ipv4"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/utils"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 )
 
 const (
@@ -70,29 +70,47 @@ const (
 	OSTypeWindows = "win"
 )
 
-// Version string, set during build.
-var VERSION string
-
 var (
 	// Default values, names for different configs.
 	defaultLogSeverity        = "Info"
 	globalFelixConfigName     = "default"
 	felixNodeConfigNamePrefix = "node."
+	globalBGPConfigName       = "default"
+	globalIPAMConfigName      = "default"
 )
 
-// This file contains the main startup processing for the calico/node.  This
+type runConf struct {
+	bailOutAfterUpgrade bool
+}
+
+type RunOpt func(*runConf)
+
+// WithBailOutAfterUpgrade is a RunOpt that configures whether to exit after
+// performing any required datastore upgrade.  Useful for tests!
+func WithBailOutAfterUpgrade(bail bool) RunOpt {
+	return func(c *runConf) {
+		c.bailOutAfterUpgrade = bail
+	}
+}
+
+// Run contains the main startup processing for the calico/node.  This
 // includes:
 //   - Detecting IP address and Network to use for BGP
 //   - Configuring the node resource with IP/AS information provided in the
 //     environment, or autodetected.
 //   - Creating default IP Pools for quick-start use
-func Run() {
+func Run(opts ...RunOpt) {
+	var conf runConf
+	for _, opt := range opts {
+		opt(&conf)
+	}
+
 	// Check $CALICO_STARTUP_LOGLEVEL to capture early log statements
 	ConfigureLogging()
 
 	// Determine the name for this node.
 	nodeName := utils.DetermineNodeName()
-	log.Infof("Starting node %s with version %s", nodeName, VERSION)
+	log.Infof("Starting node %s with version %s", nodeName, buildinfo.Version)
 
 	// Create the Calico API cli.
 	cfg, cli := calicoclient.CreateClient()
@@ -107,11 +125,21 @@ func Run() {
 		log.Info("Skipping datastore connection test")
 	}
 
-	if cfg.Spec.DatastoreType == apiconfig.Kubernetes {
-		if err := ensureKDDMigrated(cfg, cli); err != nil {
-			log.WithError(err).Errorf("Unable to ensure datastore is migrated.")
-			utils.Terminate()
-		}
+	// Make sure that this host's BlockAffinity resources are upgraded to add
+	// labels for efficient lookup.  CNI plugin also does this on the first
+	// allocation after upgrade.  Doing it here too handles some corner cases,
+	// such as calico-node being downgraded, doing some allocations and then,
+	// upgrading again.
+	upgradeCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if err := cli.IPAM().UpgradeHost(upgradeCtx, nodeName); err != nil {
+		log.WithError(err).Errorf("Unable to upgrade host's IPAM resources.")
+		utils.Terminate()
+	}
+
+	if conf.bailOutAfterUpgrade {
+		log.Info("Exiting after datastore migration as requested.")
+		return
 	}
 
 	// Query the current Node resources.  We update our node resource with
@@ -218,26 +246,118 @@ func Run() {
 		log.WithError(err).Errorf("Unable to ensure network for os")
 		utils.Terminate()
 	}
+}
 
-	// All done. Set NetworkUnavailable to false if using Calico for networking.
-	// We do it late in the process to avoid node resource update conflict because setting
-	// node condition will trigger node-controller updating node taints.
-	if os.Getenv("CALICO_NETWORKING_BACKEND") != "none" {
-		if clientset != nil {
-			err := utils.SetNodeNetworkUnavailableCondition(*clientset, k8sNodeName, false, 30*time.Second)
-			if err != nil {
-				log.WithError(err).Error("Unable to set NetworkUnavailable to False")
-				utils.Terminate()
-			}
+// ManageNodeCondition updates the Kubernetes node condition on successful startup and then sleeps forever. It
+// waits for Felix and BIRD to be ready before setting the NetworkUnavailable condition to false.
+func ManageNodeCondition(done context.Context, timeout time.Duration) error {
+	if err := waitForReady(done, timeout); err != nil {
+		if done.Err() != nil {
+			// Shutting down. Marking the network available now would clear the
+			// shutdown timestamp the preStop hook just wrote.
+			return nil
 		}
+		log.WithError(err).Error("Calico failed to become ready, continuing anyway")
+	}
+	if err := MarkNetworkAvailable(); err != nil {
+		return err
+	}
+	<-done.Done()
+	return nil
+}
+
+func waitForReady(ctx context.Context, timeout time.Duration) error {
+	// Determine which components should be checked for readiness. We don't do any liveness checking here.
+	// Do this by checking the contents of /etc/service/enabled.
+	checkBIRD := false
+	if _, err := os.Stat("/etc/service/enabled/bird/run"); err == nil {
+		checkBIRD = true
+	}
+	checkBIRD6 := false
+	if _, err := os.Stat("/etc/service/enabled/bird6/run"); err == nil {
+		checkBIRD6 = true
+	}
+
+	// Check Felix health if FELIX_HEALTHENABLED is set to true.
+	checkFelix := os.Getenv("FELIX_HEALTHENABLED") == "true"
+
+	// Wait for Felix and BIRD to be ready before setting the NetworkUnavailable condition to false.
+	//
+	// If we don't succeed, continue anyway to be extra paranoid. This should handle the mainline use case of ensuring
+	// calico/node is ready before allowing pods to run on the node.
+	log.Info("Waiting for Calico to become ready before continuing...")
+	to := time.After(timeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-to:
+			return fmt.Errorf("timed out waiting for Calico to become ready")
+		default:
+			if err := health.RunOutput(checkBIRD, checkBIRD6, checkFelix, false, false, false, 5*time.Minute); err != nil {
+				// If we fail to check the health of the components, log the error and continue waiting.
+				log.WithField("reason", err.Error()).Warn("Calico is not ready yet, waiting...")
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(1 * time.Second):
+				}
+				continue
+			}
+
+			// success !
+			return nil
+		}
+	}
+}
+
+// MarkNetworkAvailable updates the Kubernetes node condition on successful startup.
+func MarkNetworkAvailable() error {
+	if os.Getenv("CALICO_NETWORKING_BACKEND") == "none" {
+		// Calico is not managing networking, so we don't need to set the NetworkUnavailable condition.
+		log.Info("Calico is not managing networking, skipping NetworkUnavailable condition update")
+		return nil
+	}
+
+	k8sNodeName := utils.DetermineNodeName()
+	if nodeRef := os.Getenv("CALICO_K8S_NODE_REF"); nodeRef != "" {
+		k8sNodeName = nodeRef
+	}
+
+	config, err := winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+	if err == nil {
+		// Create the k8s clientset.
+		config.Timeout = 2 * time.Second
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			log.WithError(err).Error("Failed to create clientset")
+			return err
+		}
+
+		// All done. Set NetworkUnavailable to false if using Calico for networking.
+		// We do it late in the process to avoid node resource update conflict because setting
+		// node condition will trigger node-controller updating node taints.
+		err = utils.SetNodeNetworkUnavailableCondition(*clientset, k8sNodeName, false, 30*time.Second)
+		if err != nil {
+			log.WithError(err).Error("Unable to set NetworkUnavailable to False")
+			return err
+		}
+	} else if clientcmd.IsEmptyConfig(err) && os.Getenv("DATASTORE_TYPE") != "kubernetes" {
+		log.Info("Kubernetes configuration not detected; skipping NetworkUnavailable condition update")
+	} else {
+		log.WithError(err).Error("Failed to build Kubernetes config")
+		return err
 	}
 
 	// Remove shutdownTS file when everything is done.
 	// This indicates Calico node started successfully.
 	if err := utils.RemoveShutdownTimestampFile(); err != nil {
 		log.WithError(err).Errorf("Unable to remove shutdown timestamp file")
-		utils.Terminate()
+		return err
 	}
+
+	log.Info("Calico started successfully")
+	return nil
 }
 
 func getMonitorPollInterval() time.Duration {
@@ -255,15 +375,24 @@ func getMonitorPollInterval() time.Duration {
 	return interval
 }
 
-func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface, node *libapi.Node, k8sNode *v1.Node) bool {
+func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface, node *internalapi.Node, k8sNode *v1.Node) bool {
+	ok, err := configureAndCheckIPAddressSubnetsErr(ctx, cli, node, k8sNode)
+	if err != nil {
+		log.WithError(err).Error("Failed to configure IP addresses")
+		utils.Terminate()
+	}
+	return ok
+}
+
+func configureAndCheckIPAddressSubnetsErr(ctx context.Context, cli client.Interface, node *internalapi.Node, k8sNode *v1.Node) (bool, error) {
 	// If Calico is running in policy only mode we don't need to write BGP related
 	// details to the Node.
 	if os.Getenv("CALICO_NETWORKING_BACKEND") == "none" {
-		return false
+		return false, nil
 	}
 	// Configure and verify the node IP addresses and subnets.
-	checkConflicts, err := configureIPsAndSubnets(node, k8sNode, func(incl []string, excl []string, version int) ([]autodetection.Interface, error) {
-		return autodetection.GetInterfaces(net.Interfaces, incl, excl, version)
+	checkConflicts, err := configureIPsAndSubnets(node, k8sNode, func(incl []string, excl []string, version ...int) ([]autodetection.Interface, error) {
+		return autodetection.GetInterfaces(net.Interfaces, incl, excl, version...)
 	})
 	if err != nil {
 		// If this is auto-detection error, do a cleanup before returning
@@ -275,22 +404,19 @@ func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface
 			clearNodeIPs(ctx, cli, node, clearv4, clearv6)
 		}
 
-		utils.Terminate()
+		return false, fmt.Errorf("failed to configure IP addresses and subnets: %w", err)
 	}
 
 	if node.Spec.BGP.IPv4Address == "" && node.Spec.BGP.IPv6Address == "" {
 		if os.Getenv("CALICO_NETWORKING_BACKEND") != "none" {
-			log.Error("No IPv4 or IPv6 addresses configured or detected, required for Calico networking")
-			// Unrecoverable error, terminate to restart.
-			utils.Terminate()
-		} else {
-			log.Info("No IPv4 or IPv6 addresses configured or detected. Some features may not work properly.")
-			// Bail here setting BGPSpec to nil (if empty) to pass validation.
-			if reflect.DeepEqual(node.Spec.BGP, &libapi.NodeBGPSpec{}) {
-				node.Spec.BGP = nil
-			}
-			return checkConflicts
+			return false, fmt.Errorf("no IPv4 or IPv6 addresses configured or detected, required for Calico networking")
 		}
+		log.Info("No IPv4 or IPv6 addresses configured or detected. Some features may not work properly.")
+		// Bail here setting BGPSpec to nil (if empty) to pass validation.
+		if reflect.DeepEqual(node.Spec.BGP, &internalapi.NodeBGPSpec{}) {
+			node.Spec.BGP = nil
+		}
+		return checkConflicts, nil
 	}
 
 	// If we report an IP change (v4 or v6) we should verify there are no
@@ -305,62 +431,68 @@ func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface
 			if node.ResourceVersion != "" {
 				clearNodeIPs(ctx, cli, node, clearv4, clearv6)
 			}
-			utils.Terminate()
+			return false, fmt.Errorf("conflicting node detected: %w", err)
 		}
 	}
 
-	return checkConflicts
+	return checkConflicts, nil
 }
 
-func MonitorIPAddressSubnets() {
-	ctx := context.Background()
+// MonitorIPAddressSubnetsWithContext is the context-aware variant of
+// MonitorIPAddressSubnets for use when running as a goroutine in a
+// consolidated process.
+func MonitorIPAddressSubnetsWithContext(ctx context.Context) error {
 	_, cli := calicoclient.CreateClient()
 	nodeName := utils.DetermineNodeName()
-
 	pollInterval := getMonitorPollInterval()
 
 	var clientset *kubernetes.Clientset
-	var config *rest.Config
 	var k8sNode *v1.Node
-	var err error
-	var node *libapi.Node
+	var node *internalapi.Node
 
-	// Determine the Kubernetes node name. Default to the Calico node name unless an explicit
-	// value is provided.
 	k8sNodeName := nodeName
 	if nodeRef := os.Getenv("CALICO_K8S_NODE_REF"); nodeRef != "" {
 		k8sNodeName = nodeRef
 	}
-	if config, err = winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG")); err == nil {
-		// Create the k8s clientset.
+	if config, err := winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG")); err == nil {
 		clientset, err = kubernetes.NewForConfig(config)
 		if err != nil {
-			log.WithError(err).Error("Failed to create clientset")
-			return
+			return fmt.Errorf("failed to create clientset: %w", err)
 		}
 	}
 
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
 	for {
-		<-time.After(pollInterval)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 		log.Debugf("Checking node IP address every %v", pollInterval)
 
-		// Every polling interval, try to get the k8s Node and use the latest K8s node IP to configure.
 		if clientset != nil {
+			var err error
 			k8sNode, err = clientset.CoreV1().Nodes().Get(ctx, k8sNodeName, metav1.GetOptions{})
 			if err != nil {
-				log.WithError(err).Error("Failed to read Node from datastore")
-				return
+				if kerrors.IsNotFound(err) {
+					// Absent while kubelet re-registers it; re-check on the next tick.
+					log.WithField("node", k8sNodeName).Warn("Node not in the datastore, retrying")
+					continue
+				}
+				return fmt.Errorf("failed to read Node from datastore: %w", err)
 			}
 		}
 
-		// Every polling interval, try to get new node configuration.
 		node = getNode(ctx, cli, nodeName)
 
-		updated := configureAndCheckIPAddressSubnets(ctx, cli, node, k8sNode)
+		updated, err := configureAndCheckIPAddressSubnetsErr(ctx, cli, node, k8sNode)
+		if err != nil {
+			return err
+		}
 		if updated {
-			// Apply the updated node resource.
-			// we try updating the resource up to 3 times, in case of transient issues.
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				_, err := CreateOrUpdate(ctx, cli, node)
 				if err == nil {
 					log.Info("Updated node IP addresses")
@@ -375,7 +507,7 @@ func MonitorIPAddressSubnets() {
 // configureNodeRef will attempt to discover the cluster type it is running on, check to ensure we
 // have not already set it on this Node, and set it if need be.
 // Returns true if the node object needs to updated.
-func configureNodeRef(node *libapi.Node) bool {
+func configureNodeRef(node *internalapi.Node) bool {
 	orchestrator := "k8s"
 	nodeRef := ""
 
@@ -384,13 +516,13 @@ func configureNodeRef(node *libapi.Node) bool {
 		return false
 	}
 
-	node.Spec.OrchRefs = []libapi.OrchRef{{NodeName: nodeRef, Orchestrator: orchestrator}}
+	node.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: nodeRef, Orchestrator: orchestrator}}
 	return true
 }
 
 // CreateOrUpdate creates the Node if ResourceVersion is not specified,
 // or Update if it's specified.
-func CreateOrUpdate(ctx context.Context, client client.Interface, node *libapi.Node) (*libapi.Node, error) {
+func CreateOrUpdate(ctx context.Context, client client.Interface, node *internalapi.Node) (*internalapi.Node, error) {
 	if node.ResourceVersion != "" {
 		return client.Nodes().Update(ctx, node, options.SetOptions{})
 	}
@@ -398,7 +530,7 @@ func CreateOrUpdate(ctx context.Context, client client.Interface, node *libapi.N
 	return client.Nodes().Create(ctx, node, options.SetOptions{})
 }
 
-func clearNodeIPs(ctx context.Context, client client.Interface, node *libapi.Node, clearv4, clearv6 bool) {
+func clearNodeIPs(ctx context.Context, client client.Interface, node *internalapi.Node, clearv4, clearv6 bool) {
 	if clearv4 {
 		log.WithField("IP", node.Spec.BGP.IPv4Address).Info("Clearing out-of-date IPv4 address from this node")
 		node.Spec.BGP.IPv4Address = ""
@@ -409,7 +541,7 @@ func clearNodeIPs(ctx context.Context, client client.Interface, node *libapi.Nod
 	}
 
 	// If the BGP spec is empty, then set it to nil.
-	if node.Spec.BGP != nil && reflect.DeepEqual(*node.Spec.BGP, libapi.NodeBGPSpec{}) {
+	if node.Spec.BGP != nil && reflect.DeepEqual(*node.Spec.BGP, internalapi.NodeBGPSpec{}) {
 		node.Spec.BGP = nil
 	}
 
@@ -447,7 +579,6 @@ func waitForConnection(ctx context.Context, c client.Interface) {
 		// is working.  Getting a specific Node is a good option, even
 		// if the Node does not exist.
 		_, err := c.Nodes().Get(ctx, "foo", options.GetOptions{})
-
 		// We only care about a couple of error cases, all others would
 		// suggest the datastore is accessible.
 		if err != nil {
@@ -470,7 +601,7 @@ func waitForConnection(ctx context.Context, c client.Interface) {
 
 // getNode returns the current node configuration. If this node has not yet
 // been created, it returns a blank node resource.
-func getNode(ctx context.Context, client client.Interface, nodeName string) *libapi.Node {
+func getNode(ctx context.Context, client client.Interface, nodeName string) *internalapi.Node {
 	node, err := client.Nodes().Get(ctx, nodeName, options.GetOptions{})
 	if err != nil {
 		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
@@ -480,7 +611,7 @@ func getNode(ctx context.Context, client client.Interface, nodeName string) *lib
 		}
 
 		log.WithField("Name", nodeName).Info("Building new node resource")
-		node = libapi.NewNode()
+		node = internalapi.NewNode()
 		node.Name = nodeName
 	}
 
@@ -489,17 +620,18 @@ func getNode(ctx context.Context, client client.Interface, nodeName string) *lib
 
 // configureIPsAndSubnets updates the supplied node resource with IP and Subnet
 // information to use for BGP.  This returns true if we detect a change in Node IP address.
-func configureIPsAndSubnets(node *libapi.Node, k8sNode *v1.Node, getInterfaces func([]string, []string, int) ([]autodetection.Interface, error)) (bool, error) {
+func configureIPsAndSubnets(node *internalapi.Node, k8sNode *v1.Node, getInterfaces func([]string, []string, ...int) ([]autodetection.Interface, error)) (bool, error) {
 	// If the node resource currently has no BGP configuration, add an empty
 	// set of configuration as it makes the processing below easier, and we
 	// must end up configuring some BGP fields before we complete.
 	if node.Spec.BGP == nil {
 		log.Info("Initialize BGP data")
-		node.Spec.BGP = &libapi.NodeBGPSpec{}
+		node.Spec.BGP = &internalapi.NodeBGPSpec{}
 	}
 
 	oldIpv4 := node.Spec.BGP.IPv4Address
 	oldIpv6 := node.Spec.BGP.IPv6Address
+	oldInterfaces := node.Spec.Interfaces
 
 	// Determine the autodetection type for IPv4 and IPv6.  Note that we
 	// only autodetect IPv4 when it has not been specified.  IPv6 must be
@@ -517,7 +649,7 @@ func configureIPsAndSubnets(node *libapi.Node, k8sNode *v1.Node, getInterfaces f
 		} else if node.Spec.BGP.IPv4Address == "" {
 			// No IPv4 address is configured, but we always require one, so exit.
 			log.Warn("Couldn't autodetect an IPv4 address. If auto-detecting, choose a different autodetection method. Otherwise provide an explicit address.")
-			return false, fmt.Errorf("Failed to autodetect an IPv4 address")
+			return false, fmt.Errorf("failed to autodetect an IPv4 address")
 		} else {
 			// No IPv4 autodetected, but a previous one was configured.
 			// Tell the user we are leaving the value unchanged.  We
@@ -550,7 +682,7 @@ func configureIPsAndSubnets(node *libapi.Node, k8sNode *v1.Node, getInterfaces f
 		} else if node.Spec.BGP.IPv6Address == "" {
 			// No IPv6 address is configured, but we have requested one, so exit.
 			log.Warn("Couldn't autodetect an IPv6 address. If auto-detecting, choose a different autodetection method. Otherwise provide an explicit address.")
-			return false, fmt.Errorf("Failed to autodetect an IPv6 address")
+			return false, fmt.Errorf("failed to autodetect an IPv6 address")
 		} else {
 			// No IPv6 autodetected, but a previous one was configured.
 			// Tell the user we are leaving the value unchanged.  We
@@ -568,6 +700,46 @@ func configureIPsAndSubnets(node *libapi.Node, k8sNode *v1.Node, getInterfaces f
 		validateIP(node.Spec.BGP.IPv6Address)
 	}
 
+	var interfaces []autodetection.Interface
+	var err error
+	if (ipv4Env != "none" && ipv4Env != "") && (ipv6Env == "none" || ipv6Env == "") {
+		interfaces, err = getInterfaces(nil, autodetection.DEFAULT_INTERFACES_TO_EXCLUDE, 4)
+		if err != nil {
+			return false, err
+		}
+	} else if (ipv6Env != "none" && ipv6Env != "") && (ipv4Env == "none" || ipv4Env == "") {
+		interfaces, err = getInterfaces(nil, autodetection.DEFAULT_INTERFACES_TO_EXCLUDE, 6)
+		if err != nil {
+			return false, err
+		}
+	} else if (ipv4Env != "none" && ipv4Env != "") && (ipv6Env != "none" && ipv6Env != "") {
+		interfaces, err = getInterfaces(nil, autodetection.DEFAULT_INTERFACES_TO_EXCLUDE, 4, 6)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	// Sort the interfaces by name so that we have a consistent order on each run
+	slices.SortStableFunc(interfaces, func(i, j autodetection.Interface) int {
+		return strings.Compare(i.Name, j.Name)
+	})
+
+	var nodeInterfaces []internalapi.NodeInterface
+	for _, iface := range interfaces {
+		nodeInterface := internalapi.NodeInterface{
+			Name: iface.Name,
+		}
+		for _, addr := range iface.Cidrs {
+			ip, _, err := cnet.ParseCIDR(addr.String())
+			if err != nil {
+				return false, err
+			}
+			nodeInterface.Addresses = append(nodeInterface.Addresses, ip.String())
+		}
+		nodeInterfaces = append(nodeInterfaces, nodeInterface)
+	}
+	node.Spec.Interfaces = nodeInterfaces
+
 	// Detect if we've seen the IP address change, and flag that we need to check for conflicting Nodes
 	if node.Spec.BGP.IPv4Address != oldIpv4 {
 		log.Info("Node IPv4 changed, will check for conflicts")
@@ -575,6 +747,11 @@ func configureIPsAndSubnets(node *libapi.Node, k8sNode *v1.Node, getInterfaces f
 	}
 	if node.Spec.BGP.IPv6Address != oldIpv6 {
 		log.Info("Node IPv6 changed, will check for conflicts")
+		return true, nil
+	}
+
+	if !reflect.DeepEqual(node.Spec.Interfaces, oldInterfaces) {
+		log.Info("Node interfaces changed")
 		return true, nil
 	}
 
@@ -647,17 +824,18 @@ func parseBlockSizeEnvironment(envValue string) int {
 // validateBlockSize check if blockSize is valid
 func validateBlockSize(version int, blockSize int) {
 	// 20 to 32 (inclusive) for IPv4 and 116 to 128 (inclusive) for IPv6
-	if version == 4 {
+	switch version {
+	case 4:
 		if blockSize < 20 || blockSize > 32 {
 			log.Errorf("Invalid blocksize %d for version %d", blockSize, version)
 			utils.Terminate()
 		}
-	} else if version == 6 {
+	case 6:
 		if blockSize < 116 || blockSize > 128 {
 			log.Errorf("Invalid blocksize %d for version %d", blockSize, version)
 			utils.Terminate()
 		}
-	} else {
+	default:
 		log.Errorf("Invalid ip version specified (%d) when validating blocksize", version)
 		utils.Terminate()
 	}
@@ -683,7 +861,6 @@ func evaluateENVBool(envVar string, defaultValue bool) bool {
 	if isSet {
 
 		switch strings.ToLower(envValue) {
-
 		case "false", "0", "no", "n", "f":
 			log.Infof("%s is %t through environment variable", envVar, false)
 			return false
@@ -698,7 +875,7 @@ func evaluateENVBool(envVar string, defaultValue bool) bool {
 // configureASNumber configures the Node resource with the AS number specified
 // in the environment, or is a no-op if not specified.
 // Returns true if the node object needs to be updated.
-func configureASNumber(node *libapi.Node) bool {
+func configureASNumber(node *internalapi.Node) bool {
 	// If Calico is running in policy only mode we don't need to write BGP related
 	// details to the Node.
 	if os.Getenv("CALICO_NETWORKING_BACKEND") == "none" {
@@ -810,7 +987,6 @@ func configureIPPools(ctx context.Context, client client.Interface, kubeadmConfi
 	if ipv4PoolEnabled {
 		ipv4IpipModeEnvVar = strings.ToLower(os.Getenv("CALICO_IPV4POOL_IPIP"))
 		ipv4VXLANModeEnvVar = strings.ToLower(os.Getenv("CALICO_IPV4POOL_VXLAN"))
-		ipv6VXLANModeEnvVar = strings.ToLower(os.Getenv("CALICO_IPV6POOL_VXLAN"))
 
 		ipv4BlockSizeEnvVar = os.Getenv("CALICO_IPV4POOL_BLOCK_SIZE")
 		if ipv4BlockSizeEnvVar != "" {
@@ -844,6 +1020,8 @@ func configureIPPools(ctx context.Context, client client.Interface, kubeadmConfi
 	}
 
 	if ipv6PoolEnabled {
+		ipv6VXLANModeEnvVar = strings.ToLower(os.Getenv("CALICO_IPV6POOL_VXLAN"))
+
 		ipv6BlockSizeEnvVar = os.Getenv("CALICO_IPV6POOL_BLOCK_SIZE")
 		if ipv6BlockSizeEnvVar != "" {
 			ipv6BlockSize = parseBlockSizeEnvironment(ipv6BlockSizeEnvVar)
@@ -980,9 +1158,9 @@ func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet
 
 // checkConflictingNodes checks whether any other nodes have been configured
 // with the same IP addresses.
-func checkConflictingNodes(ctx context.Context, client client.Interface, node *libapi.Node) (v4conflict, v6conflict bool, retErr error) {
+func checkConflictingNodes(ctx context.Context, client client.Interface, node *internalapi.Node) (v4conflict, v6conflict bool, retErr error) {
 	// Get the full set of nodes.
-	var nodes []libapi.Node
+	var nodes []internalapi.Node
 	if nodeList, err := client.Nodes().List(ctx, options.ListOptions{}); err != nil {
 		log.WithError(err).Errorf("Unable to query node configuration")
 		retErr = err
@@ -1031,11 +1209,11 @@ func checkConflictingNodes(ctx context.Context, client client.Interface, node *l
 		// an indication of multiple nodes using the same name.  This
 		// is not an error condition as the IPs could actually change.
 		if theirNode.Name == node.Name {
-			if theirIPv4.IP != nil && ourIPv4.IP != nil && !theirIPv4.IP.Equal(ourIPv4.IP) {
+			if theirIPv4.IP != nil && ourIPv4.IP != nil && !theirIPv4.Equal(ourIPv4.IP) {
 				fields := log.Fields{"node": theirNode.Name, "original": theirIPv4.String(), "updated": ourIPv4.String()}
 				log.WithFields(fields).Warnf("IPv4 address has changed. This could happen if there are multiple nodes with the same name.")
 			}
-			if theirIPv6.IP != nil && ourIPv6.IP != nil && !theirIPv6.IP.Equal(ourIPv6.IP) {
+			if theirIPv6.IP != nil && ourIPv6.IP != nil && !theirIPv6.Equal(ourIPv6.IP) {
 				fields := log.Fields{"node": theirNode.Name, "original": theirIPv6.String(), "updated": ourIPv6.String()}
 				log.WithFields(fields).Warnf("IPv6 address has changed. This could happen if there are multiple nodes with the same name.")
 			}
@@ -1044,13 +1222,13 @@ func checkConflictingNodes(ctx context.Context, client client.Interface, node *l
 
 		// Check that other nodes aren't using the same IP addresses.
 		// This is an error condition.
-		if theirIPv4.IP != nil && ourIPv4.IP != nil && theirIPv4.IP.Equal(ourIPv4.IP) {
+		if theirIPv4.IP != nil && ourIPv4.IP != nil && theirIPv4.Equal(ourIPv4.IP) {
 			log.Warnf("Calico node '%s' is already using the IPv4 address %s.", theirNode.Name, ourIPv4.String())
 			retErr = fmt.Errorf("IPv4 address conflict")
 			v4conflict = true
 		}
 
-		if theirIPv6.IP != nil && ourIPv6.IP != nil && theirIPv6.IP.Equal(ourIPv6.IP) {
+		if theirIPv6.IP != nil && ourIPv6.IP != nil && theirIPv6.Equal(ourIPv6.IP) {
 			log.Warnf("Calico node '%s' is already using the IPv6 address %s.", theirNode.Name, ourIPv6.String())
 			retErr = fmt.Errorf("IPv6 address conflict")
 			v6conflict = true
@@ -1059,9 +1237,16 @@ func checkConflictingNodes(ctx context.Context, client client.Interface, node *l
 	return
 }
 
-// ensureDefaultConfig ensures all of the required default settings are
-// configured.
-func ensureDefaultConfig(ctx context.Context, cfg *apiconfig.CalicoAPIConfig, c client.Interface, node *libapi.Node, osType string, kubeadmConfig, rancherState *v1.ConfigMap) error {
+// ensureDefaultConfig ensures all of the required default settings are configured.
+func ensureDefaultConfig(
+	ctx context.Context,
+	cfg *apiconfig.CalicoAPIConfig,
+	c client.Interface,
+	node *internalapi.Node,
+	osType string,
+	kubeadmConfig,
+	rancherState *v1.ConfigMap,
+) error {
 	// Ensure the ClusterInformation is populated.
 	// Get the ClusterType from ENV var. This is set from the manifest.
 	clusterType := os.Getenv("CLUSTER_TYPE")
@@ -1090,8 +1275,8 @@ func ensureDefaultConfig(ctx context.Context, cfg *apiconfig.CalicoAPIConfig, c 
 		}
 	}
 
-	if err := c.EnsureInitialized(ctx, VERSION, clusterType); err != nil {
-		return nil
+	if err := c.EnsureInitialized(ctx, buildinfo.Version, clusterType); err != nil {
+		return err
 	}
 
 	// By default we set the global reporting interval to 0 - this is
@@ -1195,29 +1380,91 @@ func ensureDefaultConfig(ctx context.Context, cfg *apiconfig.CalicoAPIConfig, c 
 		}
 	}
 
+	if err := ensureDefaultBGPConfigExists(ctx, c); err != nil {
+		return err
+	}
+
+	if calicoIPAMInUse() {
+		if err := ensureDefaultIPAMConfigExists(ctx, c); err != nil {
+			return err
+		}
+	} else {
+		log.WithField("CALICO_IPAM_TYPE", os.Getenv("CALICO_IPAM_TYPE")).Info("Calico IPAM not in use, skipping default IPAMConfiguration")
+	}
 	return nil
 }
 
-// ensureKDDMigrated ensures any data migration needed is done.
-func ensureKDDMigrated(cfg *apiconfig.CalicoAPIConfig, cv3 client.Interface) error {
-	cv1, err := clients.LoadKDDClientV1FromAPIConfigV3(cfg)
-	if err != nil {
-		return err
-	}
-	m := migrator.New(cv3, cv1, nil)
-	yes, err := m.ShouldMigrate()
-	if err != nil {
-		return err
-	} else if yes {
-		log.Infof("Running migration")
-		if _, err = m.Migrate(); err != nil {
-			return fmt.Errorf("Migration failed: %v", err)
-		}
-		log.Infof("Migration successful")
-	} else {
-		log.Debugf("Migration is not needed")
+// calicoIPAMInUse treats an unset CALICO_IPAM_TYPE as Calico IPAM, since older manifests don't set it.
+func calicoIPAMInUse() bool {
+	ipamType := os.Getenv("CALICO_IPAM_TYPE")
+	return ipamType == "" || strings.EqualFold(ipamType, "Calico")
+}
+
+func ensureDefaultBGPConfigExists(ctx context.Context, c client.Interface) error {
+	_, err := c.BGPConfigurations().Get(ctx, globalBGPConfigName, options.GetOptions{})
+	if err == nil {
+		log.Debug("Default BGPConfig exists.")
+		return nil
 	}
 
+	_, ok := err.(cerrors.ErrorResourceDoesNotExist)
+	if !ok {
+		log.WithError(err).WithField("BGPConfig", globalBGPConfigName).Errorf("Error getting global BGPConfig.")
+		return err
+	}
+
+	newBGPConf := api.NewBGPConfiguration()
+	newBGPConf.Name = globalBGPConfigName
+	_, err = c.BGPConfigurations().Create(ctx, newBGPConf, options.SetOptions{})
+	if err != nil {
+		if conflict, exists := err.(cerrors.ErrorResourceAlreadyExists); exists {
+			log.Infof("Ignoring conflict when setting value %s", conflict.Identifier)
+		} else {
+			log.WithError(err).WithField("BGPConfig", newBGPConf).Errorf("Error creating default BGPConfiguration.")
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureDefaultIPAMConfigExists(ctx context.Context, c client.Interface) error {
+	_, err := c.IPAMConfiguration().Get(ctx, globalIPAMConfigName, options.GetOptions{})
+	if err == nil {
+		log.Debug("Default IPAMConfiguration exists.")
+		return nil
+	}
+
+	_, ok := err.(cerrors.ErrorResourceDoesNotExist)
+	if !ok {
+		log.WithError(err).WithField("IPAMConfiguration", globalIPAMConfigName).Errorf("Error getting default IPAMConfiguration.")
+		return err
+	}
+
+	// The meaningful IPAM defaults are not the zero value, so set them
+	// explicitly. The kubebuilder defaults only apply through the apiserver
+	// admission path, not on a direct client Create.
+	newIPAMConf := api.NewIPAMConfiguration()
+	newIPAMConf.Name = globalIPAMConfigName
+	newIPAMConf.Spec.AutoAllocateBlocks = true
+	newIPAMConf.Spec.MaxBlocksPerHost = 0
+	newIPAMConf.Spec.KubeVirtVMAddressPersistence = ptr.To(api.VMAddressPersistenceEnabled)
+
+	// Leave StrictAffinity disabled, matching the previous default. Windows
+	// nodes require it enabled, but it's a single global setting and Windows
+	// clusters are usually mixed with Linux, so we can't pick the right value
+	// from one node at startup without racing the others. Windows clusters
+	// enable it explicitly via "calicoctl ipam configure", and GetIPAMConfig
+	// enforces it for Windows nodes.
+	newIPAMConf.Spec.StrictAffinity = false
+	_, err = c.IPAMConfiguration().Create(ctx, newIPAMConf, options.SetOptions{})
+	if err != nil {
+		if conflict, exists := err.(cerrors.ErrorResourceAlreadyExists); exists {
+			log.Infof("Ignoring conflict when setting value %s", conflict.Identifier)
+		} else {
+			log.WithError(err).WithField("IPAMConfiguration", newIPAMConf).Errorf("Error creating default IPAMConfiguration.")
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1228,7 +1475,7 @@ func extractKubeadmCIDRs(kubeadmConfig *v1.ConfigMap) (string, string, error) {
 	var err error
 
 	if kubeadmConfig == nil {
-		return "", "", fmt.Errorf("Invalid config map.")
+		return "", "", fmt.Errorf("invalid config map")
 	}
 
 	// Look through the config map for lines starting with 'podSubnet', then assign the right variable
@@ -1243,7 +1490,7 @@ func extractKubeadmCIDRs(kubeadmConfig *v1.ConfigMap) (string, string, error) {
 
 	if len(line) != 0 {
 		// IPv4 and IPv6 CIDRs will be separated by a comma in a dual stack setup.
-		for _, cidr := range strings.Split(line[1], ",") {
+		for cidr := range strings.SplitSeq(line[1], ",") {
 			addr, _, err := net.ParseCIDR(cidr)
 			if err != nil {
 				break

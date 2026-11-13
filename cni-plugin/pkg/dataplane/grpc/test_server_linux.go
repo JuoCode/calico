@@ -22,18 +22,20 @@ import (
 
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
-	"github.com/gogo/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/projectcalico/calico/cni-plugin/pkg/dataplane/grpc/proto"
 )
 
 type TestServer struct {
+	pb.UnimplementedCniDataplaneServer
+
 	retval   bool
 	contMac  string
-	Received chan interface{}
+	Received chan any
 
 	lis        net.Listener
 	grpcServer *grpc.Server
@@ -95,7 +97,7 @@ func (s *TestServer) SetResult(r bool) {
 
 func (s *TestServer) GracefulStop() {
 	s.grpcServer.GracefulStop()
-	s.lis.Close()
+	_ = s.lis.Close()
 }
 
 func (s *TestServer) startServer() {
@@ -109,7 +111,7 @@ func StartTestServer(socket string, retval bool, contMac string) (s *TestServer,
 	s = &TestServer{
 		retval:     retval,
 		contMac:    contMac,
-		Received:   make(chan interface{}, 1),
+		Received:   make(chan any, 1),
 		grpcServer: grpc.NewServer(),
 	}
 

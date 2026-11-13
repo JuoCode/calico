@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
-
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -147,7 +146,7 @@ func BuildConfigFromFlags(masterUrl, kubeconfigPath string) (*rest.Config, error
 		return GetInClusterConfig()
 	}
 	if kubeconfigPath == "" && masterUrl == "" {
-		log.Warning("Neither --kubeconfig nor --master was specified.  Using the inClusterConfig.  This might not work.")
+		log.Debug("Neither --kubeconfig nor --master was specified.  Using the inClusterConfig.")
 		kubeconfig, err := GetInClusterConfig()
 		if err == nil {
 			return kubeconfig, nil

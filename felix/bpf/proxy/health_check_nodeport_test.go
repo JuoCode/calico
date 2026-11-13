@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,34 +17,87 @@ package proxy_test
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/projectcalico/calico/felix/bpf/proxy"
 )
 
 var _ = Describe("BPF Proxy healthCheckNodeport", func() {
-	var p proxy.Proxy
-	k8s := fake.NewSimpleClientset()
+	var p proxy.ProxyFrontend
+	var k8s *fake.Clientset
 
+	healthCheckNodePort := 1212
 	testNodeName := "testnode"
 	testNodeNameOther := "anothertestnode"
+
+	lbSvc := &v1.Service{
+		TypeMeta:   typeMetaV1("Service"),
+		ObjectMeta: objectMetaV1("LB"),
+		Spec: v1.ServiceSpec{
+			ClusterIP: "10.1.0.1",
+			Type:      v1.ServiceTypeLoadBalancer,
+			Selector: map[string]string{
+				"app": "test",
+			},
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			HealthCheckNodePort:   int32(healthCheckNodePort),
+			Ports: []v1.ServicePort{
+				{
+					Protocol:   v1.ProtocolTCP,
+					Port:       4321,
+					TargetPort: intstr.FromInt(32678),
+				},
+			},
+		},
+	}
+
+	lbEps := &discovery.EndpointSlice{
+		TypeMeta:    typeMetaV1("EndpointSlice"),
+		ObjectMeta:  objectMetaV1("LB"),
+		AddressType: discovery.AddressTypeIPv4,
+		Endpoints: []discovery.Endpoint{
+			{
+				Addresses: []string{"10.1.2.1"},
+				Conditions: discovery.EndpointConditions{
+					Ready: ptr.To(true),
+				},
+			},
+		},
+		Ports: []discovery.EndpointPort{
+			{
+				Port:     ptr.To(int32(1234)),
+				Name:     ptr.To("LBPort"),
+				Protocol: ptr.To(v1.ProtocolTCP),
+			},
+		},
+	}
 
 	BeforeEach(func() {
 		By("creating proxy with fake client and mock syncer", func() {
 			var err error
 
-			p, err = proxy.New(k8s, &mockDummySyncer{},
-				testNodeName, proxy.WithMinSyncPeriod(200*time.Millisecond))
+			// Pre-populate the fake clientset with the service and endpoint
+			// slice so they are picked up during the informer's initial List.
+			// Adding objects via Tracker().Add() after the proxy starts is
+			// racy: the informer may complete its List before the watch is
+			// set up, causing the add event to be lost.
+			k8s = fake.NewClientset(lbSvc, lbEps)
+
+			p, err = proxy.New(k8s, &mockDummySyncer{}, testNodeName,
+				proxy.WithMinSyncPeriod(200*time.Millisecond), proxy.WithMaxSyncPeriod(1*time.Second))
 			Expect(err).NotTo(HaveOccurred())
+			p.SetHostIPs([]net.IP{net.ParseIP("127.0.0.1")})
 		})
 	})
 
@@ -55,54 +108,6 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 	})
 
 	It("should expose health check endpoint", func() {
-		healthCheckNodePort := 1212
-
-		By("adding a LoadBalancer", func() {
-			err := k8s.Tracker().Add(&v1.Service{
-				TypeMeta:   typeMetaV1("Service"),
-				ObjectMeta: objectMetaV1("LB"),
-				Spec: v1.ServiceSpec{
-					ClusterIP: "10.1.0.1",
-					Type:      v1.ServiceTypeLoadBalancer,
-					Selector: map[string]string{
-						"app": "test",
-					},
-					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
-					HealthCheckNodePort:   int32(healthCheckNodePort),
-					Ports: []v1.ServicePort{
-						{
-							Protocol:   v1.ProtocolTCP,
-							Port:       4321,
-							TargetPort: intstr.FromInt(32678),
-						},
-					},
-				},
-			})
-			Expect(err).NotTo(HaveOccurred())
-		})
-
-		By("adding its endpointSlice", func() {
-			err := k8s.Tracker().Add(epsToSlice(&v1.Endpoints{
-				TypeMeta:   typeMetaV1("Endpoints"),
-				ObjectMeta: objectMetaV1("LB"),
-				Subsets: []v1.EndpointSubset{
-					{
-						Addresses: []v1.EndpointAddress{
-							{
-								IP: "10.1.2.1",
-							},
-						},
-						Ports: []v1.EndpointPort{
-							{
-								Port: 1234,
-							},
-						},
-					},
-				},
-			}))
-			Expect(err).NotTo(HaveOccurred())
-		})
-
 		By("checking that the healthCheckNodePort is accessible", func() {
 			Eventually(func() error {
 				result, err := http.Get(fmt.Sprintf("http://localhost:%d", healthCheckNodePort))
@@ -121,7 +126,7 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.StatusCode).Should(Equal(503))
 
-			var status map[string]interface{}
+			var status map[string]any
 
 			decoder := json.NewDecoder(result.Body)
 			err = decoder.Decode(&status)
@@ -132,31 +137,36 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 		})
 
 		By("adding a local and a non-local endpoint", func() {
-			err := k8s.Tracker().Update(discovery.SchemeGroupVersion.WithResource("endpointslices"),
-				epsToSlice(&v1.Endpoints{
-					TypeMeta:   typeMetaV1("Endpoints"),
-					ObjectMeta: objectMetaV1("LB"),
-					Subsets: []v1.EndpointSubset{
-						{
-							Addresses: []v1.EndpointAddress{
-								{
-									IP:       "10.1.2.1",
-									NodeName: &testNodeName,
-								},
-								{
-									IP:       "10.1.2.2",
-									NodeName: &testNodeNameOther,
-								},
-							},
-							Ports: []v1.EndpointPort{
-								{
-									Port: 1234,
-								},
-							},
+			ep := &discovery.EndpointSlice{
+				TypeMeta:    typeMetaV1("EndpointSlice"),
+				ObjectMeta:  objectMetaV1("LB"),
+				AddressType: discovery.AddressTypeIPv4,
+				Endpoints: []discovery.Endpoint{
+					{
+						Addresses: []string{"10.1.2.1"},
+						NodeName:  &testNodeName,
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
 						},
 					},
-				}),
-				metav1.NamespaceDefault)
+					{
+						Addresses: []string{"10.1.2.2"},
+						NodeName:  &testNodeNameOther,
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
+						},
+					},
+				},
+				Ports: []discovery.EndpointPort{
+					{
+						Port:     ptr.To(int32(1234)),
+						Name:     ptr.To("LBPort"),
+						Protocol: ptr.To(v1.ProtocolTCP),
+					},
+				},
+			}
+
+			err := k8s.Tracker().Update(discovery.SchemeGroupVersion.WithResource("endpointslices"), ep, metav1.NamespaceDefault)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
@@ -170,7 +180,7 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 					return fmt.Errorf("Unexpected status code %d; expected 200", result.StatusCode)
 				}
 
-				var status map[string]interface{}
+				var status map[string]any
 
 				decoder := json.NewDecoder(result.Body)
 				err = decoder.Decode(&status)
@@ -186,31 +196,36 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 			}, "5s", "200ms").Should(Succeed())
 
 			By("making non-local a local endpoint", func() {
-				err := k8s.Tracker().Update(discovery.SchemeGroupVersion.WithResource("endpointslices"),
-					epsToSlice(&v1.Endpoints{
-						TypeMeta:   typeMetaV1("Endpoints"),
-						ObjectMeta: objectMetaV1("LB"),
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "10.1.2.1",
-										NodeName: &testNodeName,
-									},
-									{
-										IP:       "10.1.2.2",
-										NodeName: &testNodeName,
-									},
-								},
-								Ports: []v1.EndpointPort{
-									{
-										Port: 1234,
-									},
-								},
+				ep := &discovery.EndpointSlice{
+					TypeMeta:    typeMetaV1("EndpointSlice"),
+					ObjectMeta:  objectMetaV1("LB"),
+					AddressType: discovery.AddressTypeIPv4,
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{"10.1.2.1"},
+							NodeName:  &testNodeName,
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
 							},
 						},
-					}),
-					metav1.NamespaceDefault)
+						{
+							Addresses: []string{"10.1.2.2"},
+							NodeName:  &testNodeName,
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+					},
+					Ports: []discovery.EndpointPort{
+						{
+							Port:     ptr.To(int32(1234)),
+							Name:     ptr.To("LBPort"),
+							Protocol: ptr.To(v1.ProtocolTCP),
+						},
+					},
+				}
+
+				err := k8s.Tracker().Update(discovery.SchemeGroupVersion.WithResource("endpointslices"), ep, metav1.NamespaceDefault)
 				Expect(err).NotTo(HaveOccurred())
 			})
 
@@ -224,7 +239,7 @@ var _ = Describe("BPF Proxy healthCheckNodeport", func() {
 						return fmt.Errorf("Unexpected status code %d; expected 200", result.StatusCode)
 					}
 
-					var status map[string]interface{}
+					var status map[string]any
 
 					decoder := json.NewDecoder(result.Body)
 					err = decoder.Decode(&status)

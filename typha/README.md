@@ -25,7 +25,7 @@ Typha is generally not required for Calico deployments using an etcdv3 datastore
 ## How can I start using Typha?
 
 Follow the "more than 50 nodes" section in the
-[Calico for Kubernetes getting started guide](https://docs.projectcalico.org/getting-started/kubernetes/self-managed-onprem/onpremises).
+[Calico for Kubernetes getting started guide](https://docs.tigera.io/calico/latest/getting-started/kubernetes/self-managed-onprem/onpremises).
 
 ## How can I get support for contributing to Project Calico?
 
@@ -52,7 +52,7 @@ your contribution.
 
 ## How do I build Typha?
 
-Typha mostly uses Docker for builds.  We develop on Ubuntu 16.04 but other
+Typha mostly uses Docker for builds.  We develop on Ubuntu 24.04 but other
 Linux distributions should work (there are known Makefile that prevent building on OS X).
 To build Typha, you will need:
 

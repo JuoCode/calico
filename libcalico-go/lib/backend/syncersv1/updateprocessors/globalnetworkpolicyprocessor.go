@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,21 +27,28 @@ import (
 
 // Create a new SyncerUpdateProcessor to sync GlobalNetworkPolicy data in v1 format for
 // consumption by Felix.
-func NewGlobalNetworkPolicyUpdateProcessor() watchersyncer.SyncerUpdateProcessor {
-	return NewSimpleUpdateProcessor(apiv3.KindGlobalNetworkPolicy, convertGlobalNetworkPolicyV2ToV1Key, convertGlobalNetworkPolicyV2ToV1Value)
+func NewGlobalNetworkPolicyUpdateProcessor(keyKind string) watchersyncer.SyncerUpdateProcessor {
+	return NewSimpleUpdateProcessor(
+		keyKind,
+		gnpKeyConverter(keyKind),
+		ConvertGlobalNetworkPolicyV3ToV1Value,
+	)
 }
 
-func convertGlobalNetworkPolicyV2ToV1Key(v3key model.ResourceKey) (model.Key, error) {
-	if v3key.Name == "" {
-		return model.PolicyKey{}, errors.New("Missing Name field to create a v1 NetworkPolicy Key")
+func gnpKeyConverter(kind string) func(model.ResourceKey) (model.Key, error) {
+	return func(v3key model.ResourceKey) (model.Key, error) {
+		if v3key.Name == "" {
+			return model.PolicyKey{}, errors.New("Missing Name field to create a model.PolicyKey")
+		}
+		return model.PolicyKey{
+			Name:      v3key.Name,
+			Namespace: "",
+			Kind:      kind,
+		}, nil
 	}
-	return model.PolicyKey{
-		Name: v3key.Name,
-	}, nil
-
 }
 
-func convertGlobalNetworkPolicyV2ToV1Value(val interface{}) (interface{}, error) {
+func ConvertGlobalNetworkPolicyV3ToV1Value(val any) (any, error) {
 	v3res, ok := val.(*apiv3.GlobalNetworkPolicy)
 	if !ok {
 		return nil, errors.New("Value is not a valid GlobalNetworkPolicy resource value")
@@ -64,11 +71,12 @@ func convertGlobalNetworkPolicyV2ToV1Value(val interface{}) (interface{}, error)
 
 	v1value := &model.Policy{
 		Namespace:        "", // Empty string used to signal a GlobalNetworkPolicy.
+		Tier:             tierOrDefault(spec.Tier),
 		Order:            spec.Order,
-		InboundRules:     RulesAPIV2ToBackend(spec.Ingress, ""),
-		OutboundRules:    RulesAPIV2ToBackend(spec.Egress, ""),
+		InboundRules:     RulesAPIV3ToBackend(spec.Ingress, ""),
+		OutboundRules:    RulesAPIV3ToBackend(spec.Egress, ""),
 		Selector:         selector,
-		Types:            policyTypesAPIV2ToBackend(spec.Types),
+		Types:            policyTypesAPIV3ToBackend(spec.Types),
 		DoNotTrack:       spec.DoNotTrack,
 		PreDNAT:          spec.PreDNAT,
 		ApplyOnForward:   spec.ApplyOnForward,

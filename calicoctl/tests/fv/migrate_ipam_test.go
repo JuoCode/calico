@@ -1,4 +1,4 @@
-// Copyright (c) 2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,24 +23,21 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-
-	log "github.com/sirupsen/logrus"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	. "github.com/projectcalico/calico/calicoctl/tests/fv/utils"
+	"github.com/projectcalico/calico/lib/logrusr"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 func init() {
-	log.AddHook(logutils.ContextHook{})
-	log.SetFormatter(&logutils.Formatter{})
+	// Set up logging formatting.
+	logrusr.ConfigureFormatter("test")
 }
 
 func TestDatastoreMigrationIPAM(t *testing.T) {
@@ -78,9 +75,9 @@ func TestDatastoreMigrationIPAM(t *testing.T) {
 	}()
 
 	// Create a Node resource for this host.
-	node := libapiv3.NewNode()
+	node := internalapi.NewNode()
 	node.Name = "node4"
-	node.Spec.OrchRefs = []libapiv3.OrchRef{
+	node.Spec.OrchRefs = []internalapi.OrchRef{
 		{
 			NodeName:     "node4",
 			Orchestrator: "k8s",
@@ -154,7 +151,7 @@ func TestDatastoreMigrationIPAM(t *testing.T) {
 	// Export the data
 	// Create a temporary file
 	tempfile, err := os.CreateTemp("", "ipam-migration-test")
-	defer os.Remove(tempfile.Name())
+	defer func() { _ = os.Remove(tempfile.Name()) }()
 	Expect(err).NotTo(HaveOccurred())
 	out = Calicoctl(false, "datastore", "migrate", "export")
 	_, err = tempfile.WriteString(out)
@@ -185,7 +182,7 @@ func TestDatastoreMigrationIPAM(t *testing.T) {
 	var allocatedIP string
 	r, err := regexp.Compile(`(10\.65\.[0-9]+\.)([0-9]+)/26`)
 	Expect(err).NotTo(HaveOccurred())
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		sm := r.FindStringSubmatch(line)
 		if len(sm) > 0 {
 			ordinalBase, err := strconv.Atoi(sm[2])
@@ -229,9 +226,9 @@ func TestDatastoreMigrationIPAM(t *testing.T) {
 		err = client.IPAM().ReleaseAffinity(ctx, cidr, "node4", false)
 		Expect(err).NotTo(HaveOccurred())
 		ip := cnet.ParseIP(cidr.IP.String())
-		ips = append(ips, ipam.ReleaseOptions{Address: ip.IP.String()})
+		ips = append(ips, ipam.ReleaseOptions{Address: ip.String()})
 	}
 	// Release the IPs
-	_, err = client.IPAM().ReleaseIPs(ctx, ips...)
+	_, _, err = client.IPAM().ReleaseIPs(ctx, ips...)
 	Expect(err).NotTo(HaveOccurred())
 }

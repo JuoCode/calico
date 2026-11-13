@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,272 @@
 package checker
 
 import (
+	"fmt"
+	"net"
 	"testing"
 
 	authz "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	"github.com/gogo/googleapis/google/rpc"
 	. "github.com/onsi/gomega"
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/app-policy/policystore"
-	"github.com/projectcalico/calico/app-policy/proto"
+	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/types"
 )
+
+func TestEvaluateNoEndpoint(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+
+	flow := &MockFlow{}
+	trace, _ := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, nil, flow)
+	Expect(trace).To(BeNil())
+}
+
+func TestEvaluateEndpointNoTiersNoProfiles(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+
+	ep := &proto.WorkloadEndpoint{}
+	flow := &MockFlow{}
+	trace, _ := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, ep, flow)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionDeny))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirIngress))
+	Expect(trace[0].Index).To(Equal(-1))
+	Expect(trace[0].Tier).To(Equal("__PROFILE__"))
+	Expect(trace[0].Name).To(Equal("__PROFILE__"))
+	Expect(trace[0].Namespace).To(Equal(""))
+}
+
+func TestEvaluateEndpointWithMatchingPolicy(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+
+	ep := &proto.WorkloadEndpoint{
+		Tiers: []*proto.TierInfo{
+			{
+				Name:            "tier1",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
+		InboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+			},
+		},
+	}
+	flow := &MockFlow{
+		Protocol: 6,
+		DestPort: 80,
+	}
+	trace, _ := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, ep, flow)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionAllow))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirIngress))
+	Expect(trace[0].Index).To(Equal(0))
+	Expect(trace[0].Tier).To(Equal("tier1"))
+	Expect(trace[0].Name).To(Equal("policy1"))
+	Expect(trace[0].Namespace).To(Equal(""))
+}
+
+func TestEvaluateEndpointWithNonMatchingPolicyTierDefaultAction(t *testing.T) {
+	RegisterTestingT(t)
+
+	tests := []struct {
+		name     string
+		tiers    []*proto.TierInfo
+		expLen   int
+		expActs  []rules.RuleAction
+		expIndex int
+	}{
+		{
+			name: "Tier1 Deny -> Tier2 Pass",
+			tiers: []*proto.TierInfo{
+				{
+					Name:            "tier1",
+					IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+					DefaultAction:   "Deny",
+				},
+				{
+					Name:            "tier2",
+					IngressPolicies: []*proto.PolicyID{{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+					DefaultAction:   "Pass",
+				},
+			},
+			expLen:   1,
+			expActs:  []rules.RuleAction{rules.RuleActionDeny},
+			expIndex: -1,
+		},
+		{
+			name: "Tier1 Pass -> Tier2 Deny",
+			tiers: []*proto.TierInfo{
+				{
+					Name:            "tier1",
+					IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+					DefaultAction:   "Pass",
+				},
+				{
+					Name:            "tier2",
+					IngressPolicies: []*proto.PolicyID{{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+					DefaultAction:   "Deny",
+				},
+			},
+			expLen:   2,
+			expActs:  []rules.RuleAction{rules.RuleActionPass, rules.RuleActionDeny},
+			expIndex: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := policystore.NewPolicyStore()
+			ep := &proto.WorkloadEndpoint{Tiers: tt.tiers}
+			store.PolicyByID[types.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}] = &proto.Policy{Tier: "default"}
+			store.PolicyByID[types.PolicyID{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}] = &proto.Policy{Tier: "default"}
+
+			flow := &MockFlow{Protocol: 6, DestPort: 443}
+			trace, _ := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, ep, flow)
+
+			Expect(trace).To(HaveLen(tt.expLen))
+			for i, act := range tt.expActs {
+				Expect(trace[i].Action).To(Equal(act))
+				Expect(trace[i].Index).To(Equal(tt.expIndex))
+			}
+		})
+	}
+}
+
+func TestEvaluateEndpointWithMatchingProfile(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+
+	ep := &proto.WorkloadEndpoint{
+		ProfileIds: []string{"profile1"},
+	}
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
+		InboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+			},
+		},
+	}
+	flow := &MockFlow{
+		Protocol: 6,
+		DestPort: 80,
+	}
+	trace, _ := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, ep, flow)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionAllow))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirIngress))
+	Expect(trace[0].Index).To(Equal(0))
+	Expect(trace[0].Tier).To(Equal("__PROFILE__"))
+	Expect(trace[0].Name).To(Equal("profile1"))
+	Expect(trace[0].Namespace).To(Equal(""))
+}
+
+func TestEvaluateEndpointWithNonMatchingProfile(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+
+	ep := &proto.WorkloadEndpoint{
+		Tiers: []*proto.TierInfo{
+			{
+				Name:           "tier1",
+				EgressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:  "Deny",
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier:      "tier1",
+		Namespace: "ns1",
+		OutboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+				SrcNet: []string{"10.0.0.0/24"},
+				DstPorts: []*proto.PortRange{
+					{First: 80, Last: 80},
+				},
+			},
+			{
+				Action: "deny",
+				SrcNet: []string{"192.168.1.0/24"},
+				DstPorts: []*proto.PortRange{
+					{First: 441, Last: 444},
+				},
+			},
+		},
+	}
+
+	ip_10_0_0_1 := net.ParseIP("10.0.0.1")
+	ip_10_0_0_2 := net.ParseIP("10.0.0.2")
+	ip_192_168_1_1 := net.ParseIP("192.168.1.1")
+	ip_192_168_1_2 := net.ParseIP("192.168.1.2")
+
+	flow1 := &MockFlow{
+		Protocol:   6,
+		SourcePort: 80,
+		DestPort:   443,
+		SourceIP:   ip_10_0_0_1,
+		DestIP:     ip_192_168_1_1,
+	}
+	trace, _ := Evaluate(EnforcedOnly, rules.RuleDirEgress, store, ep, flow1)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionDeny))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirEgress))
+	Expect(trace[0].Index).To(Equal(-1))
+	Expect(trace[0].Tier).To(Equal("tier1"))
+	Expect(trace[0].Name).To(Equal("policy1"))
+	Expect(trace[0].Namespace).To(Equal(""))
+
+	// Test with a matching source IP and destination port 80
+	flow2 := &MockFlow{
+		Protocol:   6,
+		SourcePort: 443,
+		DestPort:   80,
+		SourceIP:   ip_10_0_0_1,
+		DestIP:     ip_192_168_1_1,
+	}
+	trace, _ = Evaluate(EnforcedOnly, rules.RuleDirEgress, store, ep, flow2)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionAllow))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirEgress))
+	Expect(trace[0].Index).To(Equal(0))
+	Expect(trace[0].Tier).To(Equal("tier1"))
+	Expect(trace[0].Name).To(Equal("policy1"))
+	Expect(trace[0].Namespace).To(Equal(""))
+
+	// Test with a matching source IP and destination port 443
+	flow3 := &MockFlow{
+		Protocol:   6,
+		SourcePort: 80,
+		DestPort:   443,
+		SourceIP:   ip_192_168_1_2,
+		DestIP:     ip_10_0_0_2,
+	}
+	trace, _ = Evaluate(EnforcedOnly, rules.RuleDirEgress, store, ep, flow3)
+	Expect(trace).To(HaveLen(1))
+	Expect(trace[0].Action).To(Equal(rules.RuleActionDeny))
+	Expect(trace[0].Direction).To(Equal(rules.RuleDirEgress))
+	Expect(trace[0].Index).To(Equal(1))
+	Expect(trace[0].Tier).To(Equal("tier1"))
+	Expect(trace[0].Name).To(Equal("policy1"))
+	Expect(trace[0].Namespace).To(Equal(""))
+}
 
 // actionFromString should parse strings in case-insensitive mode.
 func TestActionFromString(t *testing.T) {
@@ -54,9 +312,11 @@ func TestCheckPolicyNoRules(t *testing.T) {
 			Principal: "spiffe://cluster.local/ns/default/sa/sue",
 		},
 	}}
-	reqCache, err := NewRequestCache(store, req)
-	Expect(err).To(Succeed())
-	Expect(checkPolicy(policy, reqCache)).To(Equal(NO_MATCH))
+	flow := NewCheckRequestToFlowAdapter(req)
+	reqCache := NewRequestCache(store, flow)
+	st, idx := checkPolicy(policy, rules.RuleDirIngress, reqCache)
+	Expect(st).To(Equal(NO_MATCH))
+	Expect(idx).To(Equal(tierDefaultActionIndex))
 }
 
 // If rules exist, but none match, we should get NO_MATCH
@@ -96,16 +356,80 @@ func TestCheckPolicyRules(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "HEAD"},
 		},
 	}}
-	reqCache, err := NewRequestCache(policystore.NewPolicyStore(), req)
-	Expect(err).To(Succeed())
-	Expect(checkPolicy(policy, reqCache)).To(Equal(NO_MATCH))
+	flow := NewCheckRequestToFlowAdapter(req)
+	reqCache := NewRequestCache(policystore.NewPolicyStore(), flow)
+	st, idx := checkPolicy(policy, rules.RuleDirIngress, reqCache)
+	Expect(st).To(Equal(NO_MATCH))
+	Expect(idx).To(Equal(tierDefaultActionIndex))
 
 	http := req.GetAttributes().GetRequest().GetHttp()
 	http.Method = "POST"
-	Expect(checkPolicy(policy, reqCache)).To(Equal(ALLOW))
+	st, idx = checkPolicy(policy, rules.RuleDirIngress, reqCache)
+	Expect(st).To(Equal(ALLOW))
+	Expect(idx).To(Equal(1))
 
 	http.Method = "GET"
-	Expect(checkPolicy(policy, reqCache)).To(Equal(DENY))
+	st, idx = checkPolicy(policy, rules.RuleDirIngress, reqCache)
+	Expect(st).To(Equal(DENY))
+	Expect(idx).To(Equal(2))
+}
+
+// If tiers have no ingress policies, we should not get NO_MATCH.
+func TestCheckNoIngressPolicyRulesInTier(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+	store.Endpoint = &proto.WorkloadEndpoint{
+		Tiers: []*proto.TierInfo{
+			{
+				Name:           "tier1",
+				EgressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:  "Deny",
+			},
+		},
+		ProfileIds: []string{"profile1"},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
+		OutboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
+		OutboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+			},
+		},
+	}
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
+		InboundRules: []*proto.Rule{
+			{
+				Action:    "allow",
+				HttpMatch: &proto.HTTPMatch{Methods: []string{"GET"}},
+			},
+		},
+	}
+	req := &authz.CheckRequest{Attributes: &authz.AttributeContext{
+		Source: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/steve",
+		},
+		Destination: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/sue",
+		},
+		Request: &authz.AttributeContext_Request{
+			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
+		},
+	}}
+	flow := NewCheckRequestToFlowAdapter(req)
+	status, _ := checkTiers(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	expectedStatus := rpc.Status{Code: OK}
+	Expect(status.Code).To(Equal(expectedStatus.Code))
+	Expect(status.Message).To(Equal(expectedStatus.Message))
+	Expect(status.Details).To(BeNil())
 }
 
 // CheckStore when the store has no endpoint should deny requests.
@@ -124,7 +448,8 @@ func TestCheckStoreNoEndpoint(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "HEAD"},
 		},
 	}}
-	status := checkStore(store, req)
+	flow := NewCheckRequestToFlowAdapter(req)
+	status := checkStore(EnforcedOnly, store, nil, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(PERMISSION_DENIED))
 }
 
@@ -147,7 +472,8 @@ func TestCheckStoreNoTiers(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "HEAD"},
 		},
 	}}
-	status := checkStore(store, req)
+	flow := NewCheckRequestToFlowAdapter(req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(PERMISSION_DENIED))
 }
 
@@ -160,11 +486,13 @@ func TestCheckStorePolicyMatch(t *testing.T) {
 		Tiers: []*proto.TierInfo{
 			{
 				Name:            "tier1",
-				IngressPolicies: []string{"policy1", "policy2"},
+				IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
 			},
 		},
 	}
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy1"}] = &proto.Policy{
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "deny",
@@ -172,7 +500,8 @@ func TestCheckStorePolicyMatch(t *testing.T) {
 			},
 		},
 	}
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy2"}] = &proto.Policy{
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "allow",
@@ -192,14 +521,15 @@ func TestCheckStorePolicyMatch(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
 		},
 	}}
+	flow := NewCheckRequestToFlowAdapter(req)
 
-	status := checkStore(store, req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(OK))
 
 	http := req.GetAttributes().GetRequest().GetHttp()
 	http.Method = "HEAD"
 
-	status = checkStore(store, req)
+	status = checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(PERMISSION_DENIED))
 }
 
@@ -212,7 +542,7 @@ func TestCheckStoreProfileOnly(t *testing.T) {
 		Tiers:      []*proto.TierInfo{},
 		ProfileIds: []string{"profile1", "profile2"},
 	}
-	store.ProfileByID[proto.ProfileID{Name: "profile1"}] = &proto.Profile{
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "Deny",
@@ -220,7 +550,7 @@ func TestCheckStoreProfileOnly(t *testing.T) {
 			},
 		},
 	}
-	store.ProfileByID[proto.ProfileID{Name: "profile2"}] = &proto.Profile{
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile2"})] = &proto.Profile{
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "allow",
@@ -240,18 +570,19 @@ func TestCheckStoreProfileOnly(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
 		},
 	}}
+	flow := NewCheckRequestToFlowAdapter(req)
 
-	status := checkStore(store, req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(OK))
 
 	http := req.GetAttributes().GetRequest().GetHttp()
 	http.Method = "HEAD"
 
-	status = checkStore(store, req)
+	status = checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(PERMISSION_DENIED))
 }
 
-// And endpoint with a Tier should not evaluate profiles; there is a default deny on the tier.
+// An endpoint with a Tier should not evaluate profiles; there is a default deny on the tier.
 func TestCheckStorePolicyDefaultDeny(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -260,12 +591,14 @@ func TestCheckStorePolicyDefaultDeny(t *testing.T) {
 		Tiers: []*proto.TierInfo{
 			{
 				Name:            "tier1",
-				IngressPolicies: []string{"policy1"},
+				IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
 			},
 		},
 		ProfileIds: []string{"profile1"},
 	}
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy1"}] = &proto.Policy{
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier1",
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "deny",
@@ -273,7 +606,7 @@ func TestCheckStorePolicyDefaultDeny(t *testing.T) {
 			},
 		},
 	}
-	store.ProfileByID[proto.ProfileID{Name: "profile1"}] = &proto.Profile{
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "allow",
@@ -293,8 +626,9 @@ func TestCheckStorePolicyDefaultDeny(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
 		},
 	}}
+	flow := NewCheckRequestToFlowAdapter(req)
 
-	status := checkStore(store, req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(PERMISSION_DENIED))
 }
 
@@ -306,13 +640,15 @@ func TestCheckStorePass(t *testing.T) {
 	store.Endpoint = &proto.WorkloadEndpoint{
 		Tiers: []*proto.TierInfo{{
 			Name:            "tier1",
-			IngressPolicies: []string{"policy1", "policy2"},
+			IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+			DefaultAction:   "Deny",
 		}},
 		ProfileIds: []string{"profile1"},
 	}
 
 	// Policy1 matches and has action PASS, which means policy2 is not evaluated.
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy1"}] = &proto.Policy{
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy1"})] = &proto.Policy{
+		Tier: "tier1",
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "next-tier",
@@ -320,7 +656,8 @@ func TestCheckStorePass(t *testing.T) {
 			},
 		},
 	}
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy2"}] = &proto.Policy{
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy2"})] = &proto.Policy{
+		Tier: "tier1",
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "deny",
@@ -330,7 +667,7 @@ func TestCheckStorePass(t *testing.T) {
 	}
 
 	// Profile1 matches and allows the traffic.
-	store.ProfileByID[proto.ProfileID{Name: "profile1"}] = &proto.Profile{
+	store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
 		InboundRules: []*proto.Rule{
 			{
 				Action:    "allow",
@@ -350,8 +687,9 @@ func TestCheckStorePass(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
 		},
 	}}
+	flow := NewCheckRequestToFlowAdapter(req)
 
-	status := checkStore(store, req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(OK))
 }
 
@@ -362,7 +700,8 @@ func TestCheckStoreInitFails(t *testing.T) {
 	store.Endpoint = &proto.WorkloadEndpoint{
 		Tiers: []*proto.TierInfo{{
 			Name:            "tier1",
-			IngressPolicies: []string{"policy1", "policy2"},
+			IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+			DefaultAction:   "Deny",
 		}},
 		ProfileIds: []string{"profile1"},
 	}
@@ -375,9 +714,12 @@ func TestCheckStoreInitFails(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET"},
 		},
 	}}
+	flow := NewCheckRequestToFlowAdapter(req)
 
-	status := checkStore(store, req)
-	Expect(status.Code).To(Equal(PERMISSION_DENIED))
+	// The tier names policies the store does not have, so their verdict is unknowable and
+	// evaluation fails closed rather than guessing.
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(INTERNAL))
 }
 
 // Ensure checkStore returns INVALID_ARGUMENT on invalid input
@@ -388,17 +730,20 @@ func TestCheckStoreWithInvalidData(t *testing.T) {
 	store.Endpoint = &proto.WorkloadEndpoint{
 		Tiers: []*proto.TierInfo{{
 			Name:            "tier1",
-			IngressPolicies: []string{"policy1", "policy2"},
+			IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+			DefaultAction:   "Deny",
 		}},
 		ProfileIds: []string{"profile1"},
 	}
-	store.PolicyByID[proto.PolicyID{Tier: "tier1", Name: "policy1"}] = &proto.Policy{InboundRules: []*proto.Rule{
+	id := types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy1"})
+	store.PolicyByID[id] = &proto.Policy{InboundRules: []*proto.Rule{
 		{
 			Action: "allow",
 			HttpMatch: &proto.HTTPMatch{
 				Methods: []string{"GET", "POST"},
 				Paths: []*proto.HTTPMatch_PathMatch{
-					{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/foo"}}},
+					{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/foo"}},
+				},
 			},
 		},
 	}}
@@ -414,6 +759,590 @@ func TestCheckStoreWithInvalidData(t *testing.T) {
 			Http: &authz.AttributeContext_HttpRequest{Method: "GET", Path: "foo"},
 		},
 	}}
-	status := checkStore(store, req)
+	flow := NewCheckRequestToFlowAdapter(req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
 	Expect(status.Code).To(Equal(INVALID_ARGUMENT))
+}
+
+// Check multiple tiers with next-tier (pass) to next tier and match the action on the matched rule in the next tier is
+// the result. For one path, /bar, matching hits tier2 default pass action, and result is based on a matched rule in tier3.
+func TestCheckStorePolicyMultiTierMatch(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+	store.Endpoint = &proto.WorkloadEndpoint{
+		Tiers: []*proto.TierInfo{
+			{
+				Name:            "tier1",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
+			},
+			{
+				Name:            "tier2",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy3", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Pass",
+			},
+			{
+				Name:            "tier3",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy4", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy1"})] = &proto.Policy{
+		Tier: "tier1",
+		InboundRules: []*proto.Rule{
+			{
+				Action:    "next-tier",
+				HttpMatch: &proto.HTTPMatch{Methods: []string{"GET", "HEAD"}},
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy2", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier2",
+		InboundRules: []*proto.Rule{
+			{
+				Action: "deny",
+				HttpMatch: &proto.HTTPMatch{
+					Paths: []*proto.HTTPMatch_PathMatch{{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/bad"}}},
+				},
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy3", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier2",
+		InboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+				HttpMatch: &proto.HTTPMatch{
+					Paths: []*proto.HTTPMatch_PathMatch{{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/foo"}}},
+				},
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy4", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier3",
+		InboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+				HttpMatch: &proto.HTTPMatch{
+					Paths: []*proto.HTTPMatch_PathMatch{{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/bar"}}},
+				},
+			},
+		},
+	}
+
+	req := &authz.CheckRequest{Attributes: &authz.AttributeContext{
+		Source: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/steve",
+		},
+		Destination: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/sally",
+		},
+		Request: &authz.AttributeContext_Request{
+			Http: &authz.AttributeContext_HttpRequest{Method: "GET", Path: "/foo"},
+		},
+	}}
+	flow := NewCheckRequestToFlowAdapter(req)
+
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(OK))
+
+	// Change to a bad path, and check that we get PERMISSION_DENIED
+	http := req.GetAttributes().GetRequest().GetHttp()
+	http.Path = "/bad"
+
+	status = checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(PERMISSION_DENIED))
+
+	// Change to a path that hits tier2 default Pass action, and then is allowed in tier3
+	http.Path = "/bar"
+
+	status = checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(OK))
+}
+
+// Check multiple tiers with next-tier (pass) or deny in first tier and an allow in next tier.
+func TestCheckStorePolicyMultiTierDiffTierMatch(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+	store.Endpoint = &proto.WorkloadEndpoint{
+		Tiers: []*proto.TierInfo{
+			{
+				Name:            "tier1",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}, {Name: "policy2", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Deny",
+			},
+			{
+				Name:            "tier2",
+				IngressPolicies: []*proto.PolicyID{{Name: "policy3", Kind: v3.KindGlobalNetworkPolicy}},
+				DefaultAction:   "Pass",
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy1"})] = &proto.Policy{
+		Tier: "tier1",
+		InboundRules: []*proto.Rule{
+			{
+				Action:    "deny",
+				HttpMatch: &proto.HTTPMatch{Methods: []string{"HEAD"}},
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Kind: v3.KindGlobalNetworkPolicy, Name: "policy2"})] = &proto.Policy{
+		Tier: "tier1",
+		InboundRules: []*proto.Rule{
+			{
+				Action:    "next-tier",
+				HttpMatch: &proto.HTTPMatch{Methods: []string{"GET"}},
+			},
+		},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(&proto.PolicyID{Name: "policy3", Kind: v3.KindGlobalNetworkPolicy})] = &proto.Policy{
+		Tier: "tier2",
+		InboundRules: []*proto.Rule{
+			{
+				Action: "allow",
+				HttpMatch: &proto.HTTPMatch{
+					Methods: []string{"GET"},
+					Paths:   []*proto.HTTPMatch_PathMatch{{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/foo"}}},
+				},
+			},
+		},
+	}
+
+	req := &authz.CheckRequest{Attributes: &authz.AttributeContext{
+		Source: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/steve",
+		},
+		Destination: &authz.AttributeContext_Peer{
+			Principal: "spiffe://cluster.local/ns/default/sa/sally",
+		},
+		Request: &authz.AttributeContext_Request{
+			Http: &authz.AttributeContext_HttpRequest{Method: "HEAD", Path: "/foo"},
+		},
+	}}
+	flow := NewCheckRequestToFlowAdapter(req)
+	status := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(PERMISSION_DENIED))
+
+	http := req.GetAttributes().GetRequest().GetHttp()
+	http.Method = "GET"
+
+	status = checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress, flow)
+	Expect(status.Code).To(Equal(OK))
+}
+
+func TestLookupEndpointKeysFromSrcDstNoStore(t *testing.T) {
+	RegisterTestingT(t)
+
+	src, dst, err := LookupEndpointKeysFromSrcDst(nil, "10.0.0.1", "192.168.1.1")
+	Expect(err).To(HaveOccurred())
+	Expect(src).To(BeNil())
+	Expect(dst).To(BeNil())
+}
+
+func TestLookupEndpointKeysFromSrcDst(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := policystore.NewPolicyStore()
+	store.IPToIndexes.Update(ip.MustParseCIDROrIP("10.0.0.1/32").Addr(), &proto.WorkloadEndpointUpdate{Id: &proto.WorkloadEndpointID{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}, Endpoint: &proto.WorkloadEndpoint{ProfileIds: []string{"profile1"}}})
+	store.IPToIndexes.Update(ip.MustParseCIDROrIP("10.0.0.2/32").Addr(), &proto.WorkloadEndpointUpdate{Id: &proto.WorkloadEndpointID{OrchestratorId: "default", WorkloadId: "wep2", EndpointId: "ep2"}, Endpoint: &proto.WorkloadEndpoint{ProfileIds: []string{"profile2"}}})
+	store.IPToIndexes.Update(ip.MustParseCIDROrIP("192.168.1.1/32").Addr(), &proto.WorkloadEndpointUpdate{Id: &proto.WorkloadEndpointID{OrchestratorId: "default", WorkloadId: "wep3", EndpointId: "ep3"}, Endpoint: &proto.WorkloadEndpoint{ProfileIds: []string{"profile3"}}})
+	store.IPToIndexes.Update(ip.MustParseCIDROrIP("192.168.1.2/32").Addr(), &proto.WorkloadEndpointUpdate{Id: &proto.WorkloadEndpointID{OrchestratorId: "default", WorkloadId: "wep4", EndpointId: "ep4"}, Endpoint: &proto.WorkloadEndpoint{ProfileIds: []string{"profile4"}}})
+
+	tests := []struct {
+		src, dst                 string
+		expectedSrc, expectedDst []proto.WorkloadEndpointID
+	}{
+		{
+			src: "10.0.0.1", dst: "192.168.1.1",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep3", EndpointId: "ep3"}},
+		},
+		{
+			src: "10.0.0.2", dst: "10.0.0.1",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep2", EndpointId: "ep2"}},
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+		},
+		{
+			src: "10.0.0.3", dst: "192.168.1.1",
+			expectedSrc: nil,
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep3", EndpointId: "ep3"}},
+		},
+		{
+			src: "10.0.0.1", dst: "192.168.1.2",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep4", EndpointId: "ep4"}},
+		},
+		{
+			src: "192.168.1.1", dst: "10.0.0.2",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep3", EndpointId: "ep3"}},
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep2", EndpointId: "ep2"}},
+		},
+		{
+			src: "192.168.1.2", dst: "10.0.0.1",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep4", EndpointId: "ep4"}},
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+		},
+		{
+			src: "192.168.1.3", dst: "10.0.0.1",
+			expectedSrc: nil,
+			expectedDst: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+		},
+		{
+			src: "10.0.0.1", dst: "192.168.1.3",
+			expectedSrc: []proto.WorkloadEndpointID{{OrchestratorId: "default", WorkloadId: "wep1", EndpointId: "ep1"}},
+			expectedDst: nil,
+		},
+	}
+
+	for i, test := range tests {
+		src, dst, err := LookupEndpointKeysFromSrcDst(store, test.src, test.dst)
+		Expect(err).To(BeNil(), fmt.Sprintf("Test case %d", i))
+		Expect(src).To(Equal(test.expectedSrc), fmt.Sprintf("Test case %d", i))
+		Expect(dst).To(Equal(test.expectedDst), fmt.Sprintf("Test case %d", i))
+	}
+}
+
+// MockFlow is a mock implementation of the Flow interface for testing purposes.
+type MockFlow struct {
+	SourceIP        net.IP
+	DestIP          net.IP
+	SourcePort      int
+	DestPort        int
+	Protocol        int
+	HttpMethod      *string
+	HttpPath        *string
+	SourcePrincipal *string
+	DestPrincipal   *string
+	SourceLabels    map[string]string
+	DestLabels      map[string]string
+}
+
+func (m *MockFlow) GetSourceIP() net.IP {
+	return m.SourceIP
+}
+
+func (m *MockFlow) GetDestIP() net.IP {
+	return m.DestIP
+}
+
+func (m *MockFlow) GetSourcePort() int {
+	return m.SourcePort
+}
+
+func (m *MockFlow) GetDestPort() int {
+	return m.DestPort
+}
+
+func (m *MockFlow) GetProtocol() int {
+	return m.Protocol
+}
+
+func (m *MockFlow) GetHttpMethod() *string {
+	return m.HttpMethod
+}
+
+func (m *MockFlow) GetHttpPath() *string {
+	return m.HttpPath
+}
+
+func (m *MockFlow) GetSourcePrincipal() *string {
+	return m.SourcePrincipal
+}
+
+func (m *MockFlow) GetDestPrincipal() *string {
+	return m.DestPrincipal
+}
+
+func (m *MockFlow) GetSourceLabels() map[string]string {
+	return m.SourceLabels
+}
+
+func (m *MockFlow) GetDestLabels() map[string]string {
+	return m.DestLabels
+}
+
+// Staged policies are stored like any other, so which verdict comes out depends entirely on the
+// PolicyScope the caller asks for. Under EnforcedOnly the answer must be the same as if the staged
+// policies were not attached to the endpoint at all: they match nothing, and a tier holding only
+// staged policies does not even get to apply its end-of-tier action. Under StagedAsEnforced they
+// behave like ordinary policies, end-of-tier action included.
+func TestCheckTiersPolicyScope(t *testing.T) {
+	RegisterTestingT(t)
+
+	stagedDeny := &proto.PolicyID{Name: "staged-deny", Kind: v3.KindStagedGlobalNetworkPolicy}
+	stagedNoMatch := &proto.PolicyID{Name: "staged-no-match", Kind: v3.KindStagedGlobalNetworkPolicy}
+	enforcedAllow := &proto.PolicyID{Name: "allow", Kind: v3.KindGlobalNetworkPolicy}
+	enforcedNoMatch := &proto.PolicyID{Name: "no-match", Kind: v3.KindGlobalNetworkPolicy}
+	notInStore := &proto.PolicyID{Name: "not-in-store", Kind: v3.KindGlobalNetworkPolicy}
+
+	for _, tc := range []struct {
+		name        string
+		tiers       []*proto.TierInfo
+		wantEnforce int32
+		wantPending int32
+	}{
+		{
+			name:        "tier of only staged policies is skipped when enforcing",
+			tiers:       tierInfos(policyIDs(stagedDeny)),
+			wantEnforce: OK, // Falls through the tier, so the endpoint's allowing profile decides.
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name:  "end-of-tier action of a staged-only tier applies only when pending",
+			tiers: tierInfos(policyIDs(stagedNoMatch)),
+			// Nothing matches either way, but when enforcing there is no tier to apply a default.
+			wantEnforce: OK,
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name:        "end-of-tier action survives a staged policy last in a mixed tier",
+			tiers:       tierInfos(policyIDs(enforcedNoMatch, stagedNoMatch)),
+			wantEnforce: PERMISSION_DENIED,
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name:        "end-of-tier action survives a staged policy first in a mixed tier",
+			tiers:       tierInfos(policyIDs(stagedNoMatch, enforcedNoMatch)),
+			wantEnforce: PERMISSION_DENIED,
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name:        "staged policy ahead of an enforced one only decides the pending verdict",
+			tiers:       tierInfos(policyIDs(stagedDeny, enforcedAllow)),
+			wantEnforce: OK,
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name:        "a staged policy does not shadow a later tier when enforcing",
+			tiers:       tierInfos(policyIDs(stagedDeny), policyIDs(enforcedAllow)),
+			wantEnforce: OK,
+			wantPending: PERMISSION_DENIED,
+		},
+		{
+			name: "a policy missing from the store fails the evaluation",
+			// Its verdict is unknowable, so fail closed rather than hand the request on to the rest
+			// of the tier.
+			tiers:       tierInfos(policyIDs(notInStore, enforcedAllow)),
+			wantEnforce: INTERNAL,
+			wantPending: INTERNAL,
+		},
+		{
+			name: "a policy missing from the store behind a match is never reached",
+			// Evaluation stops at the first match, in the store as in the dataplane, so a missing
+			// policy does not invalidate a verdict reached before it.
+			tiers:       tierInfos(policyIDs(enforcedAllow, notInStore)),
+			wantEnforce: OK,
+			wantPending: OK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, scope := range []struct {
+				PolicyScope
+				want int32
+			}{{EnforcedOnly, tc.wantEnforce}, {StagedAsEnforced, tc.wantPending}} {
+				store := policystore.NewPolicyStore()
+				store.Endpoint = &proto.WorkloadEndpoint{Tiers: tc.tiers, ProfileIds: []string{"profile1"}}
+				// An allowing profile, so that an end-of-tier deny which failed to apply shows up as
+				// OK instead of being masked by the overall default deny.
+				store.ProfileByID[types.ProtoToProfileID(&proto.ProfileID{Name: "profile1"})] = &proto.Profile{
+					InboundRules: []*proto.Rule{{Action: "allow"}},
+				}
+				for _, id := range []*proto.PolicyID{stagedNoMatch, enforcedNoMatch} {
+					store.PolicyByID[types.ProtoToPolicyID(id)] = &proto.Policy{Tier: "tier1"}
+				}
+				for _, id := range []*proto.PolicyID{stagedDeny} {
+					store.PolicyByID[types.ProtoToPolicyID(id)] = &proto.Policy{
+						Tier:         "tier1",
+						InboundRules: []*proto.Rule{{Action: "deny"}},
+					}
+				}
+				store.PolicyByID[types.ProtoToPolicyID(enforcedAllow)] = &proto.Policy{
+					InboundRules: []*proto.Rule{{Action: "allow"}},
+				}
+
+				st := checkStore(scope.PolicyScope, store, store.Endpoint, rules.RuleDirIngress,
+					&MockFlow{Protocol: 6, DestPort: 80})
+				Expect(st.Code).To(Equal(scope.want), "scope %v", scope.PolicyScope)
+			}
+		})
+	}
+}
+
+// policyIDs and tierInfos build one tier per argument list, named tier1, tier2, ... , each denying
+// at the end so that skipping a tier is visible.
+func policyIDs(ids ...*proto.PolicyID) []*proto.PolicyID { return ids }
+
+func tierInfos(tiers ...[]*proto.PolicyID) []*proto.TierInfo {
+	var tierInfos []*proto.TierInfo
+	for i, policies := range tiers {
+		tierInfos = append(tierInfos, &proto.TierInfo{
+			Name:            fmt.Sprintf("tier%d", i+1),
+			IngressPolicies: policies,
+			DefaultAction:   "Deny",
+		})
+	}
+	return tierInfos
+}
+
+// The status message says which policy was missing, so an operator seeing a denied request in the
+// Dikastes log does not have to guess.
+func TestCheckStoreReportsWhichPolicyIsMissing(t *testing.T) {
+	RegisterTestingT(t)
+
+	missing := &proto.PolicyID{Name: "policy1", Namespace: "ns1", Kind: v3.KindNetworkPolicy}
+
+	store := policystore.NewPolicyStore()
+	store.Endpoint = &proto.WorkloadEndpoint{Tiers: tierInfos(policyIDs(missing))}
+
+	st := checkStore(EnforcedOnly, store, store.Endpoint, rules.RuleDirIngress,
+		&MockFlow{Protocol: 6, DestPort: 80})
+	Expect(st.Code).To(Equal(INTERNAL))
+	Expect(st.Message).To(Equal("policy np/ns1/policy1 of tier tier1 is missing from the policy store"))
+}
+
+// A trace that stops short of a verdict is worse than no trace: a flow log would show the flow
+// running off the end of policy. Callers are told the evaluation failed, so they can keep whatever
+// trace they had rather than record the flow as having no policy at all.
+func TestEvaluateReportsFailureInsteadOfPartialTrace(t *testing.T) {
+	RegisterTestingT(t)
+
+	notInStore := &proto.PolicyID{Name: "not-in-store", Kind: v3.KindGlobalNetworkPolicy}
+	passes := &proto.PolicyID{Name: "passes", Kind: v3.KindGlobalNetworkPolicy}
+
+	store := policystore.NewPolicyStore()
+	store.PolicyByID[types.ProtoToPolicyID(passes)] = &proto.Policy{
+		InboundRules: []*proto.Rule{{Action: "pass"}},
+	}
+	// tier1 passes, then tier2 holds a policy we have not been told the rules for.
+	ep := &proto.WorkloadEndpoint{Tiers: tierInfos(policyIDs(passes), policyIDs(notInStore))}
+
+	for _, scope := range []PolicyScope{EnforcedOnly, StagedAsEnforced} {
+		trace, err := Evaluate(scope, rules.RuleDirIngress, store, ep, &MockFlow{Protocol: 6, DestPort: 80})
+		Expect(err).To(MatchError(ContainSubstring("not-in-store")), "scope %v", scope)
+		Expect(trace).To(BeNil(), "scope %v", scope)
+	}
+}
+
+// The pending trace records the staged policy that decided it, so that flow logs can show which
+// staged policy would have taken effect.
+func TestEvaluateRecordsStagedPolicyInPendingTraceOnly(t *testing.T) {
+	RegisterTestingT(t)
+
+	stagedDeny := &proto.PolicyID{Name: "staged-deny", Kind: v3.KindStagedGlobalNetworkPolicy}
+	enforcedAllow := &proto.PolicyID{Name: "allow", Kind: v3.KindGlobalNetworkPolicy}
+
+	store := policystore.NewPolicyStore()
+	store.PolicyByID[types.ProtoToPolicyID(stagedDeny)] = &proto.Policy{
+		Tier:         "tier1",
+		InboundRules: []*proto.Rule{{Action: "deny"}},
+	}
+	store.PolicyByID[types.ProtoToPolicyID(enforcedAllow)] = &proto.Policy{
+		Tier:         "tier2",
+		InboundRules: []*proto.Rule{{Action: "allow"}},
+	}
+	ep := &proto.WorkloadEndpoint{Tiers: tierInfos(policyIDs(stagedDeny), policyIDs(enforcedAllow))}
+	flow := &MockFlow{Protocol: 6, DestPort: 80}
+
+	pending, err := Evaluate(StagedAsEnforced, rules.RuleDirIngress, store, ep, flow)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(pending).To(Equal([]*calc.RuleID{
+		calc.NewRuleID(v3.KindStagedGlobalNetworkPolicy, "tier1", "staged-deny", "",
+			0, rules.RuleDirIngress, rules.RuleActionDeny),
+	}))
+
+	enforced, err := Evaluate(EnforcedOnly, rules.RuleDirIngress, store, ep, flow)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(enforced).To(Equal([]*calc.RuleID{
+		calc.NewRuleID(v3.KindGlobalNetworkPolicy, "tier2", "allow", "",
+			0, rules.RuleDirIngress, rules.RuleActionAllow),
+	}))
+}
+
+// A rule whose HTTP criteria would reject a malformed request path no longer decides the
+// request when the rule does not apply to it in the first place. Ordering the criteria
+// cheapest-first drops such a rule on its protocol, before matchRequest can panic on the
+// path, so the walk carries on to a rule that does apply.
+func TestMalformedHTTPPathOnlyFailsRulesThatReachIt(t *testing.T) {
+	RegisterTestingT(t)
+
+	udpWithPaths := &proto.PolicyID{Name: "udp-with-paths", Kind: v3.KindGlobalNetworkPolicy}
+	allowsTCP := &proto.PolicyID{Name: "allows-tcp", Kind: v3.KindGlobalNetworkPolicy}
+
+	httpRule := func(protocol string) *proto.Rule {
+		return &proto.Rule{
+			Action:   "allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: protocol}},
+			HttpMatch: &proto.HTTPMatch{
+				Paths: []*proto.HTTPMatch_PathMatch{
+					{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/foo"}},
+				},
+			},
+		}
+	}
+
+	store := policystore.NewPolicyStore()
+	store.PolicyByID[types.ProtoToPolicyID(allowsTCP)] = &proto.Policy{
+		InboundRules: []*proto.Rule{{Action: "allow"}},
+	}
+	ep := &proto.WorkloadEndpoint{Tiers: tierInfos(policyIDs(udpWithPaths, allowsTCP))}
+
+	// A TCP request whose path is missing its leading "/". Envoy should not send one, so the
+	// evaluator treats it as bad data from the data plane rather than as a non-match.
+	badPath := "no-leading-slash"
+	flow := &MockFlow{Protocol: 6, DestPort: 80, HttpPath: &badPath}
+
+	// The UDP rule cannot apply to a TCP request, so its HTTP criteria are never reached and
+	// the next policy allows.
+	store.PolicyByID[types.ProtoToPolicyID(udpWithPaths)] = &proto.Policy{
+		InboundRules: []*proto.Rule{httpRule("UDP")},
+	}
+	Expect(checkStore(EnforcedOnly, store, ep, rules.RuleDirIngress, flow).Code).To(Equal(OK))
+
+	// The same rule on TCP does reach them, and the malformed path still fails the request.
+	store.PolicyByID[types.ProtoToPolicyID(udpWithPaths)] = &proto.Policy{
+		InboundRules: []*proto.Rule{httpRule("TCP")},
+	}
+	st := checkStore(EnforcedOnly, store, ep, rules.RuleDirIngress, flow)
+	Expect(st.Code).To(Equal(INVALID_ARGUMENT))
+	Expect(st.Message).To(ContainSubstring(badPath))
+}
+
+// countingFlow counts how often the evaluator asks the data plane for the flow's protocol.
+type countingFlow struct {
+	Flow
+	protocolCalls int
+}
+
+func (c *countingFlow) GetProtocol() int {
+	c.protocolCalls++
+	return c.Flow.GetProtocol()
+}
+
+// The protocol is the first criterion every rule is tested against, so the evaluator must not
+// ask the data plane for it per rule: the Envoy adapter derives it from an enum name via a
+// lowercased map lookup, which allocates.
+func TestProtocolResolvedOncePerRequest(t *testing.T) {
+	RegisterTestingT(t)
+
+	// Rules that no request matches, so that every one of them tests the protocol.
+	var noMatch []*proto.Rule
+	for range 50 {
+		noMatch = append(noMatch, &proto.Rule{
+			Action:   "allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Number{Number: 132}},
+		})
+	}
+
+	policy := &proto.PolicyID{Name: "policy1", Kind: v3.KindGlobalNetworkPolicy}
+	store := policystore.NewPolicyStore()
+	store.PolicyByID[types.ProtoToPolicyID(policy)] = &proto.Policy{InboundRules: noMatch}
+	ep := &proto.WorkloadEndpoint{Tiers: tierInfos(policyIDs(policy))}
+
+	flow := &countingFlow{Flow: &MockFlow{Protocol: 6, DestPort: 80}}
+	Expect(checkStore(EnforcedOnly, store, ep, rules.RuleDirIngress, flow).Code).To(Equal(PERMISSION_DENIED))
+	Expect(flow.protocolCalls).To(Equal(1))
 }

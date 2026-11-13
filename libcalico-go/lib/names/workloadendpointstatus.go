@@ -18,11 +18,10 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/projectcalico/calico/felix/proto"
-	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-
 	"github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
 
 const (
@@ -63,27 +62,9 @@ func WorkloadEndpointKeyToStatusFilename(key *model.WorkloadEndpointKey) string 
 	return strings.Join(parts, separator)
 }
 
-// WorkloadEndpointIDToWorkloadEndpointKey converts the proto representation
-// of an endpoint key back to the canonical model structure.
-// Returns nil if passed a nilptr.
-func WorkloadEndpointIDToWorkloadEndpointKey(id *proto.WorkloadEndpointID, hostname string) *model.WorkloadEndpointKey {
-	if id == nil {
-		return nil
-	}
-
-	key := &model.WorkloadEndpointKey{
-		Hostname:       hostname,
-		OrchestratorID: id.OrchestratorId,
-		WorkloadID:     id.WorkloadId,
-		EndpointID:     id.EndpointId,
-	}
-	logrus.WithField("key", key).Debug("Generating WorkloadEndpointKey from WorkloadEndpointID")
-	return key
-}
-
 // V3WorkloadEndpointToWorkloadEndpointKey generates a WorkloadEndpointKey from the given WorkloadEndpoint.
 // Returns nil if passed endpoint is nil.
-func V3WorkloadEndpointToWorkloadEndpointKey(ep *v3.WorkloadEndpoint) (*model.WorkloadEndpointKey, error) {
+func V3WorkloadEndpointToWorkloadEndpointKey(ep *internalapi.WorkloadEndpoint) (*model.WorkloadEndpointKey, error) {
 	if ep == nil {
 		return nil, nil
 	}
@@ -101,7 +82,7 @@ func V3WorkloadEndpointToWorkloadEndpointKey(ep *v3.WorkloadEndpoint) (*model.Wo
 		}
 	}
 	v3Key := model.ResourceKey{
-		Kind:      v3.KindWorkloadEndpoint,
+		Kind:      internalapi.KindWorkloadEndpoint,
 		Name:      name,
 		Namespace: ep.GetNamespace(),
 	}

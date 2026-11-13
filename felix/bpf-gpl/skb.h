@@ -2,17 +2,20 @@
 // Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
-#ifndef __SKB_H__
-#define __SKB_H__
+#ifndef __CALI_SKB_H__
+#define __CALI_SKB_H__
 
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
-#include <linux/udp.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 
-#include "bpf.h"
-#include "types.h"
+#include "cali_bpf.h"
+#include "globals.h"
 #include "log.h"
+#include "types.h"
 
 /* skb_start_ptr is equivalent to (void*)((__u64)skb->data); the read is done
  * in a way that is acceptable to the verifier and it is done as a volatile read
@@ -67,19 +70,20 @@ static CALI_BPF_INLINE void skb_refresh_start_end(struct cali_tc_ctx *ctx) {
  */
 static CALI_BPF_INLINE long skb_iphdr_offset(struct cali_tc_ctx *ctx)
 {
-	if (CALI_F_IPIP_ENCAPPED) {
-		// Ingress on an IPIP tunnel: skb is [ether|outer IP|inner IP|payload]
-		// TODO: we need to consider different types of IPIP tunnels like 4in6 or 6in4
-		// XXX no support for ip options in ipip header
-		return sizeof(struct ethhdr) + IP_SIZE;
-	} else if (CALI_F_L3) {
-		// Egress on an IPIP tunnel, or any other l3 devices (wireguard) both directions:
-		// skb is [inner IP|payload]
+	if (CALI_F_L3) {
+		// L3 device (IPIP, wireguard), both directions: skb is [IP|payload]
 		return 0;
 	} else {
 		// Normal L2 interface: skb is [ether|IP|payload]
 		return sizeof(struct ethhdr);
 	}
+}
+
+static CALI_BPF_INLINE bool skb_is_gso(struct __sk_buff *skb) {
+	if (bpf_core_field_exists(skb->gso_size)) {
+		return (skb->gso_size > 0);
+	}
+	return (skb->gso_segs > 1);
 }
 
 /* skb_refresh_validate_ptrs refreshes the packet pointers in the context and validates access
@@ -99,30 +103,108 @@ static CALI_BPF_INLINE int skb_refresh_validate_ptrs(struct cali_tc_ctx *ctx, lo
 	if (ctx->data_start + (min_size + nh_len) > ctx->data_end) {
 		// This is an XDP program and there is not enough data for next header.
 #if CALI_F_XDP
-		CALI_DEBUG("Too short to have %d bytes for next header\n",
+		CALI_DEBUG("Too short to have %d bytes for next header",
 						min_size + nh_len);
 		return -2;
 #else
-		// Try to pull in more data.  Ideally enough for TCP, or, failing that, the
-		// minimum we've been asked for.
+		// Try to pull in more data.  Ideally enough for TCP, or, failing
+		// that, the minimum we've been asked for.
 		if (nh_len > TCP_SIZE || bpf_skb_pull_data(ctx->skb, min_size + TCP_SIZE)) {
-			CALI_DEBUG("Pulling %d bytes.\n", min_size + nh_len);
+			CALI_DEBUG("Pulling %d bytes.", min_size + nh_len);
 			if (bpf_skb_pull_data(ctx->skb, min_size + nh_len)) {
-				CALI_DEBUG("Pull failed (min len)\n");
+				CALI_DEBUG("Pull failed (min len)");
 				return -1;
 			}
 		}
-		CALI_DEBUG("Pulled data\n");
+		CALI_DEBUG("Pulled data");
 		skb_refresh_start_end(ctx);
 		if (ctx->data_start + (min_size + nh_len) > ctx->data_end) {
 			return -2;
 		}
+
+		// A partial bpf_skb_pull_data() on a UDP GSO_FRAGLIST packet
+		// (e.g. GRO-aggregated QUIC) corrupts the fraglist geometry:
+		// the head_skb ends up with more than gso_size bytes while
+		// frag_list entries still assume the original boundaries.
+		// When the kernel later tries to segment the packet in
+		// skb_segment(), it dereferences the (now-stale) frag_list
+		// and panics.
+		//
+		// Now that we have valid headers after the partial pull, check
+		// if this is a UDP GSO packet.  If so, fully linearize it:
+		// pulling skb->len moves all remaining non-linear data into
+		// the linear head (data_len=0, frag_list=NULL).  skb_segment()
+		// then processes contiguous linear data in MSS-sized chunks.
+		//
+		// This is rarely hit: GRO packets normally have headers in
+		// the linear portion so the outer pull is skipped entirely.
+		//
+		// See: https://github.com/projectcalico/calico/issues/11424
+		//      https://lkml.org/lkml/2025/5/29/75 (kernel fix in 6.16+)
+#ifndef UNITTEST
+		if ((ctx->globals->data.flags & CALI_GLOBALS_UDP_GSO_LINEARIZE) && skb_is_gso(ctx->skb)) {
+			__u8 ip_proto;
+#ifdef IPVER6
+			ip_proto = ((struct ipv6hdr *)(ctx->data_start + skb_iphdr_offset(ctx)))->nexthdr;
+#else
+			ip_proto = ((struct iphdr *)(ctx->data_start + skb_iphdr_offset(ctx)))->protocol;
+#endif
+			if (ip_proto == IPPROTO_UDP) {
+				CALI_DEBUG("UDP GSO pkt; linearizing %d bytes", ctx->skb->len);
+				if (bpf_skb_pull_data(ctx->skb, ctx->skb->len)) {
+					CALI_DEBUG("GSO linearize failed");
+					return -1;
+				}
+				skb_refresh_start_end(ctx);
+				if (ctx->data_start + (min_size + nh_len) > ctx->data_end) {
+					return -2;
+				}
+			}
+		}
+#endif /* UNITTEST */
 #endif
 	}
 	// Success, refresh the ip_header/nh fields in the context.
 	ctx->ip_header =  ctx->data_start + skb_iphdr_offset(ctx);
 
 	return 0;
+}
+
+/* skb_refresh_validate_ptrs_l4 is skb_refresh_validate_ptrs for UDP_SIZE bytes of
+ * the next header, except for a non-first IPv4 fragment. That carries no L4 header,
+ * only a piece of the payload that can be shorter than any L4 header, so only the
+ * IP header is validated.
+ */
+static CALI_BPF_INLINE int skb_refresh_validate_ptrs_l4(struct cali_tc_ctx *ctx)
+{
+#ifndef IPVER6
+	int err = skb_refresh_validate_ptrs(ctx, 0);
+
+	if (err || ip_is_nonfirst_frag(ip_hdr(ctx))) {
+		return err;
+	}
+#endif
+	return skb_refresh_validate_ptrs(ctx, UDP_SIZE);
+}
+
+/* bpf_load_bytes copies len bytes of packet data at offset into buf, using the
+ * loader helper appropriate to the program type.
+ */
+static CALI_BPF_INLINE int bpf_load_bytes(struct cali_tc_ctx *ctx, __u32 offset, void *buf, __u32 len)
+{
+	int ret;
+
+#if CALI_F_XDP
+	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_xdp_load_bytes)) {
+		ret = bpf_xdp_load_bytes(ctx->xdp, offset, buf, len);
+	} else {
+		return -22 /* EINVAL */;
+	}
+#else /* CALI_F_XDP */
+	ret = bpf_skb_load_bytes(ctx->skb, offset, buf, len);
+#endif /* CALI_F_XDP */
+
+	return ret;
 }
 
 #define skb_ptr_after(skb, ptr) ((void *)((ptr) + 1))
@@ -145,14 +227,6 @@ static CALI_BPF_INLINE __u32 skb_ingress_ifindex(struct __sk_buff *skb)
 #endif
 }
 
-static CALI_BPF_INLINE bool skb_is_gso(struct __sk_buff *skb) {
-#ifdef BPF_CORE_SUPPORTED
-	if (bpf_core_field_exists(skb->gso_size)) {
-		return (skb->gso_size > 0);
-	}
-#endif
-	return (skb->gso_segs > 1);
-}
 
 static CALI_BPF_INLINE void skb_set_mark(struct __sk_buff *skb, __u32 mark)
 {
@@ -166,4 +240,76 @@ static CALI_BPF_INLINE void skb_set_mark(struct __sk_buff *skb, __u32 mark)
 
 #define skb_mark_equals(skb, mask, val) (((skb)->mark & (mask)) == (val))
 
-#endif /* __SKB_H__ */
+static CALI_BPF_INLINE void skb_log(struct cali_tc_ctx *ctx, bool accepted)
+{
+	/* skb_log's bpf_trace_vprintk/bpf_log calls are the only unconditional
+	 * reference to the trace-printk helpers in the main programs (they are gated
+	 * at runtime by CALI_ST_LOG_PACKET, not by CALI_LOG_LEVEL, so they survive
+	 * into the no_log builds). When Felix sets no_trace_printk (kernel
+	 * lockdown=confidentiality), this constant read folds and the verifier
+	 * dead-code-eliminates the rest of the function, so the loaded program
+	 * carries no trace-printk reference and its load does not spam the kernel
+	 * log. The policy Log action cannot work under that lockdown level anyway. */
+	if (PROG_FLAGS.no_trace_printk) {
+		return;
+	}
+	if (ctx->state->flags & CALI_ST_LOG_PACKET) {
+		if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_trace_vprintk)) {
+#if CALI_F_XDP
+#define DIR_STR "X"
+#elif ((CALI_COMPILE_FLAGS) & CALI_TC_INGRESS)
+#define DIR_STR "I"
+#else
+#define DIR_STR "E"
+#endif
+		char *ok   = "ALLOWED";
+		char *drop = "DENIED ";
+			char fmt[] = "%s-" DIR_STR ": policy %s proto %d src " IP_FMT ":%d dest " IP_FMT ":%d";
+			__u64 args[] = {
+#if !CALI_F_XDP
+				(__u64)(&ctx->globals->data.iface_name),
+#else
+				(__u64)(&ctx->xdp_globals->iface_name),
+#endif
+				accepted ? (__u64) ok : (__u64) drop,
+				ctx->state->ip_proto,
+				(__u64) &ctx->state->ip_src,
+				ctx->state->sport,
+				(__u64) &ctx->state->ip_dst,
+				ctx->state->dport,
+			};
+			bpf_trace_vprintk(fmt, sizeof(fmt), args, sizeof(args));
+			return;
+		}
+		if (accepted) {
+			bpf_log("ALLOWED");
+		} else {
+			bpf_log("DENIED");
+		}
+	}
+}
+
+/* tcp_seq_space returns the sequence numbers this segment consumes: its payload
+ * plus one for each of SYN and FIN. */
+static CALI_BPF_INLINE __u32 tcp_seq_space(struct cali_tc_ctx *ctx, struct tcphdr *tcp_header)
+{
+	/* The IP header, not skb->len: the latter can include Ethernet padding
+	 * on a small frame, which would over-advance snd_nxt. */
+	int hdrs = ctx->ipheader_len + tcp_header->doff * 4;
+
+#ifdef IPVER6
+	/* state->ip_size is payload_len, which excludes the base header that
+	 * ipheader_len counts. */
+	hdrs -= IP_SIZE;
+#endif
+
+	int payload = (int)bpf_ntohs(ctx->state->ip_size) - hdrs;
+
+	if (payload < 0) {
+		payload = 0;
+	}
+
+	return (__u32)payload + (tcp_header->syn ? 1 : 0) + (tcp_header->fin ? 1 : 0);
+}
+
+#endif /* __CALI_SKB_H__ */

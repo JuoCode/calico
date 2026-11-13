@@ -1,4 +1,4 @@
-// Copyright (c) 2017, 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,64 +16,64 @@ package config_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
+	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
-
-	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 )
 
 var _ = Describe("Config", func() {
-
 	// unsetEnv() function that unsets environment variables
 	// required by kube-controllers controller
 	unsetEnv := func() {
-		os.Unsetenv("LOG_LEVEL")
-		os.Unsetenv("RECONCILER_PERIOD")
-		os.Unsetenv("ENABLED_CONTROLLERS")
-		os.Unsetenv("WORKLOAD_ENDPOINT_WORKERS")
-		os.Unsetenv("PROFILE_WORKERS")
-		os.Unsetenv("POLICY_WORKERS")
-		os.Unsetenv("KUBECONFIG")
-		os.Unsetenv("DATASTORE_TYPE")
-		os.Unsetenv("HEALTH_ENABLED")
-		os.Unsetenv("COMPACTION_PERIOD")
-		os.Unsetenv("SYNC_NODE_LABELS")
-		os.Unsetenv("AUTO_HOST_ENDPOINTS")
+		_ = os.Unsetenv("LOG_LEVEL")
+		_ = os.Unsetenv("RECONCILER_PERIOD")
+		_ = os.Unsetenv("ENABLED_CONTROLLERS")
+		_ = os.Unsetenv("WORKLOAD_ENDPOINT_WORKERS")
+		_ = os.Unsetenv("PROFILE_WORKERS")
+		_ = os.Unsetenv("POLICY_WORKERS")
+		_ = os.Unsetenv("KUBECONFIG")
+		_ = os.Unsetenv("DATASTORE_TYPE")
+		_ = os.Unsetenv("HEALTH_ENABLED")
+		_ = os.Unsetenv("COMPACTION_PERIOD")
+		_ = os.Unsetenv("SYNC_NODE_LABELS")
+		_ = os.Unsetenv("AUTO_HOST_ENDPOINTS")
 	}
 
 	// setEnv() function that sets environment variables
 	// to some sensible values
 	setEnv := func() {
-		os.Setenv("LOG_LEVEL", "debug")
-		os.Setenv("RECONCILER_PERIOD", "105s")
-		os.Setenv("ENABLED_CONTROLLERS", "node,policy")
-		os.Setenv("WORKLOAD_ENDPOINT_WORKERS", "2")
-		os.Setenv("PROFILE_WORKERS", "3")
-		os.Setenv("POLICY_WORKERS", "4")
-		os.Setenv("KUBECONFIG", "/home/user/.kube/config")
-		os.Setenv("DATASTORE_TYPE", "etcdv3")
-		os.Setenv("HEALTH_ENABLED", "false")
-		os.Setenv("COMPACTION_PERIOD", "33m")
-		os.Setenv("SYNC_NODE_LABELS", "false")
-		os.Setenv("AUTO_HOST_ENDPOINTS", "enabled")
+		_ = os.Setenv("LOG_LEVEL", "debug")
+		_ = os.Setenv("RECONCILER_PERIOD", "105s")
+		_ = os.Setenv("ENABLED_CONTROLLERS", "node,policy")
+		_ = os.Setenv("WORKLOAD_ENDPOINT_WORKERS", "2")
+		_ = os.Setenv("PROFILE_WORKERS", "3")
+		_ = os.Setenv("POLICY_WORKERS", "4")
+		_ = os.Setenv("KUBECONFIG", "/home/user/.kube/config")
+		_ = os.Setenv("DATASTORE_TYPE", "etcdv3")
+		_ = os.Setenv("HEALTH_ENABLED", "false")
+		_ = os.Setenv("COMPACTION_PERIOD", "33m")
+		_ = os.Setenv("SYNC_NODE_LABELS", "false")
+		_ = os.Setenv("AUTO_HOST_ENDPOINTS", "enabled")
 	}
 
 	// setWrongEnv() function sets environment variables
 	// with values of wrong data type
 	setWrongEnv := func() {
-		os.Setenv("WORKLOAD_ENDPOINT_WORKERS", "somestring")
-		os.Setenv("PROFILE_WORKERS", "somestring")
-		os.Setenv("POLICY_WORKERS", "somestring")
+		_ = os.Setenv("WORKLOAD_ENDPOINT_WORKERS", "somestring")
+		_ = os.Setenv("PROFILE_WORKERS", "somestring")
+		_ = os.Setenv("POLICY_WORKERS", "somestring")
 	}
 
 	Context("with unset env values", func() {
@@ -105,7 +105,7 @@ var _ = Describe("Config", func() {
 
 			BeforeEach(func() {
 				ctx, cancel = context.WithCancel(context.Background())
-				m = &mockKCC{get: config.DefaultKCC.DeepCopy()}
+				m = &mockKCC{get: config.NewDefaultKubeControllersConfig().DeepCopy()}
 				ctrl = config.NewRunConfigController(ctx, *cfg, m)
 			})
 
@@ -113,7 +113,7 @@ var _ = Describe("Config", func() {
 				cancel()
 			})
 
-			It("should return default RunConfig", func(done Done) {
+			It("should return default RunConfig", func() {
 				runCfg := <-ctrl.ConfigChan()
 				Expect(runCfg.LogLevelScreen).To(Equal(log.InfoLevel))
 				Expect(runCfg.HealthEnabled).To(BeTrue())
@@ -121,10 +121,14 @@ var _ = Describe("Config", func() {
 
 				rc := runCfg.Controllers
 				Expect(rc.Node).To(Equal(&config.NodeControllerConfig{
-					SyncLabels:        true,
-					AutoHostEndpoints: false,
-					DeleteNodes:       true,
-					LeakGracePeriod:   &v1.Duration{Duration: 15 * time.Minute},
+					SyncLabels: true,
+					AutoHostEndpointConfig: &config.AutoHostEndpointConfig{
+						AutoCreate:                false,
+						CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled,
+						Templates:                 nil,
+					},
+					DeleteNodes:     true,
+					LeakGracePeriod: &v1.Duration{Duration: 15 * time.Minute},
 				}))
 				Expect(rc.Policy).To(Equal(&config.GenericControllerConfig{
 					ReconcilerPeriod: time.Minute * 5,
@@ -142,10 +146,26 @@ var _ = Describe("Config", func() {
 					ReconcilerPeriod: time.Minute * 5,
 					NumberOfWorkers:  1,
 				}))
-				close(done)
+				Expect(rc.LoadBalancer).To(Equal(&config.LoadBalancerControllerConfig{
+					AssignIPs: v3.AllServices,
+				}))
+				Expect(rc.Migration).To(Equal(&config.MigrationControllerConfig{
+					PolicyNameMigrator: "Enabled",
+				}))
 			})
 
-			It("should write status", func(done Done) {
+			It("should preserve status through a JSON round trip", func() {
+				<-ctrl.ConfigChan()
+				status := m.update.Status
+				data, err := json.Marshal(status)
+				Expect(err).NotTo(HaveOccurred())
+
+				var stored v3.KubeControllersConfigurationStatus
+				Expect(json.Unmarshal(data, &stored)).To(Succeed())
+				Expect(stored).To(Equal(status))
+			})
+
+			It("should write status", func() {
 				<-ctrl.ConfigChan()
 				Expect(m.update).ToNot(BeNil())
 				s := m.update.Status
@@ -157,18 +177,24 @@ var _ = Describe("Config", func() {
 				Expect(c.Node).To(Equal(&v3.NodeControllerConfig{
 					ReconcilerPeriod: nil,
 					SyncLabels:       v3.Enabled,
-					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Disabled},
+					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Disabled, CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled},
 					LeakGracePeriod:  &v1.Duration{Duration: 15 * time.Minute},
 				}))
 				Expect(c.Policy).To(Equal(&v3.PolicyControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5}}))
+					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5},
+				}))
 				Expect(c.WorkloadEndpoint).To(Equal(&v3.WorkloadEndpointControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5}}))
+					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5},
+				}))
 				Expect(c.Namespace).To(Equal(&v3.NamespaceControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5}}))
+					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5},
+				}))
 				Expect(c.ServiceAccount).To(Equal(&v3.ServiceAccountControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5}}))
-				close(done)
+					ReconcilerPeriod: &v1.Duration{Duration: time.Minute * 5},
+				}))
+				Expect(c.LoadBalancer).To(Equal(&v3.LoadBalancerControllerConfig{
+					AssignIPs: v3.AllServices,
+				}))
 			})
 		})
 
@@ -189,17 +215,35 @@ var _ = Describe("Config", func() {
 						Node: &v3.NodeControllerConfig{
 							ReconcilerPeriod: nil,
 							SyncLabels:       v3.Disabled,
-							HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled},
-							LeakGracePeriod:  &v1.Duration{Duration: 20 * time.Minute},
+							HostEndpoint: &v3.AutoHostEndpointConfig{
+								AutoCreate:                v3.Enabled,
+								CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled,
+								Templates: []v3.Template{{
+									GenerateName: "template",
+									Labels:       map[string]string{"template-label": "template-value"},
+									Annotations:  map[string]string{"template.projectcalico.org/annotation": "annotation-value"},
+								}},
+							},
+							LeakGracePeriod: &v1.Duration{Duration: 20 * time.Minute},
 						},
 						Policy: &v3.PolicyControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30},
+						},
 						WorkloadEndpoint: &v3.WorkloadEndpointControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31},
+						},
 						Namespace: &v3.NamespaceControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32},
+						},
 						ServiceAccount: &v3.ServiceAccountControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33},
+						},
+						LoadBalancer: &v3.LoadBalancerControllerConfig{
+							AssignIPs: v3.RequestedServicesOnly,
+						},
+						Migration: &v3.MigrationControllerConfig{
+							PolicyNameMigrator: "Disabled",
+						},
 					},
 				}
 				m = &mockKCC{get: kcc}
@@ -211,7 +255,7 @@ var _ = Describe("Config", func() {
 				cancel()
 			})
 
-			It("should return RunConfig matching API", func(done Done) {
+			It("should return RunConfig matching API", func() {
 				runCfg := <-ctrl.ConfigChan()
 				Expect(runCfg.LogLevelScreen).To(Equal(log.WarnLevel))
 				Expect(runCfg.HealthEnabled).To(BeFalse())
@@ -219,10 +263,18 @@ var _ = Describe("Config", func() {
 
 				rc := runCfg.Controllers
 				Expect(rc.Node).To(Equal(&config.NodeControllerConfig{
-					SyncLabels:        false,
-					AutoHostEndpoints: true,
-					DeleteNodes:       true,
-					LeakGracePeriod:   &v1.Duration{Duration: 20 * time.Minute},
+					SyncLabels: false,
+					AutoHostEndpointConfig: &config.AutoHostEndpointConfig{
+						AutoCreate:                true,
+						CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled,
+						Templates: []config.AutoHostEndpointTemplate{{
+							GenerateName: "template",
+							Labels:       map[string]string{"template-label": "template-value"},
+							Annotations:  map[string]string{"template.projectcalico.org/annotation": "annotation-value"},
+						}},
+					},
+					DeleteNodes:     true,
+					LeakGracePeriod: &v1.Duration{Duration: 20 * time.Minute},
 				}))
 				Expect(rc.Policy).To(Equal(&config.GenericControllerConfig{
 					ReconcilerPeriod: time.Second * 30,
@@ -240,10 +292,15 @@ var _ = Describe("Config", func() {
 					ReconcilerPeriod: time.Second * 33,
 					NumberOfWorkers:  1,
 				}))
-				close(done)
+				Expect(rc.LoadBalancer).To(Equal(&config.LoadBalancerControllerConfig{
+					AssignIPs: v3.RequestedServicesOnly,
+				}))
+				Expect(rc.Migration).To(Equal(&config.MigrationControllerConfig{
+					PolicyNameMigrator: "Disabled",
+				}))
 			})
 
-			It("should write status matching API", func(done Done) {
+			It("should write status matching API", func() {
 				<-ctrl.ConfigChan()
 				Expect(m.update).ToNot(BeNil())
 				s := m.update.Status
@@ -251,8 +308,8 @@ var _ = Describe("Config", func() {
 
 				// Since there are no environment variables, the running config
 				// should be exactly the API Spec
-				Expect(s.RunningConfig).To(Equal(m.get.Spec))
-				close(done)
+				Expect(s.RunningConfig).NotTo(BeNil())
+				Expect(*s.RunningConfig).To(Equal(m.get.Spec))
 			})
 		})
 
@@ -272,13 +329,12 @@ var _ = Describe("Config", func() {
 				cancel()
 			})
 
-			It("should create a default KubeControllersConfig", func(done Done) {
+			It("should create a default KubeControllersConfig", func() {
 				<-ctrl.ConfigChan()
-				Expect(m.create.Spec).To(Equal(config.DefaultKCC.Spec))
-				close(done)
-			}, 600)
+				Expect(m.create.Spec).To(Equal(config.NewDefaultKubeControllersConfig().Spec))
+			})
 
-			It("should send new update when API values change", func(done Done) {
+			It("should send new update when API values change", func() {
 				// initial config
 				<-ctrl.ConfigChan()
 
@@ -300,10 +356,9 @@ var _ = Describe("Config", func() {
 
 				// get the update
 				<-ctrl.ConfigChan()
-				close(done)
 			})
 
-			It("should not send new update when Spec is unchanged", func(done Done) {
+			It("should not send new update when Spec is unchanged", func() {
 				// initial config
 				<-ctrl.ConfigChan()
 
@@ -328,10 +383,9 @@ var _ = Describe("Config", func() {
 					update = true
 				}
 				Expect(update).To(BeFalse())
-				close(done)
-			}, 2)
+			})
 
-			It("should handle watch closed by remote", func(done Done) {
+			It("should handle watch closed by remote", func() {
 				// initial config
 				<-ctrl.ConfigChan()
 
@@ -380,16 +434,11 @@ var _ = Describe("Config", func() {
 
 				// this should trigger an update
 				<-ctrl.ConfigChan()
-
-				close(done)
-
-			}, 3)
+			})
 		})
-
 	})
 
 	Context("with valid user defined values", func() {
-
 		var cfg *config.Config
 
 		BeforeEach(func() {
@@ -426,7 +475,7 @@ var _ = Describe("Config", func() {
 
 			BeforeEach(func() {
 				ctx, cancel = context.WithCancel(context.Background())
-				m = &mockKCC{get: config.DefaultKCC.DeepCopy()}
+				m = &mockKCC{get: config.NewDefaultKubeControllersConfig().DeepCopy()}
 				ctrl = config.NewRunConfigController(ctx, *cfg, m)
 			})
 
@@ -434,7 +483,7 @@ var _ = Describe("Config", func() {
 				cancel()
 			})
 
-			It("should return RunConfig matching env", func(done Done) {
+			It("should return RunConfig matching env", func() {
 				runCfg := <-ctrl.ConfigChan()
 				Expect(runCfg.LogLevelScreen).To(Equal(log.DebugLevel))
 				Expect(runCfg.HealthEnabled).To(BeFalse())
@@ -442,10 +491,10 @@ var _ = Describe("Config", func() {
 
 				rc := runCfg.Controllers
 				Expect(rc.Node).To(Equal(&config.NodeControllerConfig{
-					SyncLabels:        false,
-					AutoHostEndpoints: true,
-					DeleteNodes:       true,
-					LeakGracePeriod:   &v1.Duration{Duration: 15 * time.Minute},
+					SyncLabels:             false,
+					AutoHostEndpointConfig: &config.AutoHostEndpointConfig{AutoCreate: true, CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled},
+					DeleteNodes:            true,
+					LeakGracePeriod:        &v1.Duration{Duration: 15 * time.Minute},
 				}))
 				Expect(rc.Policy).To(Equal(&config.GenericControllerConfig{
 					ReconcilerPeriod: time.Second * 105,
@@ -454,10 +503,9 @@ var _ = Describe("Config", func() {
 				Expect(rc.Namespace).To(BeNil())
 				Expect(rc.WorkloadEndpoint).To(BeNil())
 				Expect(rc.ServiceAccount).To(BeNil())
-				close(done)
-			}, 600)
+			})
 
-			It("should write status", func(done Done) {
+			It("should write status", func() {
 				<-ctrl.ConfigChan()
 				Expect(m.update).ToNot(BeNil())
 				s := m.update.Status
@@ -477,15 +525,15 @@ var _ = Describe("Config", func() {
 				Expect(c.Node).To(Equal(&v3.NodeControllerConfig{
 					ReconcilerPeriod: nil,
 					SyncLabels:       v3.Disabled,
-					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled},
+					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled, CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled},
 					LeakGracePeriod:  &v1.Duration{Duration: 15 * time.Minute},
 				}))
 				Expect(c.Policy).To(Equal(&v3.PolicyControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Second * 105}}))
+					ReconcilerPeriod: &v1.Duration{Duration: time.Second * 105},
+				}))
 				Expect(c.WorkloadEndpoint).To(BeNil())
 				Expect(c.Namespace).To(BeNil())
 				Expect(c.ServiceAccount).To(BeNil())
-				close(done)
 			})
 		})
 
@@ -506,16 +554,23 @@ var _ = Describe("Config", func() {
 						Node: &v3.NodeControllerConfig{
 							ReconcilerPeriod: nil,
 							SyncLabels:       v3.Disabled,
-							HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled},
+							HostEndpoint: &v3.AutoHostEndpointConfig{
+								AutoCreate:                v3.Enabled,
+								CreateDefaultHostEndpoint: v3.DefaultHostEndpointsDisabled,
+							},
 						},
 						Policy: &v3.PolicyControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30},
+						},
 						WorkloadEndpoint: &v3.WorkloadEndpointControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31},
+						},
 						Namespace: &v3.NamespaceControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32},
+						},
 						ServiceAccount: &v3.ServiceAccountControllerConfig{
-							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33}},
+							ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33},
+						},
 					},
 				}
 				m = &mockKCC{get: kcc}
@@ -527,7 +582,7 @@ var _ = Describe("Config", func() {
 				cancel()
 			})
 
-			It("should return RunConfig matching API environment", func(done Done) {
+			It("should return RunConfig matching API environment", func() {
 				runCfg := <-ctrl.ConfigChan()
 				Expect(runCfg.LogLevelScreen).To(Equal(log.DebugLevel))
 				Expect(runCfg.HealthEnabled).To(BeFalse())
@@ -535,9 +590,12 @@ var _ = Describe("Config", func() {
 
 				rc := runCfg.Controllers
 				Expect(rc.Node).To(Equal(&config.NodeControllerConfig{
-					SyncLabels:        false,
-					AutoHostEndpoints: true,
-					DeleteNodes:       true,
+					SyncLabels: false,
+					AutoHostEndpointConfig: &config.AutoHostEndpointConfig{
+						AutoCreate:                true,
+						CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled,
+					},
+					DeleteNodes: true,
 				}))
 				Expect(rc.Policy).To(Equal(&config.GenericControllerConfig{
 					ReconcilerPeriod: time.Second * 105,
@@ -546,10 +604,9 @@ var _ = Describe("Config", func() {
 				Expect(rc.WorkloadEndpoint).To(BeNil())
 				Expect(rc.Namespace).To(BeNil())
 				Expect(rc.ServiceAccount).To(BeNil())
-				close(done)
 			})
 
-			It("should write status matching environment", func(done Done) {
+			It("should write status matching environment", func() {
 				<-ctrl.ConfigChan()
 				Expect(m.update).ToNot(BeNil())
 				s := m.update.Status
@@ -569,17 +626,16 @@ var _ = Describe("Config", func() {
 				Expect(c.Node).To(Equal(&v3.NodeControllerConfig{
 					ReconcilerPeriod: nil,
 					SyncLabels:       v3.Disabled,
-					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled},
+					HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled, CreateDefaultHostEndpoint: v3.DefaultHostEndpointsEnabled},
 				}))
 				Expect(c.Policy).To(Equal(&v3.PolicyControllerConfig{
-					ReconcilerPeriod: &v1.Duration{Duration: time.Second * 105}}))
+					ReconcilerPeriod: &v1.Duration{Duration: time.Second * 105},
+				}))
 				Expect(c.WorkloadEndpoint).To(BeNil())
 				Expect(c.Namespace).To(BeNil())
 				Expect(c.ServiceAccount).To(BeNil())
-				close(done)
 			})
 		})
-
 	})
 
 	Context("with invalid user defined values", func() {
@@ -605,7 +661,6 @@ var _ = Describe("Config", func() {
 	})
 
 	Context("with ENABLED_CONTROLLERS set", func() {
-
 		BeforeEach(func() {
 			unsetEnv()
 			err := os.Setenv("ENABLED_CONTROLLERS", "node,namespace,policy,serviceaccount,workloadendpoint")
@@ -616,8 +671,7 @@ var _ = Describe("Config", func() {
 			unsetEnv()
 		})
 
-		It("should use reconciler periods from API", func(done Done) {
-
+		It("should use reconciler periods from API", func() {
 			cfg := new(config.Config)
 			err := cfg.Parse()
 			Expect(err).ToNot(HaveOccurred())
@@ -634,13 +688,17 @@ var _ = Describe("Config", func() {
 						HostEndpoint:     &v3.AutoHostEndpointConfig{AutoCreate: v3.Enabled},
 					},
 					Policy: &v3.PolicyControllerConfig{
-						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30}},
+						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 30},
+					},
 					WorkloadEndpoint: &v3.WorkloadEndpointControllerConfig{
-						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31}},
+						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 31},
+					},
 					Namespace: &v3.NamespaceControllerConfig{
-						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32}},
+						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 32},
+					},
 					ServiceAccount: &v3.ServiceAccountControllerConfig{
-						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33}},
+						ReconcilerPeriod: &v1.Duration{Duration: time.Second * 33},
+					},
 				},
 			}
 			m := &mockKCC{get: kcc}
@@ -652,7 +710,41 @@ var _ = Describe("Config", func() {
 			Expect(runCfg.Controllers.WorkloadEndpoint.ReconcilerPeriod).To(Equal(time.Second * 31))
 			Expect(runCfg.Controllers.Namespace.ReconcilerPeriod).To(Equal(time.Second * 32))
 			Expect(runCfg.Controllers.ServiceAccount.ReconcilerPeriod).To(Equal(time.Second * 33))
-			close(done)
+		})
+	})
+
+	Context("with the profiling port enabled", func() {
+		var cfg *config.Config
+
+		BeforeEach(func() {
+			unsetEnv()
+			cfg = new(config.Config)
+			Expect(cfg.Parse()).ToNot(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			unsetEnv()
+		})
+
+		runConfigWithProfileHost := func(host *string) config.RunConfig {
+			kcc := config.NewDefaultKubeControllersConfig().DeepCopy()
+			kcc.Spec.DebugProfilePort = ptr.To(int32(9095))
+			kcc.Spec.DebugProfileHost = host
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctrl := config.NewRunConfigController(ctx, *cfg, &mockKCC{get: kcc})
+			return <-ctrl.ConfigChan()
+		}
+
+		It("should default the profiling host to localhost when it is not set", func() {
+			runCfg := runConfigWithProfileHost(nil)
+			Expect(runCfg.DebugProfilePort).To(Equal(int32(9095)))
+			Expect(runCfg.DebugProfileHost).To(Equal("localhost"))
+		})
+
+		It("should use the profiling host from the API", func() {
+			Expect(runConfigWithProfileHost(ptr.To("0.0.0.0")).DebugProfileHost).To(Equal("0.0.0.0"))
 		})
 	})
 })
@@ -672,6 +764,11 @@ func (m *mockKCC) Create(ctx context.Context, res *v3.KubeControllersConfigurati
 }
 
 func (m *mockKCC) Update(ctx context.Context, res *v3.KubeControllersConfiguration, opts options.SetOptions) (*v3.KubeControllersConfiguration, error) {
+	m.update = res.DeepCopy()
+	return res, nil
+}
+
+func (m *mockKCC) UpdateStatus(ctx context.Context, res *v3.KubeControllersConfiguration, opts options.SetOptions) (*v3.KubeControllersConfiguration, error) {
 	m.update = res.DeepCopy()
 	return res, nil
 }

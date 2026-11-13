@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,20 +23,27 @@ import (
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	v1v "github.com/projectcalico/calico/libcalico-go/lib/validator/v1"
 	v3v "github.com/projectcalico/calico/libcalico-go/lib/validator/v3"
+	v1v "github.com/projectcalico/calico/typha/pkg/validator/v1"
 )
 
 func NewValidationFilter(sink api.SyncerCallbacks, felixConfig *config.Config) *ValidationFilter {
 	return &ValidationFilter{
 		sink:   sink,
 		config: felixConfig,
+
+		cachedKVLogEntry: logrus.WithFields(logrus.Fields{
+			"key":   "",
+			"value": "",
+		}),
 	}
 }
 
 type ValidationFilter struct {
 	sink   api.SyncerCallbacks
 	config *config.Config
+
+	cachedKVLogEntry *logrus.Entry
 }
 
 func (v *ValidationFilter) OnStatusUpdated(status api.SyncStatus) {
@@ -47,10 +54,12 @@ func (v *ValidationFilter) OnStatusUpdated(status api.SyncStatus) {
 func (v *ValidationFilter) OnUpdates(updates []api.Update) {
 	filteredUpdates := make([]api.Update, len(updates))
 	for i, update := range updates {
-		logCxt := logrus.WithFields(logrus.Fields{
-			"key":   update.Key,
-			"value": update.Value,
-		})
+		// WithFields allocates a lot so we re-use a cached log entry for these
+		// logs.
+		logCxt := v.cachedKVLogEntry
+		v.cachedKVLogEntry.Data["key"] = update.Key
+		v.cachedKVLogEntry.Data["value"] = update.Value
+
 		logCxt.Debug("Validating KV pair.")
 		validatorFunc := v1v.Validate
 		if _, isV3 := update.Key.(model.ResourceKey); isV3 {
@@ -61,10 +70,12 @@ func (v *ValidationFilter) OnUpdates(updates []api.Update) {
 		}
 		if update.Value != nil {
 			val := reflect.ValueOf(update.Value)
-			if val.Kind() == reflect.Ptr {
+			if val.Kind() == reflect.Pointer {
 				elem := val.Elem()
 				if elem.Kind() == reflect.Struct {
-					if err := validatorFunc(elem.Interface()); err != nil {
+					// Validate the pointer: the CRD schema and CEL checks only run
+					// for a runtime.Object, which the dereferenced struct is not.
+					if err := validatorFunc(val.Interface()); err != nil {
 						logCxt.WithError(err).Warn("Validation failed; treating as missing")
 						update.Value = nil
 					}
@@ -87,7 +98,7 @@ func (v *ValidationFilter) OnUpdates(updates []api.Update) {
 
 func (v *ValidationFilter) validateWorkloadEndpoint(value *model.WorkloadEndpoint) error {
 	if value.Name == "" {
-		return errors.New("Missing workload endpoint name")
+		return errors.New("missing workload endpoint name")
 	}
 	if len(value.AllowSpoofedSourcePrefixes) > 0 && v.config.WorkloadSourceSpoofing != "Any" {
 		return errors.New("source IP spoofing requested but not enabled in Felix configuration")

@@ -1,24 +1,36 @@
-.go-pkg-cache/
-report/
-bin/
 *.created*
 *.pyc
+.dev-stamps/
+.go-pkg-cache/
 .idea
 .vscode
-vendor/
 artifacts/
-postrelease-checks.xml
+bin/
+coverprofile.out
 crypto/tmp
+postrelease-checks.xml
+report/
+vendor/
+venv/
 
 /* Produced as part of release */
-hack/release/release
+release/release
 node/windows-packaging/CalicoWindows/confd/config-bgp.ps1
 node/windows-packaging/CalicoWindows/confd/config-bgp.psm1
 node/windows-packaging/nssm.zip
 node/windows-packaging/nssm.exe
 _output
 builder.coverprofile
-hack/release/ghr
+*.log
+*.pprof
+.release-*.*
+published.refs
+
+/* Docker image tarballs */
+image.tar
+
+/* Image build stamp files for kind testing */
+.stamp.*
 
 /* Created by local kind cluster */
 hack/test/kind/kind
@@ -27,6 +39,27 @@ hack/test/kind/.*updated*
 hack/test/kind/kubectl
 hack/test/kind/kubectl-v*
 hack/test/kind/*kubeconfig.yaml
+hack/test/kind/external-node-key*
+hack/test/kind/external-node-ip
+hack/test/envtest/
 pod2daemon/node-driver-registrar/
 
 /networking-calico/upper-constraints*.txt
+
+/* Created by libcalico-go UTs */
+ut-tmp-dir
+
+.remember
+
+# Build-time copy of metadata.mk for the release CLI's embedded defaults.
+release/internal/defaults/metadata.mk
+
+# Root-level tool downloads. The Makefile targets use bin/, which is already
+# ignored; these are what a manual download leaves behind.
+/yq
+/shellcheck
+/shellcheck.tar.xz
+/shellcheck-v*/
+
+# Built by `go build ./hack/test/spider`.
+/spider

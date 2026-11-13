@@ -16,8 +16,10 @@ package workload
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -26,19 +28,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
+
+	//nolint:staticcheck // Ignore ST1001: should not use dot imports
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
-
-	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
 
 	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/tcpdump"
 	"github.com/projectcalico/calico/felix/fv/utils"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 type Workload struct {
@@ -53,15 +57,16 @@ type Workload struct {
 	outPipe               io.ReadCloser
 	errPipe               io.ReadCloser
 	namespacePath         string
-	WorkloadEndpoint      *api.WorkloadEndpoint
+	WorkloadEndpoint      *internalapi.WorkloadEndpoint
 	Protocol              string // "tcp" or "udp"
 	SpoofInterfaceName    string
 	SpoofName             string
-	SpoofWorkloadEndpoint *api.WorkloadEndpoint
+	SpoofWorkloadEndpoint *internalapi.WorkloadEndpoint
 	MTU                   int
 	isRunning             bool
 	isSpoofing            bool
 	listenAnyIP           bool
+	noKeepAlive           bool
 	pid                   string
 
 	cleanupLock sync.Mutex
@@ -86,40 +91,82 @@ func (w *Workload) Runs() bool {
 	return w.isRunning
 }
 
-var workloadIdx = 0
-var sideServIdx = 0
+var (
+	workloadIdx = 0
+	sideServIdx = 0
+)
 
-const defaultMTU = 1450
+const defaultMTU = 1440 /* wiregueard mtu */
 
 func (w *Workload) Stop() {
 	if w == nil {
 		log.Info("Stop no-op because nil workload")
-	} else {
-		log.WithField("workload", w.Name).Info("Stop")
-		_ = w.C.ExecMayFail("sh", "-c", fmt.Sprintf("kill -9 %s & ip link del %s & ip netns del %s & wait", w.pid, w.InterfaceName, w.NamespaceID()))
-		// Killing the process inside the container should cause our long-running
-		// docker exec command to exit.  Do the Wait on a background goroutine,
-		// so we can time it out, just in case.
-		waitDone := make(chan struct{})
-		go func() {
-			defer close(waitDone)
-			_, err := w.runCmd.Process.Wait()
-			if err != nil {
-				log.WithField("workload", w.Name).Error("Failed to wait for docker exec, attempting to kill it.")
-				_ = w.runCmd.Process.Kill()
-			}
-		}()
+		return
+	}
+	log.WithField("workload", w.Name).Info("Stop")
+	if !w.isRunning {
+		log.WithField("workload", w.Name).Info("Workload already stopped")
+		return
+	}
 
-		select {
-		case <-waitDone:
-			log.WithField("workload", w.Name).Info("Workload stopped")
-		case <-time.After(10 * time.Second):
-			log.WithField("workload", w.Name).Error("Workload docker exec failed to exit?  Killing it.")
+	// Flush the neighbour state that references the devices we are about to
+	// delete before deleting them.  This avoids a kernel use-after-free panic
+	// on device teardown (see felix/fv/infrastructure/felix.go Felix.Stop for
+	// the full explanation): if an unresolved-neighbour timer fires after the
+	// queued packet's device has been freed, the kernel panics in interrupt
+	// context (arp_error_report -> ipv4_link_failure -> __icmp_send ->
+	// netdev_master_upper_dev_get_rcu on a freed netdevice).  Flushing drops the
+	// queued packets and cancels the timers.
+	var cleanupCmds []string
+	if w.NamespaceID() != "" {
+		cleanupCmds = append(cleanupCmds,
+			fmt.Sprintf("ip netns exec %s ip neigh flush all", w.NamespaceID()),
+			fmt.Sprintf("ip netns exec %s ip -6 neigh flush all", w.NamespaceID()),
+		)
+	}
+	if w.IP != "" {
+		cleanupCmds = append(cleanupCmds, fmt.Sprintf("ip neigh flush to %s", w.IP))
+	}
+	if w.IP6 != "" {
+		cleanupCmds = append(cleanupCmds, fmt.Sprintf("ip -6 neigh flush to %s", w.IP6))
+	}
+
+	// Then tear the workload down in order.  These used to run concurrently
+	// (joined with " & "), but deleting an in-use device and its namespace at
+	// the same time as killing the process that uses them is exactly the race
+	// that triggers the kernel panic above, so run them sequentially instead.
+	cleanupCmds = append(cleanupCmds, fmt.Sprintf("kill -9 %s", w.pid))
+	if w.InterfaceName != "" {
+		// Only try to delete the veth if we created one.
+		cleanupCmds = append(cleanupCmds, fmt.Sprintf("ip link del %s", w.InterfaceName))
+	}
+	if w.NamespaceID() != "" {
+		cleanupCmds = append(cleanupCmds, fmt.Sprintf("ip netns del %s", w.NamespaceID()))
+	}
+
+	_ = w.C.ExecMayFail("sh", "-c", strings.Join(cleanupCmds, "; "))
+	// Killing the process inside the container should cause our long-running
+	// docker exec command to exit.  Do the Wait on a background goroutine,
+	// so we can time it out, just in case.
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		_, err := w.runCmd.Process.Wait()
+		if err != nil {
+			log.WithField("workload", w.Name).Error("Failed to wait for docker exec, attempting to kill it.")
 			_ = w.runCmd.Process.Kill()
 		}
+	}()
 
-		w.isRunning = false
+	select {
+	case <-waitDone:
+		log.WithField("workload", w.Name).Info("Workload stopped")
+	case <-time.After(10 * time.Second):
+		log.WithField("workload", w.Name).Error("Workload docker exec failed to exit?  Killing it.")
+		_ = w.runCmd.Process.Kill()
 	}
+
+	w.isRunning = false
 }
 
 func Run(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opts ...Opt) (w *Workload) {
@@ -153,6 +200,14 @@ func WithListenAnyIP() Opt {
 	}
 }
 
+// WithoutTCPKeepAlive stops the server probing idle TCP connections, which
+// would otherwise keep their conntrack entries fresh.
+func WithoutTCPKeepAlive() Opt {
+	return func(w *Workload) {
+		w.noKeepAlive = true
+	}
+}
+
 // WithHostNetworked force the workload to be host-networked even if the listen IP is
 // different than the host IP.
 func WithHostNetworked() Opt {
@@ -174,7 +229,7 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opt
 	// Build unique workload name and struct.
 	workloadIdx++
 
-	wep := api.NewWorkloadEndpoint()
+	wep := internalapi.NewWorkloadEndpoint()
 	wep.Labels = map[string]string{"name": n}
 	wep.Spec.Node = c.Hostname
 	wep.Spec.Orchestrator = "felixfv"
@@ -215,10 +270,18 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opt
 
 func run(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opts ...Opt) (w *Workload, err error) {
 	w = New(c, name, profile, ip, ports, protocol, opts...)
-	return w, w.Start()
+	err = w.Start(c)
+	if err != nil {
+		return w, err
+	}
+	return w, nil
 }
 
-func (w *Workload) Start() error {
+type CleanupProvider interface {
+	AddCleanup(func())
+}
+
+func (w *Workload) Start(cleanupProvider CleanupProvider) error {
 	var err error
 
 	// Start the workload.
@@ -232,8 +295,13 @@ func (w *Workload) Start() error {
 	if w.IP6 != "" {
 		wIP = wIP + "," + w.IP6
 	}
-	command := fmt.Sprintf("echo $$; exec test-workload %v '%v' '%v' '%v'",
+	var netkitArg string
+	if infrastructure.NetkitMode() {
+		netkitArg = "--netkit"
+	}
+	command := fmt.Sprintf("echo $$; exec test-workload %v %v '%v' '%v' '%v'",
 		protoArg,
+		netkitArg,
 		w.InterfaceName,
 		wIP,
 		w.Ports,
@@ -247,37 +315,42 @@ func (w *Workload) Start() error {
 		command += " --listen-any-ip"
 	}
 
+	if w.noKeepAlive {
+		command += " --no-keepalive"
+	}
+
 	w.runCmd = utils.Command("docker", "exec", w.C.Name, "sh", "-c", command)
 	w.outPipe, err = w.runCmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("Getting StdoutPipe failed: %v", err)
+		return fmt.Errorf("getting StdoutPipe failed: %v", err)
 	}
 	w.errPipe, err = w.runCmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("Getting StderrPipe failed: %v", err)
+		return fmt.Errorf("getting StderrPipe failed: %v", err)
 	}
 	err = w.runCmd.Start()
 	if err != nil {
 		return fmt.Errorf("runCmd Start failed: %v", err)
 	}
 
+	// Make sure we get stopped.
+	cleanupProvider.AddCleanup(w.Stop)
+
 	// Read the workload's namespace path, which it writes to its standard output.
 	stdoutReader := bufio.NewReader(w.outPipe)
 	stderrReader := bufio.NewReader(w.errPipe)
 
 	var errDone sync.WaitGroup
-	errDone.Add(1)
-	go func() {
-		defer errDone.Done()
+	errDone.Go(func() {
 		for {
 			line, err := stderrReader.ReadString('\n')
 			if err != nil {
 				log.WithError(err).Info("End of workload stderr")
 				return
 			}
-			log.Infof("Workload %s stderr: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stderr] %v", w.Name, line)
 		}
-	}()
+	})
 
 	pid, err := stdoutReader.ReadString('\n')
 	if err != nil {
@@ -293,6 +366,7 @@ func (w *Workload) Start() error {
 		defer errDone.Wait()
 		return fmt.Errorf("reading from stdout failed: %w", err)
 	}
+	log.WithField("workload", w.Name).Infof("Workload namespace path: %s", namespacePath)
 
 	w.namespacePath = strings.TrimSpace(namespacePath)
 
@@ -303,7 +377,7 @@ func (w *Workload) Start() error {
 				log.WithError(err).Info("End of workload stdout")
 				return
 			}
-			log.Infof("Workload %s stdout: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stdout] %v", w.Name, line)
 		}
 	}()
 
@@ -381,6 +455,21 @@ func (w *Workload) ConfigureInInfra(infra infrastructure.DatastoreInfra) {
 	var err error
 	w.WorkloadEndpoint, err = infra.AddWorkload(wep)
 	Expect(err).NotTo(HaveOccurred(), "Failed to add workload")
+}
+
+// UpdateInInfra updates the workload endpoint for this Workload.
+func (w *Workload) UpdateInInfra(infra infrastructure.DatastoreInfra) {
+	wep := w.WorkloadEndpoint
+	if wep.Namespace == "" {
+		wep.Namespace = "default"
+	}
+	wep.Spec.Workload = w.Name
+	wep.Spec.Endpoint = w.Name
+	wep.Spec.InterfaceName = w.InterfaceName
+	var err error
+	w.WorkloadEndpoint, err = infra.UpdateWorkload(wep)
+	log.WithFields(log.Fields{"Workload": w, "WorkloadEndpoint": w.WorkloadEndpoint, "QoSControls": w.WorkloadEndpoint.Spec.QoSControls}).Infof("Update WorkloadEndpoint")
+	Expect(err).NotTo(HaveOccurred(), "Failed to update workload")
 }
 
 // ConfigureInInfraAsSpoofInterface creates a valid workload endpoint for this Workload, using the spoof interface
@@ -491,9 +580,7 @@ func (w *Workload) ExecCombinedOutput(args ...string) (string, error) {
 	return w.C.ExecCombinedOutput(args...)
 }
 
-var (
-	rttRegexp = regexp.MustCompile(`rtt=(.*) ms`)
-)
+var rttRegexp = regexp.MustCompile(`rtt=(.*) ms`)
 
 func (w *Workload) LatencyTo(ip, port string) (time.Duration, string) {
 	if strings.Contains(ip, ":") {
@@ -501,8 +588,9 @@ func (w *Workload) LatencyTo(ip, port string) (time.Duration, string) {
 	}
 	out, err := w.ExecOutput("hping3", "-p", port, "-c", "20", "--fast", "-S", "-n", ip)
 	stderr := ""
-	if err, ok := err.(*exec.ExitError); ok {
-		stderr = string(err.Stderr)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr = string(exitErr.Stderr)
 	}
 	Expect(err).NotTo(HaveOccurred(), stderr)
 
@@ -532,15 +620,16 @@ func (w *Workload) LatencyTo(ip, port string) (time.Duration, string) {
 	return meanRtt, out
 }
 
-func (w *Workload) SendPacketsTo(ip string, count int, size int) (error, string) {
+func (w *Workload) SendPacketsTo(ip string, count int, size int) (string, error) {
 	c := fmt.Sprintf("%d", count)
 	s := fmt.Sprintf("%d", size)
 	_, err := w.ExecOutput("ping", "-c", c, "-W", "1", "-s", s, ip)
 	stderr := ""
-	if err, ok := err.(*exec.ExitError); ok {
-		stderr = string(err.Stderr)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr = string(exitErr.Stderr)
 	}
-	return err, stderr
+	return stderr, err
 }
 
 type SideService struct {
@@ -595,7 +684,6 @@ func startSideService(w *Workload) (*SideService, error) {
 	}
 	testWorkloadShArgs = append(testWorkloadShArgs,
 		"--sidecar-iptables",
-		"--up-lo",
 		fmt.Sprintf("'--namespace-path=%s'", w.namespacePath),
 		"''", // interface name, not important
 		"127.0.0.1",
@@ -630,11 +718,14 @@ type PersistentConnectionOpts struct {
 	SourcePort          int
 	MonitorConnectivity bool
 	Timeout             time.Duration
+	SendRST             bool
+	NoKeepAlive         bool
 }
 
-func (w *Workload) StartPersistentConnection(ip string, port int,
-	opts PersistentConnectionOpts) *connectivity.PersistentConnection {
-
+func (w *Workload) StartPersistentConnectionMayFail(
+	ip string, port int,
+	opts PersistentConnectionOpts,
+) (*connectivity.PersistentConnection, error) {
 	pc := &connectivity.PersistentConnection{
 		RuntimeName:         w.C.Name,
 		Runtime:             w.C,
@@ -645,9 +736,20 @@ func (w *Workload) StartPersistentConnection(ip string, port int,
 		SourcePort:          opts.SourcePort,
 		MonitorConnectivity: opts.MonitorConnectivity,
 		Timeout:             opts.Timeout,
+		SendRST:             opts.SendRST,
+		NoKeepAlive:         opts.NoKeepAlive,
 	}
 
 	err := pc.Start()
+
+	return pc, err
+}
+
+func (w *Workload) StartPersistentConnection(
+	ip string, port int,
+	opts PersistentConnectionOpts,
+) *connectivity.PersistentConnection {
+	pc, err := w.StartPersistentConnectionMayFail(ip, port, opts)
 	Expect(err).NotTo(HaveOccurred())
 
 	return pc
@@ -676,8 +778,8 @@ func (w *Workload) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 const nsprefix = "/var/run/netns/"
 
 func (w *Workload) netns() string {
-	if strings.HasPrefix(w.namespacePath, nsprefix) {
-		return strings.TrimPrefix(w.namespacePath, nsprefix)
+	if after, ok := strings.CutPrefix(w.namespacePath, nsprefix); ok {
+		return after
 	}
 
 	return ""
@@ -741,12 +843,12 @@ type SpoofedWorkload struct {
 
 func (s *SpoofedWorkload) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
 	opts = s.appendSourceIPOpt(opts)
-	s.Workload.preRetryCleanupInner(ip, port, protocol, "(spoofed)", opts...)
+	s.preRetryCleanupInner(ip, port, protocol, "(spoofed)", opts...)
 }
 
 func (s *SpoofedWorkload) CanConnectTo(ip, port, protocol string, opts ...connectivity.CheckOption) *connectivity.Result {
 	opts = s.appendSourceIPOpt(opts)
-	return s.Workload.canConnectToInner(ip, port, protocol, "(spoofed)", opts...)
+	return s.canConnectToInner(ip, port, protocol, "(spoofed)", opts...)
 }
 
 func (s *SpoofedWorkload) appendSourceIPOpt(opts []connectivity.CheckOption) []connectivity.CheckOption {
@@ -772,14 +874,14 @@ func (p *Port) SourceIPs() []string {
 
 func (p *Port) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
 	opts = p.maybeAppendPortOpt(opts)
-	p.Workload.preRetryCleanupInner(ip, port, protocol, "(with source port)", opts...)
+	p.preRetryCleanupInner(ip, port, protocol, "(with source port)", opts...)
 }
 
 // Return if a connection is good and packet loss string "PacketLoss[xx]".
 // If it is not a packet loss test, packet loss string is "".
 func (p *Port) CanConnectTo(ip, port, protocol string, opts ...connectivity.CheckOption) *connectivity.Result {
 	opts = p.maybeAppendPortOpt(opts)
-	return p.Workload.canConnectToInner(ip, port, protocol, "(with source port)", opts...)
+	return p.canConnectToInner(ip, port, protocol, "(with source port)", opts...)
 }
 
 func (p *Port) maybeAppendPortOpt(opts []connectivity.CheckOption) []connectivity.CheckOption {
@@ -825,10 +927,10 @@ func (p *Port) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 		return p.Workload.ToMatcher(explicitPort...)
 	}
 	return &connectivity.Matcher{
-		IP:         p.Workload.IP,
+		IP:         p.IP,
 		Port:       fmt.Sprint(p.Port),
-		TargetName: fmt.Sprintf("%s on port %d", p.Workload.Name, p.Port),
-		IP6:        p.Workload.IP6,
+		TargetName: fmt.Sprintf("%s on port %d", p.Name, p.Port),
+		IP6:        p.IP6,
 	}
 }
 
@@ -839,4 +941,37 @@ func (w *Workload) InterfaceIndex() int {
 	Expect(err).NotTo(HaveOccurred())
 	log.Infof("%v is ifindex %v", w.InterfaceName, ifIndex)
 	return ifIndex
+}
+
+func (w *Workload) RenameInterface(from, to string) {
+	var err error
+	sleep := 100 * time.Millisecond
+	for range 40 {
+		// Can fail with EBUSY.
+		err = w.C.ExecMayFail("ip", "link", "set", from, "name", to)
+		if err == nil {
+			return
+		}
+		time.Sleep(sleep)
+		sleep = time.Duration(float64(sleep) * (1.5 + rand.Float64()))
+		const maxSleep = 2 * time.Second
+		if sleep > maxSleep {
+			sleep = maxSleep
+		}
+	}
+	ginkgo.Fail(fmt.Sprintf("Failed to rename interface %s to %s after several retries: %s", from, to, err))
+}
+
+func (w *Workload) SetInterfaceUp(b bool) {
+	if b {
+		w.C.Exec("ip", "link", "set", "up", w.InterfaceName)
+	} else {
+		w.C.Exec("ip", "link", "set", "down", w.InterfaceName)
+	}
+}
+
+func (w *Workload) ExecCommand(name string, args ...string) *exec.Cmd {
+	args = append([]string{"exec", w.C.Name, "ip", "netns", "exec", w.NamespaceID(), name}, args...)
+	cmd := utils.Command("docker", args...)
+	return cmd
 }

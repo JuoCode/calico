@@ -15,16 +15,17 @@
 package wait
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	"github.com/fsnotify/fsnotify"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 )
 
@@ -34,18 +35,18 @@ var _ = Describe("k8s-wait", func() {
 		BeforeEach(func() {})
 		AfterEach(func() {})
 
-		pollAndReturn := func(exit chan error, dummyEndpoint *v3.WorkloadEndpoint, timeout time.Duration) {
+		pollAndReturn := func(exit chan error, dummyEndpoint *internalapi.WorkloadEndpoint, timeout time.Duration) {
 			defer close(exit)
 			err := ForEndpointReadyWithTimeout("/tmp", dummyEndpoint, timeout)
 			exit <- err
 		}
 
 		It("should wait for the given timeout and return error when no file is found", func() {
-			dummyEndpoint := &v3.WorkloadEndpoint{
+			dummyEndpoint := &internalapi.WorkloadEndpoint{
 				ObjectMeta: v1.ObjectMeta{
 					Namespace: "name-space",
 				},
-				Spec: v3.WorkloadEndpointSpec{
+				Spec: internalapi.WorkloadEndpointSpec{
 					Pod:          "podname",
 					Orchestrator: "k8s",
 					Node:         "node-1",
@@ -64,11 +65,11 @@ var _ = Describe("k8s-wait", func() {
 		})
 
 		It("should return immediately after the right file is created", func() {
-			dummyEndpoint := &v3.WorkloadEndpoint{
+			dummyEndpoint := &internalapi.WorkloadEndpoint{
 				ObjectMeta: v1.ObjectMeta{
 					Namespace: "name-space",
 				},
-				Spec: v3.WorkloadEndpointSpec{
+				Spec: internalapi.WorkloadEndpointSpec{
 					Pod:          "podname",
 					Orchestrator: "k8s",
 					Node:         "node-1",
@@ -97,6 +98,116 @@ var _ = Describe("k8s-wait", func() {
 
 			Eventually(exit, "3s").Should(Receive(&err), "Expected a return value to be passed from polling thread.")
 			Expect(err).NotTo(HaveOccurred(), "Polling thread returned an error.")
+		})
+	})
+
+	Context("waitForCreateEvent", func() {
+		It("should handle create events with multiple fsnotify operations", func() {
+			watcher, err := fsnotify.NewWatcher()
+			Expect(err).NotTo(HaveOccurred())
+			defer closeWatcherAndIgnoreErr(watcher)
+
+			const filename = "endpoint-status"
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				watcher.Events <- fsnotify.Event{
+					Name: filepath.Join("/tmp", filename),
+					Op:   fsnotify.Create | fsnotify.Write,
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			found, err := waitForCreateEvent(ctx, watcher, filename)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Eventually(done).Should(BeClosed())
+		})
+
+		It("should ignore write-only events", func() {
+			watcher, err := fsnotify.NewWatcher()
+			Expect(err).NotTo(HaveOccurred())
+			defer closeWatcherAndIgnoreErr(watcher)
+
+			const filename = "endpoint-status"
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				watcher.Events <- fsnotify.Event{
+					Name: filepath.Join("/tmp", filename),
+					Op:   fsnotify.Write,
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			found, err := waitForCreateEvent(ctx, watcher, filename)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse())
+			Eventually(done).Should(BeClosed())
+		})
+	})
+
+	Context("ForFileWithTimeout", func() {
+		var dir string
+
+		BeforeEach(func() {
+			dir = GinkgoT().TempDir()
+		})
+
+		waitInBackground := func(path string, timeout time.Duration) chan error {
+			exit := make(chan error, 1)
+			go func() {
+				exit <- ForFileWithTimeout(path, timeout)
+			}()
+			return exit
+		}
+
+		It("should return immediately if the file already exists", func() {
+			path := filepath.Join(dir, "nodename")
+			Expect(os.WriteFile(path, []byte("node-1"), 0o644)).To(Succeed())
+
+			var err error
+			Eventually(waitInBackground(path, 3*time.Second), "1s").Should(Receive(&err))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should return an error after the timeout if the file never appears", func() {
+			exit := waitInBackground(filepath.Join(dir, "nodename"), 2*time.Second)
+			Consistently(exit, "1s").ShouldNot(Receive(), "Returned before the timeout.")
+
+			var err error
+			Eventually(exit, "3s").Should(Receive(&err))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return once the file is created", func() {
+			path := filepath.Join(dir, "nodename")
+			exit := waitInBackground(path, 10*time.Second)
+			Consistently(exit, "1s").ShouldNot(Receive(), "Returned before the file was created.")
+
+			Expect(os.WriteFile(path, []byte("node-1"), 0o644)).To(Succeed())
+
+			var err error
+			Eventually(exit, "2s").Should(Receive(&err))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should return once the file is created in a directory that did not exist at the start", func() {
+			// On node boot /var/lib/calico may not exist until calico/node creates it,
+			// so the watch cannot be set up and the wait must fall back to polling.
+			subDir := filepath.Join(dir, "calico")
+			path := filepath.Join(subDir, "nodename")
+			exit := waitInBackground(path, 10*time.Second)
+			Consistently(exit, "1s").ShouldNot(Receive(), "Returned before the file was created.")
+
+			Expect(os.MkdirAll(subDir, 0o755)).To(Succeed())
+			Expect(os.WriteFile(path, []byte("node-1"), 0o644)).To(Succeed())
+
+			var err error
+			Eventually(exit, "3s").Should(Receive(&err))
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 })

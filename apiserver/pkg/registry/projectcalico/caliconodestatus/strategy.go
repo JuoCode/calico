@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 package caliconodestatus
 
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -14,8 +15,6 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 type apiServerStrategy struct {
@@ -33,20 +32,25 @@ func (apiServerStrategy) NamespaceScoped() bool {
 }
 
 func (apiServerStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	cns := obj.(*calico.CalicoNodeStatus)
+	cns.Status = calico.CalicoNodeStatusStatus{}
 }
 
 func (apiServerStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newCNS := obj.(*calico.CalicoNodeStatus)
+	oldCNS := old.(*calico.CalicoNodeStatus)
+	newCNS.Status = oldCNS.Status
 }
 
 func (apiServerStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	return field.ErrorList{}
 }
 
-func (apiServerStrategy) AllowCreateOnUpdate() bool {
+func (apiServerStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (apiServerStrategy) AllowUnconditionalUpdate() bool {
+func (apiServerStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -65,12 +69,31 @@ func (apiServerStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 	return field.ErrorList{}
 }
 
+type apiServerStatusStrategy struct {
+	apiServerStrategy
+}
+
+func NewStatusStrategy(strategy apiServerStrategy) apiServerStatusStrategy {
+	return apiServerStatusStrategy{strategy}
+}
+
+func (apiServerStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newStatus := obj.(*calico.CalicoNodeStatus)
+	oldStatus := old.(*calico.CalicoNodeStatus)
+	newStatus.Spec = oldStatus.Spec
+	newStatus.Labels = oldStatus.Labels
+}
+
+func (apiServerStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return field.ErrorList{}
+}
+
 func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	apiserver, ok := obj.(*calico.CalicoNodeStatus)
 	if !ok {
 		return nil, nil, fmt.Errorf("given object (type %v) is not a Cluster Information", reflect.TypeOf(obj))
 	}
-	return labels.Set(apiserver.ObjectMeta.Labels), CalicoNodeStatusToSelectableFields(apiserver), nil
+	return labels.Set(apiserver.Labels), CalicoNodeStatusToSelectableFields(apiserver), nil
 }
 
 // MatchCalicoNodeStatus is the event filter used by clients of the apiserver only interested in

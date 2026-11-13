@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
+	"encoding/json"
 	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/bpf/ifstate"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 )
@@ -41,7 +41,6 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Felix bpf reattach object",
 
 	BeforeEach(func() {
 		infra = getInfra()
-		// opts := infrastructure.DefaultTopologyOptions()
 		opts := infrastructure.TopologyOptions{
 			FelixLogSeverity: "debug",
 			DelayFelixStart:  true,
@@ -58,15 +57,6 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Felix bpf reattach object",
 
 		err := infra.AddAllowToDatastore("host-endpoint=='true'")
 		Expect(err).NotTo(HaveOccurred())
-	})
-
-	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			infra.DumpErrorData()
-		}
-
-		tc.Stop()
-		infra.Stop()
 	})
 
 	It("should clean up programs when BPFDataIfacePattern changes", func() {
@@ -91,5 +81,121 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ Felix bpf reattach object",
 			out, _ := felix.ExecOutput("bpftool", "-jp", "net")
 			return out
 		}, "15s", "1s").ShouldNot(ContainSubstring("eth0"))
+	})
+
+	It("should attach programs to the bond interfaces", func() {
+		By("Starting Felix")
+		felix.TriggerDelayedStart()
+		By("Check that dummy interfaces has a program")
+		tc.Felixes[0].Exec("ip", "link", "add", "eth10", "type", "dummy")
+		tc.Felixes[0].Exec("ip", "link", "add", "eth20", "type", "dummy")
+
+		getBPFNet := func() []string {
+			out, _ := felix.ExecOutput("bpftool", "-jp", "net")
+			devs := []string{}
+			var output []struct {
+				Tc []struct {
+					Devname string `json:"devname"`
+				} `json:"tc"`
+			}
+			err := json.Unmarshal([]byte(out), &output)
+			if err == nil {
+				for _, tc := range output[0].Tc {
+					devs = append(devs, tc.Devname)
+				}
+			}
+			return devs
+		}
+
+		// Bring up the interfaces
+		tc.Felixes[0].Exec("ifconfig", "eth10", "up")
+		tc.Felixes[0].Exec("ifconfig", "eth20", "up")
+
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElements("eth10", "eth20"))
+		ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, map[string]uint32{"eth10": ifstate.FlgIPv4Ready | ifstate.FlgHEP, "eth20": ifstate.FlgIPv4Ready | ifstate.FlgHEP})
+
+		By("Creating a bond interface and eth10, eth20 to the bond")
+		tc.Felixes[0].Exec("ip", "link", "add", "bond0", "type", "bond", "mode", "802.3ad")
+		tc.Felixes[0].Exec("ifconfig", "eth10", "down")
+		tc.Felixes[0].Exec("ifconfig", "eth20", "down")
+		tc.Felixes[0].Exec("ip", "link", "set", "eth10", "master", "bond0")
+		tc.Felixes[0].Exec("ip", "link", "set", "eth20", "master", "bond0")
+		tc.Felixes[0].Exec("ifconfig", "bond0", "up")
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElement("bond0"))
+		Eventually(getBPFNet, "15s", "1s").ShouldNot(ContainElements("eth10", "eth20"))
+		ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, map[string]uint32{"bond0": ifstate.FlgIPv4Ready | ifstate.FlgBond})
+
+		By("Removing eth10 from bond")
+		tc.Felixes[0].Exec("ip", "link", "set", "eth10", "nomaster")
+		tc.Felixes[0].Exec("ifconfig", "eth10", "up")
+		Eventually(getBPFNet, "15s", "1s").ShouldNot(ContainElement("eth20"))
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElements("bond0", "eth10"))
+		ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, map[string]uint32{"bond0": ifstate.FlgIPv4Ready | ifstate.FlgBond, "eth10": ifstate.FlgIPv4Ready | ifstate.FlgHEP})
+
+		By("Removing eth20 from bond")
+		tc.Felixes[0].Exec("ip", "link", "set", "eth20", "nomaster")
+		tc.Felixes[0].Exec("ifconfig", "eth20", "up")
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElements("bond0", "eth10", "eth20"))
+		ensureRightIFStateFlags(tc.Felixes[0], ifstate.FlgIPv4Ready, ifstate.FlgHEP, map[string]uint32{"eth10": ifstate.FlgIPv4Ready | ifstate.FlgHEP, "eth20": ifstate.FlgIPv4Ready | ifstate.FlgHEP})
+
+		By("Creating a bond interface which does match BPFDataIfacePattern")
+		tc.Felixes[0].Exec("ip", "link", "add", "foo0", "type", "bond", "mode", "802.3ad")
+		tc.Felixes[0].Exec("ifconfig", "eth10", "down")
+		tc.Felixes[0].Exec("ifconfig", "eth20", "down")
+
+		tc.Felixes[0].Exec("ip", "link", "set", "eth10", "master", "foo0")
+		tc.Felixes[0].Exec("ip", "link", "set", "eth20", "master", "foo0")
+		tc.Felixes[0].Exec("ifconfig", "foo0", "up")
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElements("eth10", "eth20"))
+
+	})
+
+	It("should attach programs to the bridge and not its member ports", func() {
+		By("Creating a bridge with its member ports before Felix starts")
+		// Configure the full bridge topology up-front so Felix builds its
+		// interface tree from the initial netlink resync. This mirrors how a
+		// bridge is deployed in practice (set up at boot, before calico-node
+		// starts) and avoids relying on an interface flap: enslaving an
+		// already-up port to a bridge does not change its oper state, and
+		// Felix's interface monitor only notifies on an up/down transition, so
+		// a runtime enslave of an up port would not be picked up on its own.
+		tc.Felixes[0].Exec("ip", "link", "add", "br10", "type", "dummy")
+		tc.Felixes[0].Exec("ip", "link", "add", "br20", "type", "dummy")
+		tc.Felixes[0].Exec("ip", "link", "add", "br0", "type", "bridge")
+		tc.Felixes[0].Exec("ip", "link", "set", "br10", "master", "br0")
+		tc.Felixes[0].Exec("ip", "link", "set", "br20", "master", "br0")
+		tc.Felixes[0].Exec("ifconfig", "br10", "up")
+		tc.Felixes[0].Exec("ifconfig", "br20", "up")
+		tc.Felixes[0].Exec("ifconfig", "br0", "up")
+
+		By("Starting Felix with a data iface pattern that matches the bridge")
+		felix.TriggerDelayedStart()
+		// "br" is free of shell metacharacters (SetEnv writes it into a sourced
+		// script) and matches the bridge br0 and its br10/br20 members.
+		felix.SetEnv(map[string]string{"FELIX_BPFDataIfacePattern": "br"})
+		felix.Restart()
+
+		getBPFNet := func() []string {
+			out, _ := felix.ExecOutput("bpftool", "-jp", "net")
+			devs := []string{}
+			var output []struct {
+				Tc []struct {
+					Devname string `json:"devname"`
+				} `json:"tc"`
+			}
+			err := json.Unmarshal([]byte(out), &output)
+			if err == nil {
+				for _, tc := range output[0].Tc {
+					devs = append(devs, tc.Devname)
+				}
+			}
+			return devs
+		}
+
+		By("Checking the program is on the bridge, not its member ports")
+		// Felix's resync sees br10/br20 already enslaved to br0, so the tc
+		// program is attached to the bridge and not to the enslaved ports.
+		Eventually(getBPFNet, "15s", "1s").Should(ContainElement("br0"))
+		Eventually(getBPFNet, "15s", "1s").ShouldNot(ContainElements("br10", "br20"))
 	})
 })

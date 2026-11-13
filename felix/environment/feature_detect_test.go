@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,16 +22,16 @@ import (
 	"strings"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-
-	"github.com/projectcalico/calico/felix/netlinkshim/mocknetlink"
 
 	. "github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/iptables/cmdshim"
 	"github.com/projectcalico/calico/felix/iptables/testutils"
+	"github.com/projectcalico/calico/felix/netlinkshim/mocknetlink"
 )
 
 func init() {
@@ -54,6 +54,8 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       true,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -64,6 +66,8 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -74,6 +78,8 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -84,6 +90,8 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -94,6 +102,20 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
+			},
+		},
+		{
+			"garbage",
+			"Linux version 3.12.0",
+			Features{
+				RestoreSupportsLock:   false,
+				SNATFullyRandom:       false,
+				MASQFullyRandom:       false,
+				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -104,6 +126,8 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -114,17 +138,21 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 		},
 		{
 			"iptables v1.6.2",
 			"Linux version 4.20.0", // Triggers test harness to support KernelSideRouteFiltering
 			Features{
-				RestoreSupportsLock:      true,
 				SNATFullyRandom:          true,
 				MASQFullyRandom:          true,
+				RestoreSupportsLock:      true,
 				ChecksumOffloadBroken:    true,
+				NFLogSize:                true,
 				KernelSideRouteFiltering: true,
+				NFTablesSupported:        true,
 			},
 		},
 		{
@@ -135,6 +163,20 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       false,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
+			},
+		},
+		{
+			"iptables v1.8.4",
+			"Linux version 4.8.0",
+			Features{
+				RestoreSupportsLock:   true,
+				SNATFullyRandom:       true,
+				MASQFullyRandom:       true,
+				ChecksumOffloadBroken: true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 		},
 		{
@@ -145,20 +187,25 @@ func TestFeatureDetection(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       true,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 		},
 		{
 			"iptables v1.8.4",
 			"Linux version 5.8.0",
 			Features{
-				RestoreSupportsLock:   true,
-				SNATFullyRandom:       true,
-				MASQFullyRandom:       true,
-				ChecksumOffloadBroken: false,
+				RestoreSupportsLock:      true,
+				SNATFullyRandom:          true,
+				MASQFullyRandom:          true,
+				ChecksumOffloadBroken:    false,
+				NFLogSize:                true,
+				IPIPDeviceIsL3:           false,
+				KernelSideRouteFiltering: false,
+				NFTablesSupported:        true,
 			},
 		},
 	} {
-		tst := tst
 		t.Run("iptables version "+tst.iptablesVersion+" kernel "+tst.kernelVersion, func(t *testing.T) {
 			RegisterTestingT(t)
 			dataplane := testutils.NewMockDataplane("filter", map[string][]string{}, "legacy")
@@ -206,6 +253,8 @@ func TestFeatureDetectionOverride(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       true,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
@@ -217,6 +266,8 @@ func TestFeatureDetectionOverride(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"RestoreSupportsLock": "true",
@@ -230,15 +281,18 @@ func TestFeatureDetectionOverride(t *testing.T) {
 				SNATFullyRandom:       true,
 				MASQFullyRandom:       false,
 				ChecksumOffloadBroken: true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
-				"RestoreSupportsLock": "true",
-				"SNATFullyRandom":     "true",
-				"MASQFullyRandom":     "false",
+				"RestoreSupportsLock":   "true",
+				"SNATFullyRandom":       "true",
+				"MASQFullyRandom":       "false",
+				"ChecksumOffloadBroken": "true",
+				"NFLogSize":             "true",
 			},
 		},
 	} {
-		tst := tst
 		t.Run("iptables version "+tst.iptablesVersion+" kernel "+tst.kernelVersion, func(t *testing.T) {
 			RegisterTestingT(t)
 			dataplane := testutils.NewMockDataplane("filter", map[string][]string{}, "legacy")
@@ -270,6 +324,15 @@ func TestFeatureDetectionOverride(t *testing.T) {
 
 func TestIptablesBackendDetection(t *testing.T) {
 	RegisterTestingT(t)
+
+	// Pin the module check so detection doesn't depend on what the test host has loaded.
+	realModulesLoaded := LegacyIPTablesModulesLoaded
+	LegacyIPTablesModulesLoaded = func(ipVersion uint8) bool {
+		return true
+	}
+	defer func() {
+		LegacyIPTablesModulesLoaded = realModulesLoaded
+	}()
 
 	type test struct {
 		name            string
@@ -393,7 +456,8 @@ func TestIptablesBackendDetection(t *testing.T) {
 				Ip4NftKube:    2,
 			},
 			"nft",
-		}, {
+		},
+		{
 			"Output from legacy with kube chains and has nft chains",
 			"auto",
 			ipOutputFactory{
@@ -409,7 +473,6 @@ func TestIptablesBackendDetection(t *testing.T) {
 			"legacy",
 		},
 	} {
-		tst := tst
 		t.Run("DetectingBackend, testing "+tst.name, func(t *testing.T) {
 			RegisterTestingT(t)
 			Expect(DetectBackend(testutils.LookPathAll, tst.cmdF.NewCmd, tst.spec)).To(Equal(tst.expectedBackend))
@@ -417,6 +480,30 @@ func TestIptablesBackendDetection(t *testing.T) {
 			Expect(DetectBackend(testutils.LookPathAll, tst.cmdF.NewCmd, strings.ToUpper(tst.spec))).To(Equal(tst.expectedBackend), "Capitalization affected output")
 		})
 	}
+}
+
+func TestIptablesBackendDetectionSkipsUnloadedLegacy(t *testing.T) {
+	RegisterTestingT(t)
+
+	realModulesLoaded := LegacyIPTablesModulesLoaded
+	LegacyIPTablesModulesLoaded = func(ipVersion uint8) bool {
+		return false
+	}
+	defer func() {
+		LegacyIPTablesModulesLoaded = realModulesLoaded
+	}()
+
+	cmdF := ipOutputFactory{Ip6legacy: 20, Ip4legacy: 20, Ip6Nft: 10, Ip4Nft: 10}
+	var invoked []string
+	newCmd := func(name string, arg ...string) cmdshim.CmdIface {
+		invoked = append(invoked, name)
+		return cmdF.NewCmd(name, arg...)
+	}
+
+	// The legacy backend outweighs nft, but the modules aren't loaded, so those rules can't be
+	// there and probing for them would autoload the modules.
+	Expect(DetectBackend(testutils.LookPathAll, newCmd, "auto")).To(Equal(IPTablesBackendNFT))
+	Expect(invoked).NotTo(ContainElement(ContainSubstring("legacy")))
 }
 
 type ipOutputFactory struct {
@@ -488,10 +575,10 @@ func (d *ipOutputCmd) Output() ([]byte, error) {
 
 	out := []byte{}
 	for i := 0; i < d.outKube; i++ {
-		out = append(out, []byte(fmt.Sprintf("KUBE-IPTABLES-HINT - [0:0] %d\n", i))...)
+		out = append(out, fmt.Appendf(nil, "KUBE-IPTABLES-HINT - [0:0] %d\n", i)...)
 	}
 	for i := 0; i < d.out-d.outKube; i++ {
-		out = append(out, []byte(fmt.Sprintf("-Output line %d\n", i))...)
+		out = append(out, fmt.Appendf(nil, "-Output line %d\n", i)...)
 	}
 
 	return out, nil
@@ -517,28 +604,40 @@ func TestBPFFeatureDetection(t *testing.T) {
 		{
 			"Linux version 5.10.0 - ubuntu",
 			Features{
-				IPIPDeviceIsL3: false,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        false,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
 		{
 			"Linux version 5.14.0 - something else",
 			Features{
-				IPIPDeviceIsL3: true,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        true,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
 		{
 			"Linux version 5.15.0",
 			Features{
-				IPIPDeviceIsL3: true,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        true,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
 		{
 			"Linux version 5.10.0 - Default",
 			Features{
-				IPIPDeviceIsL3: true,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        true,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "true",
@@ -547,7 +646,10 @@ func TestBPFFeatureDetection(t *testing.T) {
 		{
 			"Linux version 5.14.0",
 			Features{
-				IPIPDeviceIsL3: false,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        false,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "false",
@@ -556,7 +658,10 @@ func TestBPFFeatureDetection(t *testing.T) {
 		{
 			"Linux version 5.16.0 - Ubuntu",
 			Features{
-				IPIPDeviceIsL3: false,
+				NFLogSize:             true,
+				IPIPDeviceIsL3:        false,
+				ChecksumOffloadBroken: false,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "false",
@@ -567,6 +672,8 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        false,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
@@ -575,6 +682,8 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
@@ -583,6 +692,8 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{},
 		},
@@ -591,6 +702,8 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        true,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "true",
@@ -601,6 +714,8 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        false,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "false",
@@ -611,10 +726,32 @@ func TestBPFFeatureDetection(t *testing.T) {
 			Features{
 				ChecksumOffloadBroken: true,
 				IPIPDeviceIsL3:        false,
+				NFLogSize:             true,
+				NFTablesSupported:     true,
 			},
 			map[string]string{
 				"IPIPDeviceIsL3": "false",
 			},
+		},
+		{
+			"Linux version 6.15.0",
+			Features{
+				NFLogSize:          true,
+				IPIPDeviceIsL3:     true,
+				KernelHasUDPGSOFix: false,
+				NFTablesSupported:  true,
+			},
+			map[string]string{},
+		},
+		{
+			"Linux version 6.16.0",
+			Features{
+				NFLogSize:          true,
+				IPIPDeviceIsL3:     true,
+				KernelHasUDPGSOFix: true,
+				NFTablesSupported:  true,
+			},
+			map[string]string{},
 		},
 	} {
 		t.Run("kernel "+tst.kernelVersion, func(t *testing.T) {
@@ -645,4 +782,84 @@ type mockKernelVersion struct {
 
 func (kv mockKernelVersion) GetKernelVersionReader() (io.Reader, error) {
 	return bytes.NewBufferString(kv.kernelVersion), nil
+}
+
+func TestVXLANVNIFilterDetection(t *testing.T) {
+	addVXLAN := func(nl *mocknetlink.MockNetlinkDataplane, name string, vniFilter bool) {
+		la := netlink.NewLinkAttrs()
+		la.Name = name
+		Expect(nl.LinkAdd(&netlink.Vxlan{LinkAttrs: la, FlowBased: true, VniFilter: vniFilter})).To(Succeed())
+	}
+	for _, tst := range []struct {
+		name          string
+		setup         func(nl *mocknetlink.MockNetlinkDataplane)
+		expected      bool
+		expectedProbe bool
+		override      map[string]string
+	}{
+		{"kernel supports vnifilter", func(nl *mocknetlink.MockNetlinkDataplane) {}, true, true, nil},
+		{"kernel ignores vnifilter", func(nl *mocknetlink.MockNetlinkDataplane) { nl.KernelLacksVniFilter = true }, false, true, nil},
+		{"probe device creation fails", func(nl *mocknetlink.MockNetlinkDataplane) {
+			nl.FailuresToSimulate = mocknetlink.FailNextLinkAdd
+		}, false, false, nil},
+		{"existing VNI-filtering device proves support", func(nl *mocknetlink.MockNetlinkDataplane) {
+			addVXLAN(nl, "vxlan.calico", true)
+			nl.KernelLacksVniFilter = true // Would fail if probed.
+		}, true, false, nil},
+		{"failed probe does not downgrade a filtering vxlan.calico", func(nl *mocknetlink.MockNetlinkDataplane) {
+			addVXLAN(nl, "vxlan.calico", true)
+			nl.FailuresToSimulate = mocknetlink.FailNextLinkAdd
+		}, true, false, nil},
+		{"unfiltered vxlan.calico does not prove support", func(nl *mocknetlink.MockNetlinkDataplane) {
+			addVXLAN(nl, "vxlan.calico", false)
+			nl.KernelLacksVniFilter = true
+		}, false, true, nil},
+		{"leftover probe device is replaced", func(nl *mocknetlink.MockNetlinkDataplane) {
+			addVXLAN(nl, "cali-vnif-probe", false)
+		}, true, true, nil},
+		{"override skips the probe", func(nl *mocknetlink.MockNetlinkDataplane) {}, false, false, map[string]string{"VXLANVNIFilter": "false"}},
+		{"override can force it on without probing", func(nl *mocknetlink.MockNetlinkDataplane) {
+			nl.KernelLacksVniFilter = true
+		}, true, false, map[string]string{"VXLANVNIFilter": "true"}},
+	} {
+		t.Run(tst.name, func(t *testing.T) {
+			RegisterTestingT(t)
+			dataplane := testutils.NewMockDataplane("filter", map[string][]string{}, "legacy")
+			dataplane.KernelVersion = "Linux version 6.8.0"
+			mockNL := mocknetlink.New()
+			_, err := mockNL.NewMockNetlink()
+			Expect(err).NotTo(HaveOccurred())
+			tst.setup(mockNL)
+			mockNL.ResetDeltas()
+			mockNL.Delete()
+			featureDetector := NewFeatureDetector(tst.override, WithNetlinkOverride(mockNL.NewMockNetlink), WithVXLANVNIFilterProbe())
+			featureDetector.NewCmd = dataplane.NewCmd
+			featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
+
+			Expect(featureDetector.GetFeatures().VXLANVNIFilter).To(Equal(tst.expected))
+			probed := false
+			for name := range mockNL.AddedLinks.All() {
+				if strings.HasPrefix(name, "cali-vnif-") {
+					probed = true
+				}
+			}
+			Expect(probed).To(Equal(tst.expectedProbe))
+			for name := range mockNL.NameToLink {
+				Expect(name).NotTo(HavePrefix("cali-vnif-"), "probe device should be cleaned up")
+			}
+		})
+	}
+}
+
+func TestVXLANVNIFilterNotProbedByDefault(t *testing.T) {
+	RegisterTestingT(t)
+	dataplane := testutils.NewMockDataplane("filter", map[string][]string{}, "legacy")
+	dataplane.KernelVersion = "Linux version 6.8.0"
+	mockNL := mocknetlink.New()
+	featureDetector := NewFeatureDetector(nil, WithNetlinkOverride(mockNL.NewMockNetlink))
+	featureDetector.NewCmd = dataplane.NewCmd
+	featureDetector.GetKernelVersionReader = dataplane.GetKernelVersionReader
+
+	Expect(featureDetector.GetFeatures().VXLANVNIFilter).To(BeFalse())
+	Expect(mockNL.NumLinkAddCalls).To(BeZero())
 }

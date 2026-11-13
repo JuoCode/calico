@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,38 +18,27 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/client-go/rest"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 const (
 	IPPoolResourceName = "IPPools"
-	IPPoolCRDName      = "ippools.crd.projectcalico.org"
 )
 
-func NewIPPoolClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResourceClient {
-	return &customK8sResourceClient{
-		clientSet:       c,
-		restClient:      r,
-		name:            IPPoolCRDName,
-		resource:        IPPoolResourceName,
-		description:     "Calico IP Pools",
-		k8sResourceType: reflect.TypeOf(apiv3.IPPool{}),
-		k8sResourceTypeMeta: metav1.TypeMeta{
-			Kind:       apiv3.KindIPPool,
-			APIVersion: apiv3.GroupVersionCurrent,
-		},
-		k8sListType:      reflect.TypeOf(apiv3.IPPoolList{}),
-		resourceKind:     apiv3.KindIPPool,
+func NewIPPoolClient(r rest.Interface, group BackingAPIGroup) K8sResourceClient {
+	return &customResourceClient{
+		restClient:       r,
+		resource:         IPPoolResourceName,
+		k8sResourceType:  reflect.TypeFor[apiv3.IPPool](),
+		k8sListType:      reflect.TypeFor[apiv3.IPPoolList](),
+		kind:             apiv3.KindIPPool,
 		versionconverter: IPPoolv1v3Converter{},
+		apiGroup:         group,
 	}
 }
 
@@ -62,28 +51,6 @@ func (c IPPoolv1v3Converter) ConvertFromK8s(inRes Resource) (Resource, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid type conversion")
 	}
-
-	// If IPIP field is not nil, then it means the resource has v1 IPIP data
-	// and we must convert it to v3 equivalent data.
-	if ipp.Spec.IPIP != nil {
-		if !ipp.Spec.IPIP.Enabled {
-			ipp.Spec.IPIPMode = apiv3.IPIPModeNever
-		} else if ipp.Spec.IPIP.Mode == encap.CrossSubnet {
-			ipp.Spec.IPIPMode = apiv3.IPIPModeCrossSubnet
-		} else {
-			ipp.Spec.IPIPMode = apiv3.IPIPModeAlways
-		}
-
-		// Set IPIP to nil since we've already converted v1 IPIP fields to v3.
-		ipp.Spec.IPIP = nil
-	}
-
-	// Take a logical OR of the v1 NATOutgoing field with the v3 NATOutgoing.
-	ipp.Spec.NATOutgoing = ipp.Spec.NATOutgoingV1 || ipp.Spec.NATOutgoing
-
-	// Set v1 NatOutgoing to false since we've already converted it to v3 NatOutgoing.
-	ipp.Spec.NATOutgoingV1 = false
-
 	return ipp, nil
 }
 
@@ -94,7 +61,7 @@ func IPPoolV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
 		return nil, err
 	}
 	v1key := model.IPPoolKey{
-		CIDR: *cidr,
+		CIDR: model.PrefixFromIPNet(*cidr),
 	}
 	var ipipInterface string
 	var ipipMode encap.Mode
@@ -107,7 +74,7 @@ func IPPoolV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
 		ipipMode = encap.CrossSubnet
 	default:
 		ipipInterface = ""
-		ipipMode = encap.Undefined
+		ipipMode = encap.Never
 	}
 
 	var vxlanMode encap.Mode
@@ -117,7 +84,12 @@ func IPPoolV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
 	case apiv3.VXLANModeCrossSubnet:
 		vxlanMode = encap.CrossSubnet
 	default:
-		vxlanMode = encap.Undefined
+		vxlanMode = encap.Never
+	}
+
+	if v3res.Spec.AssignmentMode == nil {
+		automatic := apiv3.Automatic
+		v3res.Spec.AssignmentMode = &automatic
 	}
 
 	return &model.KVPair{
@@ -131,6 +103,10 @@ func IPPoolV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
 			IPAM:             !v3res.Spec.Disabled,
 			Disabled:         v3res.Spec.Disabled,
 			DisableBGPExport: v3res.Spec.DisableBGPExport,
+			AssignmentMode:   *v3res.Spec.AssignmentMode,
+			AllowedUses:      v3res.Spec.AllowedUses,
+			NodeSelector:     v3res.Spec.NodeSelector,
+			Deleting:         v3res.DeletionTimestamp != nil,
 		},
 		Revision: kvp.Revision,
 	}, nil

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -23,15 +21,15 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-
 	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
+	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 )
 
 // These tests verify that test-connection and test-workload work properly across all the different protocols.
@@ -70,18 +68,6 @@ func describeConnCheckTests(protocol string) bool {
 
 				cc = &connectivity.Checker{}
 				cc.Protocol = protocol
-			})
-
-			AfterEach(func() {
-				for _, wl := range hostW {
-					wl.Stop()
-				}
-				tc.Stop()
-
-				if CurrentGinkgoTestDescription().Failed {
-					infra.DumpErrorData()
-				}
-				infra.Stop()
 			})
 
 			It("should have host-to-host on right port only", func() {
@@ -124,12 +110,12 @@ func describeConnCheckTests(protocol string) bool {
 						tcpdF := tc.Felixes[0].AttachTCPDump("eth0")
 						tcpdF.SetLogEnabled(true)
 						tcpdF.AddMatcher("UDP", regexp.MustCompile(`.*UDP.*`))
-						tcpdF.Start()
+						tcpdF.Start(infra)
 
 						tcpdW := hostW[1].AttachTCPDump()
 						tcpdW.SetLogEnabled(true)
 						tcpdW.AddMatcher("UDP", regexp.MustCompile(`.*UDP.*`))
-						tcpdW.Start()
+						tcpdW.Start(infra)
 
 						cc.ExpectLoss(tc.Felixes[0], hostW[1], 2*time.Second, 20, -1)
 						cc.CheckConnectivityPacketLoss()
@@ -161,14 +147,6 @@ var _ = infrastructure.DatastoreDescribe("Container self tests",
 			tc, _ = infrastructure.StartNNodeTopology(1, options, infra)
 		})
 
-		AfterEach(func() {
-			tc.Stop()
-			if CurrentGinkgoTestDescription().Failed {
-				infra.DumpErrorData()
-			}
-			infra.Stop()
-		})
-
 		It("should only report that existing files actually exist", func() {
 			Expect(tc.Felixes[0].FileExists("/usr/local/bin/calico-felix")).To(BeTrue())
 			Expect(tc.Felixes[0].FileExists("/garbage")).To(BeFalse())
@@ -184,11 +162,23 @@ var _ = infrastructure.DatastoreDescribe("Container self tests",
 				dir, err := os.ReadDir("/tmp")
 				Expect(err).NotTo(HaveOccurred())
 				name := ""
+				var filesToClean []string
 				for _, f := range dir {
 					if strings.Contains(f.Name(), "core_"+tc.Felixes[0].Hostname) {
 						name = f.Name()
+						filesToClean = append(filesToClean, name)
 					}
 				}
+				defer func() {
+					// The core files get owned by root, use temporary privileged container to clean them up.
+					for _, s := range filesToClean {
+						utils.Run("docker", "run",
+							"--rm",
+							"-v", "/tmp:/tmp",
+							"--privileged",
+							"--entrypoint", "rm", utils.Config.FelixImage, "/tmp/"+s)
+					}
+				}()
 				Expect(name).NotTo(Equal(""), "Couldn't find core file")
 				s, err := os.Stat("/tmp/" + name)
 				Expect(err).NotTo(HaveOccurred())
@@ -204,6 +194,7 @@ var _ = infrastructure.DatastoreDescribe("Container self tests",
 			if os.Getenv("FV_RACE_DETECTOR_ENABLED") == "true" {
 				It("should detect a race", func() {
 					Eventually(tc.Felixes[0].DataRaces).ShouldNot(BeEmpty())
+					tc.Felixes[0].DisableRaceDetector()
 				})
 			} else {
 				It("should not detect a race because race detector is disabled", func() {

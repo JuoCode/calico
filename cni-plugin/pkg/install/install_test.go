@@ -1,28 +1,30 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 package install
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
+	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
 var expectedDefaultConfig string = `{
   "name": "k8s-pod-network",
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "plugins": [
     {
       "type": "calico",
@@ -33,7 +35,9 @@ var expectedDefaultConfig string = `{
       "mtu": 1500,
       "ipam": {"type": "calico-ipam"},
       "policy": {"type": "k8s"},
-      "kubernetes": {"kubeconfig": "/etc/cni/net.d/calico-kubeconfig"}
+      "kubernetes": {"kubeconfig": "/etc/cni/net.d/calico-kubeconfig"},
+      "require_mtu_file": false,
+      "calico_api_group": "crd.projectcalico.org/v1"
     },
     {
       "type": "portmap",
@@ -84,12 +88,14 @@ func runCniContainer(tempDir string, binFolderWriteable bool, extraArgs ...strin
 	}
 	args := []string{
 		"run", "--rm", "--name", name,
+		"--user", "0",
 		"--net=host",
 		"-e", "SLEEP=false",
 		"-e", "KUBERNETES_SERVICE_HOST=127.0.0.1",
 		"-e", "KUBERNETES_SERVICE_PORT=6443",
 		"-e", "KUBERNETES_NODE_NAME=my-node",
 		"-e", "KUBECONFIG=/home/user/certs/kubeconfig",
+		"-e", "TEST_FILE_PERMISSION=0644",
 		"-v", tempDir + "/bin:" + binFolder,
 		"-v", tempDir + "/net.d:/host/etc/cni/net.d",
 		"-v", tempDir + "/serviceaccount:/var/run/secrets/kubernetes.io/serviceaccount",
@@ -97,7 +103,7 @@ func runCniContainer(tempDir string, binFolderWriteable bool, extraArgs ...strin
 	}
 	args = append(args, extraArgs...)
 	image := os.Getenv("CONTAINER_NAME")
-	args = append(args, image, "/opt/cni/bin/install")
+	args = append(args, image, "component", "cni", "install")
 
 	out, err = exec.Command("docker", args...).CombinedOutput()
 	_, writeErr := GinkgoWriter.Write(out)
@@ -166,15 +172,15 @@ var _ = Describe("CNI installation tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Make subdirectories for where we expect binaries and config to be installed.
-		err = os.MkdirAll(tempDir+"/bin", 0755)
+		err = os.MkdirAll(tempDir+"/bin", 0o755)
 		if err != nil {
 			Fail("Failed to create directory tmp/bin")
 		}
-		err = os.MkdirAll(tempDir+"/net.d", 0755)
+		err = os.MkdirAll(tempDir+"/net.d", 0o755)
 		if err != nil {
 			Fail("Failed to create directory tmp/net.d")
 		}
-		err = os.MkdirAll(tempDir+"/serviceaccount", 0755)
+		err = os.MkdirAll(tempDir+"/serviceaccount", 0o755)
 		if err != nil {
 			Fail("Failed to create directory tmp/serviceaccount")
 		}
@@ -182,7 +188,7 @@ var _ = Describe("CNI installation tests", func() {
 		// Create token file for the Kubernetes client.
 		k8sSecret := []byte("my-secret-key")
 		tokenFile := fmt.Sprintf("%s/serviceaccount/token", tempDir)
-		err = os.WriteFile(tokenFile, k8sSecret, 0755)
+		err = os.WriteFile(tokenFile, k8sSecret, 0o755)
 		if err != nil {
 			Fail(fmt.Sprintf("Failed to write k8s secret file: %v", err))
 		}
@@ -211,15 +217,15 @@ yvQ/7I8lUKV1hMeCWc2k/x146B/gEgyDl1zUNnJZ/hrKmXqjQy3dkj4HzBePHYND
 PuB/TL+u2y+iQUyXxLy3
 -----END CERTIFICATE-----`)
 		caFile := fmt.Sprintf("%s/serviceaccount/ca.crt", tempDir)
-		err = os.WriteFile(caFile, k8sCA, 0755)
+		err = os.WriteFile(caFile, k8sCA, 0o755)
 		if err != nil {
 			Fail(fmt.Sprintf("Failed to write k8s CA file for test: %v", err))
 		}
 
 		// Create namespace file for token refresh
 		k8sNamespace := []byte("kube-system")
-		var namespaceFile = fmt.Sprintf("%s/serviceaccount/namespace", tempDir)
-		err = os.WriteFile(namespaceFile, k8sNamespace, 0755)
+		namespaceFile := fmt.Sprintf("%s/serviceaccount/namespace", tempDir)
+		err = os.WriteFile(namespaceFile, k8sNamespace, 0o755)
 		if err != nil {
 			Fail(fmt.Sprintf("Failed to write k8s namespace file: %v", err))
 		}
@@ -236,7 +242,7 @@ PuB/TL+u2y+iQUyXxLy3
 
 	AfterEach(func() {
 		// Cleanup temp directory
-		os.RemoveAll(tempDir)
+		_ = os.RemoveAll(tempDir)
 		// Cleanup calico-node service account
 		err := createKubernetesClient().CoreV1().ServiceAccounts("kube-system").Delete(context.Background(), "calico-cni-plugin", metav1.DeleteOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -299,6 +305,32 @@ PuB/TL+u2y+iQUyXxLy3
 		Expect(err).To(HaveOccurred())
 	})
 
+	It("should succeed on read-only bin dir when calico is pre-installed and UPDATE_CNI_BINARIES=false", func() {
+		// Pre-populate the host bin dir with stub calico and calico-ipam binaries
+		// so the install can detect that it has nothing left to do, even though the
+		// directory is mounted read-only. Covers projectcalico/calico#7486.
+		Expect(os.WriteFile(tempDir+"/bin/calico", []byte("stub"), 0o755)).To(Succeed())
+		Expect(os.WriteFile(tempDir+"/bin/calico-ipam", []byte("stub"), 0o755)).To(Succeed())
+		err := runCniContainer(
+			tempDir, false,
+			"-v", tempDir+"/secondary-bin-dir:/host/secondary-bin-dir:ro",
+			"-e", "UPDATE_CNI_BINARIES=false",
+		)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should fail on read-only bin dir when calico-ipam is missing and UPDATE_CNI_BINARIES=false", func() {
+		// Only calico is present, so the read-only fallback must not report
+		// success: kubelet would later fail when it invokes calico-ipam.
+		Expect(os.WriteFile(tempDir+"/bin/calico", []byte("stub"), 0o755)).To(Succeed())
+		err := runCniContainer(
+			tempDir, false,
+			"-v", tempDir+"/secondary-bin-dir:/host/secondary-bin-dir:ro",
+			"-e", "UPDATE_CNI_BINARIES=false",
+		)
+		Expect(err).To(HaveOccurred())
+	})
+
 	It("should support CNI_CONF_NAME", func() {
 		err := runCniContainer(tempDir, true, "-e", "CNI_CONF_NAME=20-calico.conflist")
 		Expect(err).NotTo(HaveOccurred())
@@ -322,7 +354,7 @@ PuB/TL+u2y+iQUyXxLy3
 		// Write the alternate configuration to disk so it can be picked up by
 		// the CNI container.
 		altConfigFile := tempDir + "/net.d/alternate-config"
-		err := os.WriteFile(altConfigFile, []byte(expectedAlternateConfig), 0755)
+		err := os.WriteFile(altConfigFile, []byte(expectedAlternateConfig), 0o755)
 		Expect(err).NotTo(HaveOccurred())
 		err = runCniContainer(
 			tempDir, true,
@@ -362,12 +394,12 @@ PuB/TL+u2y+iQUyXxLy3
 	Context("copying /calico-secrets", func() {
 		var err error
 		BeforeEach(func() {
-			err = os.MkdirAll(tempDir+"/certs", 0755)
+			err = os.MkdirAll(tempDir+"/certs", 0o755)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("Should not crash or copy when having a hidden file", func() {
-			err = os.WriteFile(tempDir+"/certs/.hidden", []byte("doesn't matter"), 0644)
+			err = os.WriteFile(tempDir+"/certs/.hidden", []byte("doesn't matter"), 0o644)
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write hidden file: %v", err))
 			err = runCniContainer(tempDir, true, "-v", tempDir+"/certs:/calico-secrets")
 			Expect(err).NotTo(HaveOccurred())
@@ -375,7 +407,7 @@ PuB/TL+u2y+iQUyXxLy3
 			Expect(err).To(HaveOccurred())
 		})
 		It("Should copy a non-hidden file", func() {
-			err = os.WriteFile(tempDir+"/certs/etcd-cert", []byte("doesn't matter"), 0644)
+			err = os.WriteFile(tempDir+"/certs/etcd-cert", []byte("doesn't matter"), 0o644)
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 			err = runCniContainer(tempDir, true, "-v", tempDir+"/certs:/calico-secrets", "-e", "CNI_NETWORK_CONFIG={\"etcd_cert\": \"__ETCD_CERT_FILE__\"}")
 			Expect(err).NotTo(HaveOccurred())
@@ -416,14 +448,14 @@ var _ = Describe("file comparison tests", func() {
 
 	AfterEach(func() {
 		// Cleanup temp directory
-		os.RemoveAll(tempDir)
+		_ = os.RemoveAll(tempDir)
 	})
 
 	It("should compare two equal files", func() {
 		// Write two identical files.
-		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0644)
+		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", []byte("doesn't matter"), 0644)
+		err = os.WriteFile(tempDir+"/dstFile", []byte("doesn't matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are equal.
@@ -434,9 +466,9 @@ var _ = Describe("file comparison tests", func() {
 
 	It("should compare two unequal files", func() {
 		// Write two files with different contents.
-		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0644)
+		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", []byte("it does matter"), 0644)
+		err = os.WriteFile(tempDir+"/dstFile", []byte("it does matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are not equal.
@@ -447,9 +479,9 @@ var _ = Describe("file comparison tests", func() {
 
 	It("should compare two unequal files of the same size", func() {
 		// Write two files with different contents, but same total size.
-		err := os.WriteFile(tempDir+"/srcFile", []byte("foobar"), 0644)
+		err := os.WriteFile(tempDir+"/srcFile", []byte("foobar"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", []byte("barfoo"), 0644)
+		err = os.WriteFile(tempDir+"/dstFile", []byte("barfoo"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are not equal.
@@ -460,13 +492,13 @@ var _ = Describe("file comparison tests", func() {
 
 	It("should compare two files with differing file modes", func() {
 		// Write two identical files.
-		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0644)
+		err := os.WriteFile(tempDir+"/srcFile", []byte("doesn't matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", []byte("doesn't matter"), 0644)
+		err = os.WriteFile(tempDir+"/dstFile", []byte("doesn't matter"), 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// For whatever reason, we need to explicitly chmod the file to get the permissions to change.
-		Expect(os.Chmod(tempDir+"/dstFile", 0777)).NotTo(HaveOccurred())
+		Expect(os.Chmod(tempDir+"/dstFile", 0o777)).NotTo(HaveOccurred())
 
 		// Assert that they are not equal.
 		match, err := destinationUptoDate(tempDir+"/srcFile", tempDir+"/dstFile")
@@ -475,12 +507,12 @@ var _ = Describe("file comparison tests", func() {
 	})
 
 	It("should compare a big file with a small file", func() {
-		err := os.WriteFile(tempDir+"/srcFile", bigFile, 0644)
+		err := os.WriteFile(tempDir+"/srcFile", bigFile, 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Here we use the first 10 bytes from "bigFile" to be extra tricky, to make sure
 		// we spot if the files partially match.
-		err = os.WriteFile(tempDir+"/dstFile", bigFile[:10], 0644)
+		err = os.WriteFile(tempDir+"/dstFile", bigFile[:10], 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are not equal.
@@ -492,9 +524,9 @@ var _ = Describe("file comparison tests", func() {
 	It("should compare a small file with a big file", func() {
 		// Here we use the first 10 bytes from "bigFile" to be extra tricky, to make sure
 		// we spot if the files partially match.
-		err := os.WriteFile(tempDir+"/srcFile", bigFile[:10], 0644)
+		err := os.WriteFile(tempDir+"/srcFile", bigFile[:10], 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", bigFile, 0644)
+		err = os.WriteFile(tempDir+"/dstFile", bigFile, 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are not equal.
@@ -506,9 +538,9 @@ var _ = Describe("file comparison tests", func() {
 	It("should compare two files larger than the buffer size, that differ slightly", func() {
 		// Grab a slightly different number of bytes, ensuring that both are large enough
 		// to require a second loop iteration.
-		err := os.WriteFile(tempDir+"/srcFile", bigFile[:128002], 0644)
+		err := os.WriteFile(tempDir+"/srcFile", bigFile[:128002], 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", bigFile[:128003], 0644)
+		err = os.WriteFile(tempDir+"/dstFile", bigFile[:128003], 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are not equal.
@@ -518,9 +550,9 @@ var _ = Describe("file comparison tests", func() {
 	})
 
 	It("should compare two identical files larger than the buffer size", func() {
-		err := os.WriteFile(tempDir+"/srcFile", bigFile, 0644)
+		err := os.WriteFile(tempDir+"/srcFile", bigFile, 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
-		err = os.WriteFile(tempDir+"/dstFile", bigFile, 0644)
+		err = os.WriteFile(tempDir+"/dstFile", bigFile, 0o644)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to write file: %v", err))
 
 		// Assert that they are equal.
@@ -536,4 +568,57 @@ func expectFileContents(filename, expected string) {
 	ExpectWithOffset(0, string(actual)).To(Equal(expected), fmt.Sprintf(
 		"actual file (%s) differed from expected contents.\nActual: (%s)\nExpected: (%s)",
 		filename, string(actual), string(expected)))
+}
+
+func TestCalculateKubeconfig_IPv4_NoBrackets(t *testing.T) {
+	// Ensure env vars are restored after the test using t.Setenv
+	t.Setenv("KUBERNETES_SERVICE_PROTOCOL", "")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "6443")
+
+	cfg := &rest.Config{TLSClientConfig: rest.TLSClientConfig{CAData: []byte("my-ca-data")}}
+	out := calculateKubeconfig(cfg, "my-token")
+
+	if !strings.Contains(out, "server: https://127.0.0.1:6443") {
+		t.Fatalf("expected IPv4 host to not be wrapped in brackets; got:\n%s", out)
+	}
+
+	expectedCA := base64.StdEncoding.EncodeToString(cfg.CAData)
+	if !strings.Contains(out, "certificate-authority-data: "+expectedCA) {
+		t.Fatalf("expected certificate-authority-data to be present; got:\n%s", out)
+	}
+
+	if !strings.Contains(out, "token: my-token") {
+		t.Fatalf("expected token to be present; got:\n%s", out)
+	}
+}
+
+func TestCalculateKubeconfig_IPv6_Wrapped(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_PROTOCOL", "https")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "2001:db8::1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "6443")
+
+	cfg := &rest.Config{TLSClientConfig: rest.TLSClientConfig{CAData: []byte("my-ca-data")}}
+	out := calculateKubeconfig(cfg, "tok")
+
+	if !strings.Contains(out, "server: https://[2001:db8::1]:6443") {
+		t.Fatalf("expected IPv6 host to be wrapped in brackets; got:\n%s", out)
+	}
+}
+
+func TestCalculateKubeconfig_SkipTLSVerify(t *testing.T) {
+	t.Setenv("SKIP_TLS_VERIFY", "true")
+	t.Setenv("KUBERNETES_SERVICE_PROTOCOL", "https")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "6443")
+
+	cfg := &rest.Config{TLSClientConfig: rest.TLSClientConfig{CAData: []byte("my-ca-data")}}
+	out := calculateKubeconfig(cfg, "tok")
+
+	if !strings.Contains(out, "insecure-skip-tls-verify: true") {
+		t.Fatalf("expected insecure-skip-tls-verify: true to be present; got:\n%s", out)
+	}
+	if strings.Contains(out, "certificate-authority-data:") {
+		t.Fatalf("did not expect certificate-authority-data when SKIP_TLS_VERIFY=true; got:\n%s", out)
+	}
 }

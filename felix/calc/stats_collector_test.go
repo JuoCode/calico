@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,18 +17,19 @@ package calc_test
 import (
 	"errors"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	. "github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	. "github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
 
 var (
-	localHostIPKey   = HostIPKey{Hostname: localHostname}
-	remoteHostIPKey  = HostIPKey{Hostname: remoteHostname}
-	remoteHost2IPKey = HostIPKey{Hostname: remoteHostname2}
+	localHostNodeKey   = ResourceKey{Kind: internalapi.KindNode, Name: localHostname}
+	remoteHostNodeKey  = ResourceKey{Kind: internalapi.KindNode, Name: remoteHostname}
+	remoteHost2NodeKey = ResourceKey{Kind: internalapi.KindNode, Name: remoteHostname2}
 )
 
 var _ = Describe("Stats collector", func() {
@@ -48,7 +49,7 @@ var _ = Describe("Stats collector", func() {
 	Describe("before in-sync", func() {
 		It("should do nothing on IP update", func() {
 			sc.OnUpdate(api.Update{
-				KVPair:     KVPair{Key: localHostIPKey},
+				KVPair:     KVPair{Key: localHostNodeKey},
 				UpdateType: api.UpdateTypeKVNew,
 			})
 			Expect(lastStatsUpdate).To(BeNil())
@@ -61,7 +62,7 @@ var _ = Describe("Stats collector", func() {
 			Expect(lastStatsUpdate).To(BeNil())
 		})
 		It("should do nothing on policy count update", func() {
-			sc.UpdatePolicyCounts(10, 10, 10)
+			sc.UpdatePolicyCounts(5, 10, 10, 10)
 			Expect(lastStatsUpdate).To(BeNil())
 		})
 	})
@@ -71,7 +72,7 @@ var _ = Describe("Stats collector", func() {
 			sc.OnStatusUpdate(api.InSync)
 		})
 		It("should count an IP create", func() {
-			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostIPKey}, UpdateType: api.UpdateTypeKVNew})
+			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostNodeKey}, UpdateType: api.UpdateTypeKVNew})
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{NumHosts: 1}))
 		})
 		It("should count a workload create", func() {
@@ -96,19 +97,20 @@ var _ = Describe("Stats collector", func() {
 			}))
 		})
 		It("should count a policy", func() {
-			sc.UpdatePolicyCounts(1, 0, 0)
+			sc.UpdatePolicyCounts(1, 1, 0, 0)
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{
+				NumTiers:    1,
 				NumPolicies: 1,
 			}))
 		})
 		It("should count a profile", func() {
-			sc.UpdatePolicyCounts(0, 1, 0)
+			sc.UpdatePolicyCounts(0, 0, 1, 0)
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{
 				NumProfiles: 1,
 			}))
 		})
 		It("should count a ALP policy", func() {
-			sc.UpdatePolicyCounts(0, 0, 1)
+			sc.UpdatePolicyCounts(0, 0, 0, 1)
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{
 				NumALPPolicies: 1,
 			}))
@@ -120,19 +122,19 @@ var _ = Describe("Stats collector", func() {
 			Expect(lastStatsUpdate).To(BeNil())
 		})
 		It("should ignore idempotent updates", func() {
-			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostIPKey}, UpdateType: api.UpdateTypeKVNew})
+			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostNodeKey}, UpdateType: api.UpdateTypeKVNew})
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{NumHosts: 1}))
 			lastStatsUpdate = nil
-			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostIPKey}, UpdateType: api.UpdateTypeKVUpdated})
+			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostNodeKey}, UpdateType: api.UpdateTypeKVUpdated})
 			Expect(lastStatsUpdate).To(BeNil())
 		})
 		It("should handle errors from the callback", func() {
 			updateErr = errors.New("dummy error")
-			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostIPKey}, UpdateType: api.UpdateTypeKVNew})
+			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostNodeKey}, UpdateType: api.UpdateTypeKVNew})
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{NumHosts: 1}))
 			lastStatsUpdate = nil
 			// Now send an update, which would normally not call the callback.
-			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostIPKey}, UpdateType: api.UpdateTypeKVUpdated})
+			sc.OnUpdate(api.Update{KVPair: KVPair{Key: localHostNodeKey}, UpdateType: api.UpdateTypeKVUpdated})
 			Expect(*lastStatsUpdate).To(Equal(StatsUpdate{NumHosts: 1}))
 		})
 

@@ -35,10 +35,10 @@ class TestCalicoctlCLIFlags(TestBase):
         """
         # no -m flag
         rc = calicoctl("-m")
-        rc.assert_error(text="Invalid option: '--allow-version-mismatch -m'.")
+        rc.assert_error(text="unknown shorthand flag: 'm' in -m")
         # no --unknown-flag flag
         rc = calicoctl("--unknown-flag")
-        rc.assert_error(text="Invalid option: '--allow-version-mismatch --unknown-flag'.")
+        rc.assert_error(text="unknown flag: --unknown-flag")
 
     def test_version_mismatch(self):
         """
@@ -52,7 +52,7 @@ class TestCalicoctlCLIFlags(TestBase):
         # The "datastore migrate import" command bypasses version mismatch checking
         rc = calicoctl("datastore migrate import -f a", allowVersionMismatch=False)
         # Assert that the error is not "version mismatch"
-        rc.assert_error("Invalid datastore type")
+        rc.assert_error("invalid datastore type")
 
         # CalicoVersion is unset in the cluster, expect no error
         rc = calicoctl("replace", data=node_name1_rev1, allowVersionMismatch=False)
@@ -72,4 +72,4 @@ class TestCalicoctlCLIFlags(TestBase):
 
         # CalicoVersion is incorrect in the cluster, expect error
         rc = calicoctl("replace", data=node_name1_rev1, allowVersionMismatch=False)
-        rc.assert_error("Version mismatch.")
+        rc.assert_error("version mismatch.")

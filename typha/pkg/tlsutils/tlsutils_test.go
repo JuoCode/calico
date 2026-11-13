@@ -19,7 +19,7 @@ import (
 	"crypto/x509"
 	"fmt"
 
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
@@ -167,11 +167,11 @@ func errChecker(certConfig *certConfig, typhaConfig *typhaConfig) func(error) {
 	}
 	if typhaConfig.CN != "" && typhaConfig.URISAN != "" {
 		// Required CN and URISAN both specified.
-		return expectErrorMessage("Peer certificate does not have required CN or URI SAN")
+		return expectErrorMessage("peer certificate does not have required CN or URI SAN")
 	} else if typhaConfig.CN != "" {
-		return expectErrorMessage("Peer certificate does not have required CN")
+		return expectErrorMessage("peer certificate does not have required CN")
 	} else if typhaConfig.URISAN != "" {
-		return expectErrorMessage("Peer certificate does not have required URI SAN")
+		return expectErrorMessage("peer certificate does not have required URI SAN")
 	}
 	return expectOK
 }
@@ -201,7 +201,7 @@ var _ = DescribeTable("CertificateVerifier",
 		err := verifier([][]byte{peerCertBytes}, nil)
 		errChecker(err)
 	},
-	genTestCases()...)
+	genTestCases())
 
 func makePeerCert(cfg *certConfig) []byte {
 	log.WithField("cfg", cfg).Info("Make peer cert")

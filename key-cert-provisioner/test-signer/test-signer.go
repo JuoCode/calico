@@ -26,14 +26,12 @@ import (
 	"os"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+	certv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-
-	log "github.com/sirupsen/logrus"
-
-	certv1 "k8s.io/api/certificates/v1"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -85,7 +83,7 @@ func main() {
 		log.Fatal("No key found")
 	}
 
-	var parsedKey interface{}
+	var parsedKey any
 	if parsedKey, err = x509.ParsePKCS1PrivateKey(keyDER.Bytes); err != nil {
 		if parsedKey, err = x509.ParsePKCS8PrivateKey(keyDER.Bytes); err != nil {
 			log.Fatal(err)
@@ -176,7 +174,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("unexpected err when updating csr: %v", err)
 			}
-			log.Infof("CSR Signed: %v", r.ObjectMeta.Name)
+			log.Infof("CSR Signed: %v", r.Name)
 		} else if len(csr.Status.Conditions) == 0 && approve {
 			cert.Status.Conditions = []certv1.CertificateSigningRequestCondition{
 				{

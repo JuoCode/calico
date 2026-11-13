@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 package updateprocessors_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/updateprocessors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -62,9 +62,9 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 			Key: v1NetworkSetKey1,
 			Value: &model.NetworkSet{
 				Nets: []net.IPNet{*cidr1IPNet},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					apiv3.LabelNamespace: ns1,
-				},
+				}),
 				ProfileIDs: []string{
 					"kns." + ns1,
 				},
@@ -75,7 +75,10 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 		By("adding another CIDR to the existing NetworkSet")
 		cidr2str := "1.2.3.123/32"
 		_, cidr2IPNet, _ := net.ParseCIDROrIP(cidr2str)
-		res.Spec.Nets = []string{cidr1str, cidr2str}
+		res.Spec.Nets = []string{
+			cidr1str,
+			cidr2str,
+		}
 
 		kvps, err = up.Process(&model.KVPair{
 			Key:      v3NetworkSetKey1,
@@ -88,9 +91,9 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 			Key: v1NetworkSetKey1,
 			Value: &model.NetworkSet{
 				Nets: []net.IPNet{*cidr1IPNet, *cidr2IPNet},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					apiv3.LabelNamespace: ns1,
-				},
+				}),
 				ProfileIDs: []string{
 					"kns." + ns1,
 				},
@@ -108,6 +111,26 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 				Key: v1NetworkSetKey1,
 			},
 		}))
+	})
+
+	It("should skip invalid CIDRs without panicking", func() {
+		up := updateprocessors.NewNetworkSetUpdateProcessor()
+
+		res := apiv3.NewNetworkSet()
+		res.Name = name1
+		res.Namespace = ns1
+		res.Spec.Nets = []string{"10.2402.0.0/16", cidr1str}
+
+		kvps, err := up.Process(&model.KVPair{
+			Key:      v3NetworkSetKey1,
+			Value:    res,
+			Revision: "abcde",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvps).To(HaveLen(1))
+
+		ns := kvps[0].Value.(*model.NetworkSet)
+		Expect(ns.Nets).To(Equal([]net.IPNet{*cidr1IPNet}))
 	})
 
 	It("should fail to convert an invalid resource", func() {
@@ -130,9 +153,9 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 			Key: v1NetworkSetKey1,
 			Value: &model.NetworkSet{
 				Nets: []net.IPNet{*cidr1IPNet},
-				Labels: map[string]string{
+				Labels: uniquelabels.Make(map[string]string{
 					apiv3.LabelNamespace: ns1,
-				},
+				}),
 				ProfileIDs: []string{
 					"kns." + ns1,
 				},
@@ -141,7 +164,7 @@ var _ = Describe("Test the NetworkSet update processor", func() {
 		}))
 		_, err = up.Process(&model.KVPair{
 			Key: model.GlobalBGPPeerKey{
-				PeerIP: net.MustParseIP("1.2.3.4"),
+				PeerIP: model.AddrFromIP(net.MustParseIP("1.2.3.4")),
 			},
 			Value:    res,
 			Revision: "abcde",

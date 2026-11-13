@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -21,40 +21,20 @@ package server
 import (
 	"flag"
 	"io"
-	"os"
-
-	genericoptions "k8s.io/apiserver/pkg/server/options"
-
-	"github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
-
-	"k8s.io/kubernetes/pkg/util/interrupt"
 
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"k8s.io/klog/v2"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
+
+	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
 )
 
 const defaultEtcdPathPrefix = ""
 
-func logrusLevel() logrus.Level {
-	if env := os.Getenv("LOG_LEVEL"); env != "" {
-		return logutils.SafeParseLogLevel(env)
-	}
-
-	if klog.V(2).Enabled() {
-		return logrus.DebugLevel
-	}
-	if klog.V(1).Enabled() {
-		return logrus.InfoLevel
-	}
-	return logrus.ErrorLevel
-}
-
-func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, error) {
+// NewCommandStartMaster provides a CLI handler for 'start master' command
+func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, *CalicoServerOptions, error) {
 	//	o := NewCalicoServerOptions(out, errOut)
 
 	// Create the command that runs the API server
@@ -67,32 +47,27 @@ func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, error) {
 	flags := cmd.Flags()
 	flags.AddGoFlagSet(flag.CommandLine)
 
-	stopCh := make(chan struct{})
-
 	ro := genericoptions.NewRecommendedOptions(defaultEtcdPathPrefix, apiserver.Codecs.LegacyCodec(v3.SchemeGroupVersion))
 	opts := &CalicoServerOptions{
 		RecommendedOptions: ro,
-		StopCh:             stopCh,
 	}
 	opts.addFlags(flags)
 
 	cmd.Run = func(c *cobra.Command, args []string) {
-		logrus.SetLevel(logrusLevel())
+		configureLogging()
 
-		h := interrupt.New(nil, func() {
-			close(stopCh)
-		})
-		if err := h.Run(func() error {
-			server, err := PrepareServer(opts)
-			if err != nil {
-				return err
-			}
-			return RunServer(opts, server)
-		}); err != nil {
-			klog.Fatalf("error running server (%s)", err)
-			return
+		// The first SIGINT or SIGTERM starts graceful shutdown and a second exits immediately. It panics if called
+		// twice, so it lives here rather than where the command is built.
+		opts.StopCh = genericapiserver.SetupSignalHandler()
+
+		server, err := PrepareServer(opts)
+		if err != nil {
+			logrus.WithError(err).Fatal("Error preparing the API server")
+		}
+		if err := RunServer(opts, server); err != nil {
+			logrus.WithError(err).Fatal("Error running the API server")
 		}
 	}
 
-	return cmd, nil
+	return cmd, opts, nil
 }

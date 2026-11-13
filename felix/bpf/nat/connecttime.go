@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,199 +15,229 @@
 package nat
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
-	"github.com/projectcalico/calico/felix/bpf/bpfutils"
 	"github.com/projectcalico/calico/felix/bpf/jump"
 	"github.com/projectcalico/calico/felix/bpf/libbpf"
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/utils"
 )
 
-type cgroupProgs struct {
-	ID          int    `json:"id"`
-	AttachType  string `json:"attach_type"`
-	AttachFlags string `json:"attach_flags"`
-	Name        string `json:"name"`
-}
-
 const (
-	ProgIndexCTLBConnectV6 = iota
-	ProgIndexCTLBSendV6
-	ProgIndexCTLBRecvV6
+	MapIndexCTLBConnectV6 = iota
+	MapIndexCTLBSendV6
+	MapIndexCTLBRecvV6
 )
 
 var ctlbProgToIndex = map[string]int{
-	"calico_connect_v6": ProgIndexCTLBConnectV6,
-	"calico_sendmsg_v6": ProgIndexCTLBSendV6,
-	"calico_recvmsg_v6": ProgIndexCTLBRecvV6,
+	"calico_connect_v6": MapIndexCTLBConnectV6,
+	"calico_sendmsg_v6": MapIndexCTLBSendV6,
+	"calico_recvmsg_v6": MapIndexCTLBRecvV6,
 }
 
-var ProgramsMapParameters = maps.MapParameters{
+var ConnMapParameters = maps.MapParameters{
 	Type:       "prog_array",
 	KeySize:    4,
 	ValueSize:  4,
-	MaxEntries: 3,
-	Name:       "cali_ctlb_progs",
+	MaxEntries: 1,
+	Name:       "cali_ctlb_conn",
 }
 
-func newProgramsMap() maps.Map {
-	return maps.NewPinnedMap(ProgramsMapParameters)
+var SendMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: 1,
+	Name:       "cali_ctlb_send",
 }
 
-func RemoveConnectTimeLoadBalancer(cgroupv2 string) error {
+var RecvMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: 1,
+	Name:       "cali_ctlb_recv",
+}
+
+func ProgramsMaps() []maps.Map {
+	return []maps.Map{
+		maps.NewPinnedMap(ConnMapParameters),
+		maps.NewPinnedMap(SendMapParameters),
+		maps.NewPinnedMap(RecvMapParameters),
+	}
+}
+
+func RemoveConnectTimeLoadBalancer(ipv4Enabled bool, cgroupv2 string) error {
 	if os.Getenv("FELIX_DebugSkipCTLBCleanup") == "true" {
 		log.Info("FV special case: skipping CTLB cleanup")
 		return nil
 	}
 
-	cgroupPath, err := ensureCgroupPath(cgroupv2)
+	bpfMount, err := utils.MaybeMountBPFfs()
 	if err != nil {
-		return errors.Wrap(err, "failed to set-up cgroupv2")
+		return fmt.Errorf("failed to mount bpffs: %w", err)
 	}
 
-	cmd := exec.Command("bpftool", "-j", "-p", "cgroup", "show", cgroupPath)
-	log.WithField("args", cmd.Args).Info("Running bpftool to look up programs attached to cgroup")
-	out, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(out)) == "" {
-		log.WithError(err).WithField("output", string(out)).Info(
-			"Failed to list BPF programs.  Assuming not supported/nothing to clean up.")
-		return err
-	}
-
-	var progs []cgroupProgs
-
-	err = json.Unmarshal(out, &progs)
-	if err != nil {
-		log.WithError(err).WithField("output", string(out)).Error("BPF program list not json.")
-		return err
-	}
-
-	for _, p := range progs {
-		if !strings.HasPrefix(p.Name, "cali_") {
-			continue
+	pinDir := path.Join(bpfMount, bpfdefs.CtlbPinDir)
+	defer bpf.CleanUpCalicoPins(pinDir)
+	ctlbProgsMap := ProgramsMaps()
+	for _, index := range ctlbProgToIndex {
+		if err := ctlbProgsMap[index].EnsureExists(); err != nil {
+			return fmt.Errorf("failed to create ctlb jump map: %w", err)
 		}
+	}
+	for _, index := range ctlbProgToIndex {
+		err := ctlbProgsMap[index].Delete(jump.Key(0))
+		if err != nil && !os.IsNotExist(err) {
+			log.Errorf("failed to delete the ctlb jump map entry: %s", err)
+		}
+	}
+	for _, index := range ctlbProgToIndex {
+		ctlbProgsMap[index].Close()
+		os.Remove(ctlbProgsMap[index].Path())
+	}
 
-		cmd = exec.Command("bpftool", "cgroup", "detach", cgroupPath, p.AttachType, "id", strconv.Itoa(p.ID))
-		log.WithField("args", cmd.Args).Info("Running bpftool to detach program")
-		out, err = cmd.CombinedOutput()
+	if err := detachCtlbPrograms(pinDir); err != nil {
+		return err
+	}
+	bpf.CleanUpCalicoPins(pinDir)
+	return nil
+}
+
+func detachCtlbPrograms(pinDir string) error {
+	err := filepath.Walk(pinDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.WithError(err).WithField("output", string(out)).Error(
-				"Failed to detach connect-time load balancing program.")
 			return err
 		}
+		if strings.HasPrefix(info.Name(), "cali_") || strings.HasPrefix(info.Name(), "calico_") {
+			log.WithField("path", path).Debug("Detaching pinned link")
+			link, err := libbpf.OpenLink(path)
+			if err != nil {
+				log.WithField("path", path).Error("Error opening link")
+				return err
+			}
+			defer link.Close()
+			err = link.Detach()
+			if err != nil {
+				log.WithField("path", path).Error("Error detaching link")
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		log.WithError(err).Error("error detaching link")
+		return err
 	}
-
-	bpf.CleanUpCalicoPins("/sys/fs/bpf/calico_connect4")
-	ctlbProgsMap := newProgramsMap()
-	os.Remove(ctlbProgsMap.Path())
-
 	return nil
 }
 
 func loadProgram(logLevel, ipver string, udpNotSeen time.Duration, excludeUDP bool) (*libbpf.Obj, error) {
 	filename := path.Join(bpfdefs.ObjectDir, ProgFileName(logLevel, ipver))
-
-	log.WithField("filename", filename).Debug("Loading object file")
-	obj, err := libbpf.OpenObject(filename)
+	obj, err := bpf.LoadObject(filename, &libbpf.CTLBGlobalData{UDPNotSeen: udpNotSeen, ExcludeUDP: excludeUDP})
 	if err != nil {
-		return nil, fmt.Errorf("failed to load %s: %w", filename, err)
-	}
-
-	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
-		// In case of global variables, libbpf creates an internal map <prog_name>.rodata
-		// The values are read only for the BPF programs, but can be set to a value from
-		// userspace before the program is loaded.
-		mapName := m.Name()
-		if m.IsMapInternal() {
-			if strings.HasPrefix(mapName, ".rodata") {
-				continue
-			}
-			if err := libbpf.CTLBSetGlobals(m, udpNotSeen, excludeUDP); err != nil {
-				return nil, fmt.Errorf("error setting globals: %w", err)
-			}
-			continue
-		}
-
-		if size := maps.Size(mapName); size != 0 {
-			err := m.SetSize(size)
-			if err != nil {
-				return nil, fmt.Errorf("error set map size %s: %w", m.Name(), err)
-			}
-		}
-		if err := m.SetPinPath(path.Join(bpfdefs.GlobalPinDir, mapName)); err != nil {
-			return nil, fmt.Errorf("error pinning map %s: %w", mapName, err)
-		}
-		log.WithFields(log.Fields{"obj": filename, "map": mapName}).Debug("Pinned map")
-	}
-
-	if err := obj.Load(); err != nil {
-		return nil, fmt.Errorf("error loading object %s: %w", filename, err)
+		return nil, fmt.Errorf("error loading %s:%w", filename, err)
 	}
 	return obj, nil
 }
 
-func attachProgram(name, ipver, bpfMount, cgroupPath string, udpNotSeen time.Duration, excludeUDP bool, obj *libbpf.Obj) error {
-
-	progPinDir := path.Join(bpfMount, "calico_connect4")
-	_ = os.RemoveAll(progPinDir)
-
-	progName := "calico_" + name + "_v" + ipver
-
-	// N.B. no need to remember the link since we are never going to detach
-	// these programs unless Felix restarts.
-	if _, err := obj.AttachCGroup(cgroupPath, progName); err != nil {
-		return fmt.Errorf("failed to attach program %s: %w", progName, err)
+// tryUpdateExistingCTLBLink updates the program behind a previously-pinned
+// cgroup link. It returns needsReattach=true if the pin should be discarded and
+// the caller should perform a fresh AttachCGroup + Pin — currently that means
+// the kernel reported ENOLINK, i.e. the link was severed from the cgroup.
+func tryUpdateExistingCTLBLink(obj *libbpf.Obj, progName, progPinPath string) (needsReattach bool, err error) {
+	link, err := libbpf.OpenLink(progPinPath)
+	if err != nil {
+		return false, fmt.Errorf("error opening link %s : %w", progPinPath, err)
 	}
-
-	log.WithFields(log.Fields{"program": progName, "cgroup": cgroupPath}).Info("Loaded cgroup program")
-
-	return nil
+	defer link.Close()
+	if err := link.Update(obj, progName); err != nil {
+		if errors.Is(err, unix.ENOLINK) {
+			log.WithField("program", progName).Debug("Cgroup link severed, re-attaching")
+			if rmErr := os.Remove(progPinPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				return false, fmt.Errorf("error removing stale pin %s: %w", progPinPath, rmErr)
+			}
+			return true, nil
+		}
+		return false, fmt.Errorf("error updating program %s : %w", progName, err)
+	}
+	return false, nil
 }
 
-func updateCTLBJumpMap(jumpMap maps.Map, obj *libbpf.Obj) error {
-	for prog, index := range ctlbProgToIndex {
-		fd, err := obj.ProgramFD(prog)
+func attachProgram(name, ipver, bpfMount, cgroupPath string, obj *libbpf.Obj) error {
+	progName := "calico_" + name + "_v" + ipver
+	progPinPath := path.Join(bpfMount, progName)
+	if _, err := os.Stat(progPinPath); err == nil {
+		needsReattach, err := tryUpdateExistingCTLBLink(obj, progName, progPinPath)
 		if err != nil {
-			return fmt.Errorf("failed to get prog FD. Program = %s: %w", prog, err)
-		}
-
-		err = maps.UpdateMapEntry(jumpMap.MapFD(), jump.Key(index), jump.Value(uint32(fd)))
-		if err != nil {
-			log.WithError(err).Errorf("Failed to update %s map at index %d", prog, index)
 			return err
 		}
+		if !needsReattach {
+			return nil
+		}
+		// Pin existed but the underlying cgroup link was severed (e.g. cleared
+		// across a Felix restart). Fall through to a fresh AttachCGroup + Pin.
+	}
+
+	link, err := obj.AttachCGroup(cgroupPath, progName)
+	if err != nil {
+		return fmt.Errorf("failed to attach program %s: %w", progName, err)
+	}
+	if link != nil {
+		defer link.Close()
+		err := link.Pin(progPinPath)
+		if err != nil {
+			return fmt.Errorf("failed to pin program %s:%w", progName, err)
+		}
+	}
+	log.WithFields(log.Fields{"program": progName, "cgroup": cgroupPath}).Info("Loaded cgroup program")
+	return nil
+}
+
+func updateCTLBJumpMap(jumpMap maps.Map, obj *libbpf.Obj, prog string) error {
+	fd, err := obj.ProgramFD(prog)
+	if err != nil {
+		return fmt.Errorf("failed to get prog FD. Program = %s: %w", prog, err)
+	}
+
+	err = maps.UpdateMapEntry(jumpMap.MapFD(), jump.Key(0), jump.Value(uint32(fd)))
+	if err != nil {
+		log.WithError(err).Errorf("Failed to update %s map at index 0", prog)
+		return err
 	}
 	return nil
 }
 
-func InstallConnectTimeLoadBalancer(ipv4Enabled, ipv6Enabled bool, cgroupv2 string, logLevel string, udpNotSeen time.Duration, excludeUDP bool) error {
-
+func installCTLB(ipv4Enabled, ipv6Enabled bool, cgroupv2 string, logLevel string, udpNotSeen time.Duration, excludeUDP bool, ctlbProgsMap []maps.Map) error {
 	bpfMount, err := utils.MaybeMountBPFfs()
 	if err != nil {
 		log.WithError(err).Error("Failed to mount bpffs, unable to do connect-time load balancing")
 		return err
 	}
 
-	cgroupPath, err := ensureCgroupPath(cgroupv2)
-	if err != nil {
-		return errors.Wrap(err, "failed to set-up cgroupv2")
+	pinDir := path.Join(bpfMount, bpfdefs.CtlbPinDir)
+	if err = os.MkdirAll(pinDir, 0700); err != nil {
+		log.WithError(err).Error("Failed to create pin dir, unable to do connect-time load balancing")
+		return err
 	}
 
-	ctlbProgsMap := newProgramsMap()
-	var v4Obj, v46Obj, v6Obj *libbpf.Obj
+	cgroupPath, err := ensureCgroupPath(cgroupv2)
+	if err != nil {
+		return fmt.Errorf("failed to set-up cgroupv2: %w", err)
+	}
+
+	var v4Obj, v6Obj *libbpf.Obj
 
 	// Load and attach v4, v46 CTLB program.
 	if ipv4Enabled {
@@ -217,44 +247,40 @@ func InstallConnectTimeLoadBalancer(ipv4Enabled, ipv6Enabled bool, cgroupv2 stri
 		}
 		defer v4Obj.Close()
 
-		v46Obj, err = loadProgram(logLevel, "46", udpNotSeen, excludeUDP)
+		v46Obj, err := loadProgram(logLevel, "46", udpNotSeen, excludeUDP)
 		if err != nil {
 			return err
 		}
 		defer v46Obj.Close()
-		err = attachProgram("connect", "4", bpfMount, cgroupPath, udpNotSeen, excludeUDP, v4Obj)
+		err = attachProgram("connect", "4", pinDir, cgroupPath, v4Obj)
 		if err != nil {
 			return err
 		}
-		err = attachProgram("connect", "46", bpfMount, cgroupPath, udpNotSeen, excludeUDP, v46Obj)
+		err = attachProgram("connect", "46", pinDir, cgroupPath, v46Obj)
 		if err != nil {
 			return err
 		}
 
 		if !excludeUDP {
-			err = attachProgram("sendmsg", "4", bpfMount, cgroupPath, udpNotSeen, false, v4Obj)
+			err = attachProgram("sendmsg", "4", pinDir, cgroupPath, v4Obj)
 			if err != nil {
 				return err
 			}
 
-			err = attachProgram("recvmsg", "4", bpfMount, cgroupPath, udpNotSeen, false, v4Obj)
+			err = attachProgram("recvmsg", "4", pinDir, cgroupPath, v4Obj)
 			if err != nil {
 				return err
 			}
 
-			err = attachProgram("sendmsg", "46", bpfMount, cgroupPath, udpNotSeen, false, v46Obj)
+			err = attachProgram("sendmsg", "46", pinDir, cgroupPath, v46Obj)
 			if err != nil {
 				return err
 			}
 
-			err = attachProgram("recvmsg", "46", bpfMount, cgroupPath, udpNotSeen, false, v46Obj)
+			err = attachProgram("recvmsg", "46", pinDir, cgroupPath, v46Obj)
 			if err != nil {
 				return err
 			}
-		}
-		if !ipv6Enabled {
-			//delete the jump map
-			os.Remove(ctlbProgsMap.Path())
 		}
 	}
 	// Load the v6 CTLB program.
@@ -266,27 +292,25 @@ func InstallConnectTimeLoadBalancer(ipv4Enabled, ipv6Enabled bool, cgroupv2 stri
 		defer v6Obj.Close()
 		// If dual-stack, populate the jump maps with v6 ctlb programs.
 		if ipv4Enabled {
-			if err := ctlbProgsMap.EnsureExists(); err != nil {
-				log.WithError(err).Error("Failed to create CTLB programs maps")
-				return err
-			}
-			err = updateCTLBJumpMap(ctlbProgsMap, v6Obj)
-			if err != nil {
-				return err
+			for prog, index := range ctlbProgToIndex {
+				err = updateCTLBJumpMap(ctlbProgsMap[index], v6Obj, prog)
+				if err != nil {
+					return err
+				}
 			}
 		} else {
-			err = attachProgram("connect", "6", bpfMount, cgroupPath, udpNotSeen, excludeUDP, v6Obj)
+			err = attachProgram("connect", "6", pinDir, cgroupPath, v6Obj)
 			if err != nil {
 				return err
 			}
 
 			if !excludeUDP {
-				err = attachProgram("sendmsg", "6", bpfMount, cgroupPath, udpNotSeen, false, v6Obj)
+				err = attachProgram("sendmsg", "6", pinDir, cgroupPath, v6Obj)
 				if err != nil {
 					return err
 				}
 
-				err = attachProgram("recvmsg", "6", bpfMount, cgroupPath, udpNotSeen, false, v6Obj)
+				err = attachProgram("recvmsg", "6", pinDir, cgroupPath, v6Obj)
 				if err != nil {
 					return err
 				}
@@ -296,18 +320,17 @@ func InstallConnectTimeLoadBalancer(ipv4Enabled, ipv6Enabled bool, cgroupv2 stri
 	return nil
 }
 
-func ProgFileName(logLevel string, ipver string) string {
+func InstallConnectTimeLoadBalancer(ipv4Enabled, ipv6Enabled bool, cgroupv2 string, logLevel string, udpNotSeen time.Duration, excludeUDP bool, ctlbProgramsMap []maps.Map) error {
+	return installCTLB(ipv4Enabled, ipv6Enabled, cgroupv2, logLevel, udpNotSeen, excludeUDP, ctlbProgramsMap)
+}
+
+func ProgFileName(logLevel, ipver string) string {
 	logLevel = strings.ToLower(logLevel)
 	if logLevel == "off" {
 		logLevel = "no_log"
 	}
 
-	btf := ""
-	if bpfutils.BTFEnabled {
-		btf = "_co-re"
-	}
-
-	return fmt.Sprintf("connect_time_%s_v%s%s.o", logLevel, ipver, btf)
+	return fmt.Sprintf("connect_balancer_%s_v%s.o", logLevel, ipver)
 }
 
 func ensureCgroupPath(cgroupv2 string) (string, error) {
@@ -324,7 +347,7 @@ func ensureCgroupPath(cgroupv2 string) (string, error) {
 		err = os.MkdirAll(cgroupPath, 0766)
 		if err != nil {
 			log.WithError(err).Error("Failed to make cgroup")
-			return "", errors.Wrap(err, "failed to create cgroup")
+			return "", fmt.Errorf("failed to create cgroup: %w", err)
 		}
 	}
 	return cgroupPath, nil

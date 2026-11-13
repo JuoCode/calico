@@ -1,30 +1,41 @@
 // Project Calico BPF dataplane programs.
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
 #ifndef __CALI_GLOBALS_H__
 #define __CALI_GLOBALS_H__
 
+#include <linux/types.h>
+#include <stdbool.h>
+
 #include "ip_addr.h"
 
-#define DECLARE_TC_GLOBAL_DATA(name, ip_t)	\
-struct name {				\
-	ip_t host_ip;			\
-	__be16 tunnel_mtu;		\
-	__be16 vxlan_port;		\
-	ip_t intf_ip;			\
-	__be32 ext_to_svc_mark;		\
-	__be16 psnat_start;		\
-	__be16 psnat_len;		\
-	ip_t host_tunnel_ip;		\
-	__be32 flags;			\
-	__be16 wg_port;			\
-	__be16 __pad;			\
-	__u32 natin_idx;		\
-	__u32 natout_idx;		\
-	__u8 iface_name[16];		\
-	__u32 log_filter_jmp;		\
-	__u32 jumps[40];		\
+#define DECLARE_TC_GLOBAL_DATA(name, ip_t) \
+struct name {                              \
+	ip_t host_ip;                          \
+	__be16 tunnel_mtu;                     \
+	__be16 vxlan_port;                     \
+	ip_t intf_ip;                          \
+	__be32 ext_to_svc_mark;                \
+	__be16 psnat_start;                    \
+	__be16 psnat_len;                      \
+	ip_t host_tunnel_ip;                   \
+	__be32 flags;                          \
+	__be16 wg_port;                        \
+	__be16 profiling;                      \
+	__u32 natin_idx;                       \
+	__u32 natout_idx;                      \
+	__u32 overlay_tunnel_id;               \
+	__u8 iface_name[16];                   \
+	__u32 log_filter_jmp;                  \
+	__u32 jumps[40];                       \
+	__s8 dscp;                             \
+	__s8 istio_dscp;                       \
+	__u32 maglev_lut_size;                 \
+	__u32 ipfrag_timeout;                  \
+	__u32 host_ifindex;                    \
+	__be16 vxlan_src_port_min;             \
+	__be16 vxlan_src_port_max;             \
 }
 
 DECLARE_TC_GLOBAL_DATA(cali_tc_global_data, ipv6_addr_t);
@@ -44,14 +55,30 @@ struct cali_tc_preamble_globals {
 };
 
 enum cali_globals_flags {
-	CALI_GLOBALS_RESERVED1			= 0x00000002,
-	CALI_GLOBALS_RESERVED2			= 0x00000004,
-	CALI_GLOBALS_RESERVED3			= 0x00000008,
-	CALI_GLOBALS_RPF_OPTION_ENABLED		= 0x00000010,
-	CALI_GLOBALS_RPF_OPTION_STRICT		= 0x00000020,
-	CALI_GLOBALS_RESERVED7			= 0x00000040,
-	CALI_GLOBALS_NO_DSR_CIDRS		= 0x00000080,
-	CALI_GLOBALS_LO_UDP_ONLY		= 0x00000100,
+	/* Set on an attach point whose device encapsulates traffic: a vxlan,
+	 * ipip or wireguard device. */
+	CALI_GLOBALS_IFACE_ENCAPS                         = 0x00000001,
+	CALI_GLOBALS_RESERVED1                            = 0x00000002,
+	CALI_GLOBALS_RESERVED2                            = 0x00000004,
+	CALI_GLOBALS_RESERVED3                            = 0x00000008,
+	CALI_GLOBALS_RPF_OPTION_ENABLED                   = 0x00000010,
+	CALI_GLOBALS_RPF_OPTION_STRICT                    = 0x00000020,
+	CALI_GLOBALS_RESERVED7                            = 0x00000040,
+	CALI_GLOBALS_NO_DSR_CIDRS                         = 0x00000080,
+	CALI_GLOBALS_LO_UDP_ONLY                          = 0x00000100,
+	CALI_GLOBALS_RESERVED10                           = 0x00000200,
+	CALI_GLOBALS_REDIRECT_PEER                        = 0x00000400,
+	CALI_GLOBALS_FLOWLOGS_ENABLED                     = 0x00000800,
+	CALI_GLOBALS_NATOUTGOING_EXCLUDE_HOSTS            = 0x00001000,
+	CALI_GLOBALS_SKIP_EGRESS_REDIRECT                 = 0x00002000,
+	CALI_GLOBALS_INGRESS_PACKET_RATE_CONFIGURED       = 0x00004000,
+	CALI_GLOBALS_EGRESS_PACKET_RATE_CONFIGURED        = 0x00008000,
+	CALI_GLOBALS_UDP_GSO_LINEARIZE                    = 0x00010000,
+	CALI_GLOBALS_WORKLOAD_SRC_SPOOFING_CONFIGURED     = 0x00020000,
+	CALI_GLOBALS_INGRESS_CONN_LIMIT_CONFIGURED        = 0x00040000,
+	CALI_GLOBALS_EGRESS_CONN_LIMIT_CONFIGURED         = 0x00080000,
+	CALI_GLOBALS_RESERVED21                           = 0x00100000,
+	CALI_GLOBALS_RESERVED22                           = 0x00200000,
 };
 
 struct cali_ctlb_globals {
@@ -67,6 +94,42 @@ struct cali_xdp_globals {
 struct cali_xdp_preamble_globals {
 	struct cali_xdp_globals v4;
 	struct cali_xdp_globals v6;
+};
+
+/* prog_flags holds per-program, load-time feature flags, distinct from the
+ * node-wide globals above: it lives in its own frozen read-only section so it
+ * does not disturb their layout, and Felix sets it per program at load. Because
+ * the section is frozen, the verifier folds each field to a constant and
+ * dead-code-eliminates the guarded branches (e.g. a program can load with no
+ * reference to the bpf_trace_printk helper at all). New per-program load-time
+ * flags belong here — append fields as needed.
+ */
+struct prog_flags {
+	/* no_trace_printk, when set, drops the code paths that call
+	 * bpf_trace_printk/bpf_trace_vprintk. Felix sets it on nodes running with
+	 * kernel lockdown=confidentiality, where ftrace is disabled and loading any
+	 * program that references the helper spams the kernel log on every load. */
+	__u8 no_trace_printk;
+};
+
+/* Instance lives in its own .rodata section; only objects that reference it get
+ * the map. Declared volatile const so the compiler emits real loads that the
+ * verifier can fold against the frozen map. */
+__attribute__((section(".rodata.prog_flags"))) volatile const struct prog_flags PROG_FLAGS;
+
+struct cali_ct_cleanup_globals {
+    __u64 creation_grace;
+
+    __u64 tcp_syn_sent;
+    __u64 tcp_established;
+    __u64 tcp_fins_seen;
+    __u64 tcp_reset_seen;
+
+    __u64 udp_timeout;
+
+    __u64 generic_timeout;
+
+    __u64 icmp_timeout;
 };
 
 #endif /* __CALI_GLOBALS_H__ */

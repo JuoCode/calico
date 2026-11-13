@@ -20,13 +20,13 @@ ipmo .\libs\hns\hns.psm1 -Force -DisableNameChecking
 
 function Get-TokenRefresherPid()
 {
-    return $(Get-WmiObject Win32_Process -Filter "name = 'calico-node.exe'" | Select-Object CommandLine, ProcessId | Where-Object -Property CommandLine -match ".*calico-node.exe.*-monitor-token.*").ProcessId
+    return $(Get-WmiObject Win32_Process -Filter "name = 'calico.exe'" | Select-Object CommandLine, ProcessId | Where-Object -Property CommandLine -match ".*calico.exe.*monitor-token.*").ProcessId
 }
 
 function Start-TokenRefresher()
 {
     Write-Host "Starting Calico token refresher..."
-    Start-Process -NoNewWindow .\calico-node.exe -ArgumentList "-monitor-token"
+    Start-Process -NoNewWindow .\calico.exe -ArgumentList "component","node","monitor-token"
     Write-Host "Calico token refresher running on PID" $(Get-TokenRefresherPid)
 }
 
@@ -185,7 +185,7 @@ while ($True)
 {
     try
     {
-        # Run calico-node.exe if kubelet starts/restarts
+        # Run calico.exe if kubelet starts/restarts
         $currentKubeletPid = (Get-Process -Name kubelet -ErrorAction Stop).id
         if ($currentKubeletPid -NE $kubeletPid)
         {
@@ -193,11 +193,14 @@ while ($True)
             $kubeletPid = $currentKubeletPid
             while ($true)
             {
-                .\calico-node.exe -startup
+                .\calico.exe component node startup --complete-startup
                 if ($LastExitCode -EQ 0)
                 {
                     Write-Host "Calico node initialisation succeeded; monitoring kubelet for restarts..."
-                    Restart-TokenRefresher
+                    # Token refresher only needs to run in hostprocess containers
+                    if ($env:CONTAINER_SANDBOX_MOUNT_POINT -AND ("$env:CNI_PLUGIN_TYPE" -eq "Calico")) {
+                        Restart-TokenRefresher
+                    }
                     break
                 }
 
@@ -212,19 +215,10 @@ while ($True)
         $kubeletPid = -1
     }
 
-    # Upgrade service is not needed if node is running in a hostprocess container.
-    if (-not $env:CONTAINER_SANDBOX_MOUNT_POINT) {
-        if (!(Get-UpgradeService)) {
-            # If upgrade service has not been running, check if we should run upgrade service.
-            .\calico-node.exe -should-install-windows-upgrade
-            if ($LastExitCode -EQ 0) {
-                Install-UpgradeService
-                Start-Service CalicoUpgrade
-            }
-        }
+    # Token refresher only needs to run in hostprocess containers
+    if ($env:CONTAINER_SANDBOX_MOUNT_POINT -AND ("$env:CNI_PLUGIN_TYPE" -eq "Calico")) {
+        Ensure-TokenRefresher
     }
-
-    Ensure-TokenRefresher
 
     Start-Sleep 10
 }

@@ -19,14 +19,11 @@ import (
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
-
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
-	cresources "github.com/projectcalico/calico/libcalico-go/lib/resources"
-
 	wg "golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
@@ -57,31 +54,16 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 	// v1 model.  For a delete these will all be nil.  If we fail to convert any value then
 	// just treat that as a delete on the underlying key and return the error alongside
 	// the updates.
-	var ipv4, ipv4Tunl, vxlanTunlIp, vxlanTunlMac, vxlanV6TunlIp, vxlanV6TunlMac, wgConfig interface{}
-	var node *libapiv3.Node
+	var ipv4Tunl, vxlanTunlIp, vxlanTunlMac, vxlanV6TunlIp, vxlanV6TunlMac, wgConfig any
+	var node *internalapi.Node
 	var ok bool
 	if kvp.Value != nil {
-		node, ok = kvp.Value.(*libapiv3.Node)
+		node, ok = kvp.Value.(*internalapi.Node)
 		if !ok {
 			return nil, errors.New("Incorrect value type - expecting resource of kind Node")
 		}
 
 		if bgp := node.Spec.BGP; bgp != nil {
-			var ip *cnet.IP
-			var cidr *cnet.IPNet
-
-			// Parse the IPv4 address, Felix expects this as a HostIPKey.  If we fail to parse then
-			// treat as a delete (i.e. leave ipv4 as nil).
-			if len(bgp.IPv4Address) != 0 {
-				ip, cidr, err = cnet.ParseCIDROrIP(bgp.IPv4Address)
-				if err == nil {
-					log.WithFields(log.Fields{"ip": ip, "cidr": cidr}).Debug("Parsed IPv4 address")
-					ipv4 = ip
-				} else {
-					log.WithError(err).WithField("IPv4Address", bgp.IPv4Address).Warn("Failed to parse IPv4Address")
-				}
-			}
-
 			// Parse the IPv4 IPIP tunnel address, Felix expects this as a HostConfigKey.  If we fail to parse then
 			// treat as a delete (i.e. leave ipv4Tunl as nil).
 			if len(bgp.IPv4IPIPTunnelAddr) != 0 {
@@ -93,19 +75,6 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 					log.WithField("IPv4IPIPTunnelAddr", bgp.IPv4IPIPTunnelAddr).Warn("Failed to parse IPv4IPIPTunnelAddr")
 					err = fmt.Errorf("failed to parsed IPv4IPIPTunnelAddr as an IP address")
 				}
-			}
-		}
-		// Look for internal node address, if BGP is not running
-		if ipv4 == nil {
-			ip, _ := cresources.FindNodeAddress(node, libapiv3.InternalIP, 4)
-			if ip != nil {
-				ipv4 = ip
-			}
-		}
-		if ipv4 == nil {
-			ip, _ := cresources.FindNodeAddress(node, libapiv3.ExternalIP, 4)
-			if ip != nil {
-				ipv4 = ip
 			}
 		}
 
@@ -221,13 +190,6 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 
 	kvps := []*model.KVPair{
 		{
-			Key: model.HostIPKey{
-				Hostname: name,
-			},
-			Value:    ipv4,
-			Revision: kvp.Revision,
-		},
-		{
 			Key: model.HostConfigKey{
 				Hostname: name,
 				Name:     "IpInIpTunnelAddr",
@@ -273,7 +235,7 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 			// preserve that relationship here.
 			Key: model.ResourceKey{
 				Name: name,
-				Kind: libapiv3.KindNode,
+				Kind: internalapi.KindNode,
 			},
 			Value:    kvp.Value,
 			Revision: kvp.Revision,
@@ -307,7 +269,7 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 				continue
 			}
 			kvps = append(kvps, &model.KVPair{
-				Key:      model.BlockKey{CIDR: *cidr},
+				Key:      model.BlockKey{CIDR: model.PrefixFromIPNet(*cidr)},
 				Value:    nil,
 				Revision: kvp.Revision,
 			})
@@ -323,7 +285,7 @@ func (c *FelixNodeUpdateProcessor) Process(kvp *model.KVPair) ([]*model.KVPair, 
 
 			aff := fmt.Sprintf("host:%s", name)
 			kvps = append(kvps, &model.KVPair{
-				Key:      model.BlockKey{CIDR: *cidr},
+				Key:      model.BlockKey{CIDR: model.PrefixFromIPNet(*cidr)},
 				Value:    &model.AllocationBlock{CIDR: *cidr, Affinity: &aff},
 				Revision: kvp.Revision,
 			})
@@ -340,7 +302,7 @@ func (c *FelixNodeUpdateProcessor) OnSyncerStarting() {
 
 func (c *FelixNodeUpdateProcessor) extractName(k model.Key) (string, error) {
 	rk, ok := k.(model.ResourceKey)
-	if !ok || rk.Kind != libapiv3.KindNode {
+	if !ok || rk.Kind != internalapi.KindNode {
 		return "", errors.New("Incorrect key type - expecting resource of kind Node")
 	}
 	return rk.Name, nil

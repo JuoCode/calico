@@ -25,15 +25,14 @@ import (
 	"strings"
 	"time"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	yaml "github.com/projectcalico/go-yaml-wrapper"
+	"sigs.k8s.io/yaml"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/argutils"
 	yamlsep "github.com/projectcalico/calico/calicoctl/calicoctl/util/yaml"
@@ -69,8 +68,10 @@ type ResourceListObject interface {
 	v1.ListMetaAccessor
 }
 
-type ResourceActionCommand func(context.Context, client.Interface, ResourceObject) (ResourceObject, error)
-type ResourceListActionCommand func(context.Context, client.Interface, ResourceObject) (ResourceListObject, error)
+type (
+	ResourceActionCommand     func(context.Context, client.Interface, ResourceObject) (ResourceObject, error)
+	ResourceListActionCommand func(context.Context, client.Interface, ResourceObject) (ResourceListObject, error)
+)
 
 // ResourceHelper encapsulates details about a specific version of a specific resource:
 //
@@ -100,19 +101,26 @@ type resourceHelper struct {
 func (rh resourceHelper) String() string {
 	if !rh.isList {
 		return fmt.Sprintf("Resource(%s %s)", rh.resource.GetObjectKind(), rh.resource.GetObjectKind().GroupVersionKind())
-
 	}
 	return fmt.Sprintf("Resource(%s %s)", rh.listResource.GetObjectKind(), rh.listResource.GetListMeta().GetResourceVersion())
 }
 
 // Store a resourceHelper for each resource.
-var helpers map[schema.GroupVersionKind]resourceHelper
-var kindToRes = make(map[string]ResourceObject)
+var (
+	helpers   map[schema.GroupVersionKind]resourceHelper
+	kindToRes = make(map[string]ResourceObject)
+	allKinds  = []string{}
+)
+
+// ValidResources returns all registered resource kinds.
+func ValidResources() []string {
+	return allKinds
+}
 
 func registerResource(res ResourceObject, resList ResourceListObject, isNamespaced bool, names []string,
 	tableHeadings []string, tableHeadingsWide []string, headingsMap map[string]string,
-	create, update, delete, get ResourceActionCommand, list ResourceListActionCommand) {
-
+	create, update, delete, get ResourceActionCommand, list ResourceListActionCommand,
+) {
 	if helpers == nil {
 		helpers = make(map[schema.GroupVersionKind]resourceHelper)
 	}
@@ -146,6 +154,7 @@ func registerResource(res ResourceObject, resList ResourceListObject, isNamespac
 	for _, v := range names {
 		kindToRes[v] = res
 	}
+	allKinds = append(allKinds, res.GetObjectKind().GroupVersionKind().Kind)
 }
 
 func (rh resourceHelper) GetObjectType() reflect.Type {
@@ -228,7 +237,7 @@ func (rh resourceHelper) Update(ctx context.Context, client client.Interface, re
 				id = fmt.Sprintf("%s(%s/%s)", ro.GetObjectKind().GroupVersionKind().GroupKind().Kind, ro.GetObjectMeta().GetNamespace(), ro.GetObjectMeta().GetName())
 			}
 			return ro, cerrors.ErrorResourceUpdateConflict{
-				Err:        fmt.Errorf(fmt.Sprintf("Resource version '%s' is out of date (latest: %s). Update the resource YAML/JSON in order to make changes.", rv, ro.GetObjectMeta().GetResourceVersion())),
+				Err:        fmt.Errorf("resource version '%s' is out of date (latest: %s). Update the resource YAML/JSON in order to make changes", rv, ro.GetObjectMeta().GetResourceVersion()),
 				Identifier: id,
 			}
 		}
@@ -240,7 +249,7 @@ func (rh resourceHelper) Update(ctx context.Context, client client.Interface, re
 	// If the resourceVersion is not specified then we do a Get to get
 	// the latest resourceVersion and then do an Update with it.
 	// We retry only if we get an update conflict.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		// Get the resource to get the resourceVersion.
 		ro, err := rh.get(ctx, client, resource)
 		if err != nil {
@@ -339,7 +348,7 @@ func GetResourceManager(resource runtime.Object) ResourceManager {
 // This function also inserts resource name, namespace if specified.
 // Example "calicoctl get bgppeer peer123" will return
 // a BGPPeer resource with name field populated to "peer123".
-func GetResourcesFromArgs(args map[string]interface{}) ([]ResourceObject, error) {
+func GetResourcesFromArgs(args map[string]any) ([]ResourceObject, error) {
 	kind := args["<KIND>"].(string)
 	argname := "<NAME>"
 
@@ -352,7 +361,7 @@ func GetResourcesFromArgs(args map[string]interface{}) ([]ResourceObject, error)
 	case []string:
 		names = argutils.ArgStringsOrBlank(args, argname)
 	default:
-		panic(fmt.Errorf("Wrong name format, unexpected type: %T", args[argname]))
+		panic(fmt.Errorf("wrong name format, unexpected type: %T", args[argname]))
 	}
 
 	namespace := argutils.ArgStringOrBlank(args, "--namespace")
@@ -388,7 +397,7 @@ func (rh resourceHelper) IsNamespaced() bool {
 func newResource(tm schema.GroupVersionKind) (runtime.Object, error) {
 	rh, ok := helpers[tm]
 	if !ok {
-		return nil, fmt.Errorf("Unknown resource type (%s) and/or version (%s)", tm.Kind, tm.GroupVersion().String())
+		return nil, fmt.Errorf("unknown resource type (%s) and/or version (%s)", tm.Kind, tm.GroupVersion().String())
 	}
 	log.Infof("Found resource helper: %s", rh)
 
@@ -568,7 +577,7 @@ func (rh resourceHelper) GetTableTemplate(headings []string, printNamespace bool
 			for heading := range rh.headingsMap {
 				headings = append(headings, heading)
 			}
-			return "", fmt.Errorf("Unknown heading %s, valid values are: %s",
+			return "", fmt.Errorf("unknown heading %s, valid values are: %s",
 				heading,
 				strings.Join(headings, ", "))
 		}

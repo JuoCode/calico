@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,11 +18,10 @@ import (
 	"context"
 	"strings"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -34,18 +33,21 @@ func init() {
 		newNetworkPolicyList(),
 		true,
 		[]string{"networkpolicy", "networkpolicies", "policy", "np", "policies", "pol", "pols"},
-		[]string{"NAME"},
-		[]string{"NAME", "ORDER", "SELECTOR"},
+		[]string{"NAME", "TIER"},
+		[]string{"NAME", "TIER", "ORDER", "SELECTOR"},
 		// NAMESPACE may be prepended in GrabTableTemplate so needs to remain in the map below
 		map[string]string{
 			"NAME":      "{{.ObjectMeta.Name}}",
 			"NAMESPACE": "{{.ObjectMeta.Namespace}}",
 			"ORDER":     "{{.Spec.Order}}",
 			"SELECTOR":  "{{.Spec.Selector}}",
+			"TIER":      "{{.Spec.Tier}}",
 		},
 		func(ctx context.Context, client client.Interface, resource ResourceObject) (ResourceObject, error) {
 			r := resource.(*api.NetworkPolicy)
-			if strings.HasPrefix(r.Name, conversion.K8sNetworkPolicyNamePrefix) {
+			if strings.HasPrefix(r.Name, converter.KubernetesNetworkPolicyEtcdPrefix) {
+				// In etcd mode, we use a name prefix to multiplex K8s NetworkPolicies and Calico NetworkPolicies, so
+				// cannot allow Calico network policies to be named with that prefix.
 				return nil, cerrors.ErrorOperationNotSupported{
 					Operation:  "create or apply",
 					Identifier: resource,
@@ -56,7 +58,9 @@ func init() {
 		},
 		func(ctx context.Context, client client.Interface, resource ResourceObject) (ResourceObject, error) {
 			r := resource.(*api.NetworkPolicy)
-			if strings.HasPrefix(r.Name, conversion.K8sNetworkPolicyNamePrefix) {
+			if strings.HasPrefix(r.Name, converter.KubernetesNetworkPolicyEtcdPrefix) {
+				// In etcd mode, we use a name prefix to multiplex K8s NetworkPolicies and Calico NetworkPolicies, so
+				// cannot allow Calico network policies to be named with that prefix.
 				return nil, cerrors.ErrorOperationNotSupported{
 					Operation:  "apply or replace",
 					Identifier: resource,
@@ -67,7 +71,9 @@ func init() {
 		},
 		func(ctx context.Context, client client.Interface, resource ResourceObject) (ResourceObject, error) {
 			r := resource.(*api.NetworkPolicy)
-			if strings.HasPrefix(r.Name, conversion.K8sNetworkPolicyNamePrefix) {
+			if strings.HasPrefix(r.Name, converter.KubernetesNetworkPolicyEtcdPrefix) {
+				// In etcd mode, we use a name prefix to multiplex K8s NetworkPolicies and Calico NetworkPolicies, so
+				// cannot allow Calico network policies to be named with that prefix.
 				return nil, cerrors.ErrorOperationNotSupported{
 					Operation:  "delete",
 					Identifier: resource,

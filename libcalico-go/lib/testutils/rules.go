@@ -15,10 +15,9 @@
 package testutils
 
 import (
-	"github.com/sirupsen/logrus"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	"github.com/sirupsen/logrus"
 )
 
 var InRule1, InRule2, EgressRule1, EgressRule2 apiv3.Rule
@@ -29,7 +28,7 @@ func init() {
 		logrus.WithError(err).Panic("Failed to create port range")
 	}
 	singlePort := numorstring.SinglePort(1024)
-	namedPort := numorstring.NamedPort("named-port")
+	namedPort, _ := numorstring.NamedPort("named-port")
 
 	ipv4 := 4
 	ipv6 := 6

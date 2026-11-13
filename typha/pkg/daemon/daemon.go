@@ -25,13 +25,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
-	"github.com/projectcalico/calico/libcalico-go/lib/metricsserver"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -40,33 +36,25 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/nodestatussyncer"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/tunnelipsyncer"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
-	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator"
-	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator/clients"
-	"github.com/projectcalico/calico/typha/pkg/buildinfo"
+	"github.com/projectcalico/calico/libcalico-go/lib/metricsserver"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 	"github.com/projectcalico/calico/typha/pkg/calc"
 	"github.com/projectcalico/calico/typha/pkg/config"
 	"github.com/projectcalico/calico/typha/pkg/jitter"
 	"github.com/projectcalico/calico/typha/pkg/k8s"
-	"github.com/projectcalico/calico/typha/pkg/logutils"
+	"github.com/projectcalico/calico/typha/pkg/logging"
 	"github.com/projectcalico/calico/typha/pkg/snapcache"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 	"github.com/projectcalico/calico/typha/pkg/syncserver"
 )
 
-const usage = `Typha, Calico's fan-out proxy.
+const DefaultConfigFile = "/etc/calico/typha.cfg"
 
-Usage:
-  calico-typha [options]
-
-Options:
-  -c --config-file=<filename>  Config file to load [default: /etc/calico/typha.cfg].
-  --version                    Print the version and exit.
-`
-
-// TyphaDaemon handles the lifecycle of the Typha process.  The main() function of the Typha executable
-// should simply call InitializeAndServeForever() to start the Typha server.  The lifecycle is broken out into
-// several individual methods for ease of testing.
+// TyphaDaemon handles the lifecycle of the Typha process. Use NewCommand() for the CLI
+// entry point, or call Run() directly for programmatic use. The lifecycle is broken out
+// into several individual methods for ease of testing.
 type TyphaDaemon struct {
 	BuildInfoLogCxt *log.Entry
 	ConfigFilePath  string
@@ -121,22 +109,29 @@ func New() *TyphaDaemon {
 			}
 			return ClientV3Shim{client.(RealClientV3), config}, nil
 		},
-		ConfigureEarlyLogging: logutils.ConfigureEarlyLogging,
-		ConfigureLogging:      logutils.ConfigureLogging,
+		ConfigureEarlyLogging: logging.ConfigureEarlyLogging,
+		ConfigureLogging:      logging.ConfigureLogging,
 		CachesBySyncerType:    map[syncproto.SyncerType]syncserver.BreadcrumbProvider{},
 	}
 }
 
-func (t *TyphaDaemon) InitializeAndServeForever(cxt context.Context) error {
+// Run starts the Typha daemon with the given config file path and blocks until shutdown.
+func (t *TyphaDaemon) Run(ctx context.Context, configFile string) error {
 	t.DoEarlyRuntimeSetup()
-	t.ParseCommandLineArgs(nil)
-	err := t.LoadConfiguration(cxt)
-	if err != nil { // Should only happen if context is canceled.
+	t.ConfigFilePath = configFile
+	t.BuildInfoLogCxt = log.WithFields(log.Fields{
+		"version":    buildinfo.Version,
+		"buildDate":  buildinfo.BuildDate,
+		"gitCommit":  buildinfo.GitRevision,
+		"GOMAXPROCS": runtime.GOMAXPROCS(0),
+	})
+	t.BuildInfoLogCxt.Info("Typha starting up")
+	if err := t.LoadConfiguration(ctx); err != nil {
 		return err
 	}
 	t.CreateServer()
-	t.Start(cxt)
-	t.WaitAndShutDown(cxt)
+	t.Start(ctx)
+	t.WaitAndShutDown(ctx)
 	return nil
 }
 
@@ -147,28 +142,16 @@ func (t *TyphaDaemon) DoEarlyRuntimeSetup() {
 	t.ConfigureEarlyLogging()
 }
 
-// ParseCommandLineArgs parses the command line args and either exits with a usage warning or stores the parsed
-// arguments on fields of the struct.
-func (t *TyphaDaemon) ParseCommandLineArgs(argv []string) {
-	// Parse command-line args.
-	version := "Version:            " + buildinfo.GitVersion + "\n" +
-		"Full git commit ID: " + buildinfo.GitRevision + "\n" +
-		"Build date:         " + buildinfo.BuildDate + "\n"
-	p := &docopt.Parser{OptionsFirst: false, SkipHelpFlags: false}
-	arguments, err := p.ParseArgs(usage, argv, version)
-	if err != nil {
-		println(usage)
-		log.Fatalf("Failed to parse usage, exiting: %v", err)
-	}
-	t.ConfigFilePath = arguments["--config-file"].(string)
+// SetConfigFilePath sets the config file path and initializes the build info log context.
+// Used by tests that need to configure the daemon without going through the CLI.
+func (t *TyphaDaemon) SetConfigFilePath(path string) {
+	t.ConfigFilePath = path
 	t.BuildInfoLogCxt = log.WithFields(log.Fields{
-		"version":    buildinfo.GitVersion,
+		"version":    buildinfo.Version,
 		"buildDate":  buildinfo.BuildDate,
 		"gitCommit":  buildinfo.GitRevision,
 		"GOMAXPROCS": runtime.GOMAXPROCS(0),
 	})
-	t.BuildInfoLogCxt.Info("Typha starting up")
-	log.Infof("Command line arguments: %v", arguments)
 }
 
 // LoadConfiguration uses the command-line configuration and environment variables to load our configuration.
@@ -247,56 +230,6 @@ configRetry:
 	// again.
 	t.BuildInfoLogCxt.WithField("config", configParams).Info(
 		"Successfully loaded configuration.")
-
-	if datastoreConfig.Spec.DatastoreType == apiconfig.Kubernetes {
-		// Special case: for KDD v1 datamodel to v3 datamodel upgrade, we need to ensure that the datastore migration
-		// has completed before we start serving requests.  Otherwise, we might serve partially-migrated data to
-		// Felix.
-
-		// Get a v1 client, so we can check if there's any data there to migrate.
-		log.Info("Using Kubernetes API datastore, checking if we need to migrate v1 -> v3")
-		var civ1 clients.V1ClientInterface
-		var err error
-		for {
-			if err := ctx.Err(); err != nil {
-				log.WithError(err).Warn("Context canceled.")
-				return err
-			}
-			civ1, err = clients.LoadKDDClientV1FromAPIConfigV3(&datastoreConfig)
-			if err != nil {
-				log.WithError(err).Error("Failed to connect to Kubernetes datastore (Calico v1 API)")
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			break
-		}
-
-		// Use the migration helper to determine if need to perform a migration, and if so
-		// perform the migration.
-		mh := migrator.New(t.DatastoreClient, civ1, nil)
-		for {
-			if err := ctx.Err(); err != nil {
-				log.WithError(err).Warn("Context canceled.")
-				return err
-			}
-			if migrate, err := mh.ShouldMigrate(); err != nil {
-				log.WithError(err).Error("Failed to determine migration requirements")
-				time.Sleep(1 * time.Second)
-				continue
-			} else if migrate {
-				log.Info("Need to migrate Kubernetes v1 configuration to v3")
-				if _, err := mh.Migrate(); err != nil {
-					log.WithError(err).Error("Failed to migrate Kubernetes v1 configuration to v3")
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				log.Info("Successfully migrated Kubernetes v1 configuration to v3")
-				break
-			}
-			log.Info("Migration not required.")
-			break
-		}
-	}
 
 	// Ensure that, as soon as we are able to connect to the datastore at all, it is initialized.
 	// Note: we block further start-up while we do this, which means, if we're stuck here for long enough,
@@ -390,11 +323,13 @@ func (t *TyphaDaemon) CreateServer() {
 			PingInterval:                   t.ConfigParams.ServerPingIntervalSecs,
 			PongTimeout:                    t.ConfigParams.ServerPongTimeoutSecs,
 			HandshakeTimeout:               t.ConfigParams.ServerHandshakeTimeoutSecs,
+			WriteTimeout:                   t.ConfigParams.ServerWriteTimeoutSecs,
 			DropInterval:                   t.ConfigParams.ConnectionDropIntervalSecs,
 			ShutdownTimeout:                t.ConfigParams.ShutdownTimeoutSecs,
 			ShutdownMaxDropInterval:        t.ConfigParams.ShutdownConnectionDropIntervalMaxSecs,
 			MaxConns:                       t.ConfigParams.MaxConnectionsUpperLimit,
 			Port:                           t.ConfigParams.ServerPort,
+			Host:                           t.ConfigParams.ServerHost,
 			HealthAggregator:               t.healthAggregator,
 			KeyFile:                        t.ConfigParams.ServerKeyFile,
 			CertFile:                       t.ConfigParams.ServerCertFile,
@@ -427,12 +362,31 @@ func (t *TyphaDaemon) Start(cxt context.Context) {
 		debugserver.StartDebugPprofServer(t.ConfigParams.DebugHost, t.ConfigParams.DebugPort)
 	}
 	if t.ConfigParams.PrometheusMetricsEnabled {
-		log.Info("Prometheus metrics enabled.  Starting server.")
+		log.Info("Prometheus metrics enabled.")
 		t.configurePrometheusMetrics()
-		go metricsserver.ServePrometheusMetricsForever(
-			t.ConfigParams.PrometheusMetricsHost,
-			t.ConfigParams.PrometheusMetricsPort,
-		)
+		if t.ConfigParams.PrometheusMetricsKeyFile != "" || t.ConfigParams.PrometheusMetricsCertFile != "" {
+			log.Info("Trying to start metrics https server.")
+			go func() {
+				err := metricsserver.ServePrometheusMetricsHTTPS(
+					prometheus.DefaultGatherer,
+					t.ConfigParams.PrometheusMetricsHost,
+					t.ConfigParams.PrometheusMetricsPort,
+					t.ConfigParams.PrometheusMetricsCertFile,
+					t.ConfigParams.PrometheusMetricsKeyFile,
+					t.ConfigParams.PrometheusMetricsClientAuth,
+					t.ConfigParams.PrometheusMetricsCAFile,
+				)
+				// The server retries internally, so it only returns on failure.
+				log.WithError(err).Error("Error starting metrics https server.")
+			}()
+		} else {
+			log.Info("Starting metrics http server.")
+			go metricsserver.ServePrometheusMetricsHTTP(
+				prometheus.DefaultGatherer,
+				t.ConfigParams.PrometheusMetricsHost,
+				t.ConfigParams.PrometheusMetricsPort,
+			)
+		}
 	}
 
 	if t.ConfigParams.HealthEnabled {
@@ -519,10 +473,10 @@ type DatastoreClient interface {
 	NodeStatusSyncerByIface(callbacks bapi.SyncerCallbacks) bapi.Syncer
 }
 
-// RealClientV3 is the real API of the V3 client, including the semi-private API that we use to get the backend.
+// RealClientV3 is the real API of the V3 client, plus the BackendAccessor we use to get the backend.
 type RealClientV3 interface {
 	clientv3.Interface
-	Backend() bapi.Client
+	bapi.BackendAccessor
 }
 
 // TODO Typha: Share with Felix.

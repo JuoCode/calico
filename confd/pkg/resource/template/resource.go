@@ -50,7 +50,7 @@ type TemplateResource struct {
 	StageFile     *os.File
 	Uid           int
 	ExpandedKeys  []string
-	funcMap       map[string]interface{}
+	funcMap       map[string]any
 	keepStageFile bool
 	noop          bool
 	store         memkv.Store
@@ -64,7 +64,7 @@ var ErrEmptySrc = errors.New("empty src template")
 // NewTemplateResource creates a TemplateResource.
 func NewTemplateResource(path string, config Config) (*TemplateResource, error) {
 	if config.StoreClient == nil {
-		return nil, errors.New("A valid StoreClient is required.")
+		return nil, errors.New("a valid StoreClient is required")
 	}
 
 	// Set the default uid and gid so we can determine if it was
@@ -74,7 +74,7 @@ func NewTemplateResource(path string, config Config) (*TemplateResource, error) 
 	log.Debug("Loading template resource from " + path)
 	_, err := toml.DecodeFile(path, &tc)
 	if err != nil {
-		return nil, fmt.Errorf("Cannot process template resource %s - %s", path, err.Error())
+		return nil, fmt.Errorf("cannot process template resource %s - %s", path, err.Error())
 	}
 
 	tr := &tc.TemplateResource
@@ -86,6 +86,9 @@ func NewTemplateResource(path string, config Config) (*TemplateResource, error) 
 	tr.syncOnly = config.SyncOnly
 	addFuncs(tr.funcMap, tr.store.FuncMap)
 
+	// Add Calico-specific functions.
+	addCalicoFuncs(tr.funcMap)
+
 	if runtime.GOOS == "windows" {
 		// On Windows HPC containers, $PATH does not contain the directory with 'powershell.exe'. Add it so that the powershell command works.
 		_, err = exec.LookPath("powershell.exe")
@@ -93,11 +96,11 @@ func NewTemplateResource(path string, config Config) (*TemplateResource, error) 
 			path := os.Getenv("PATH")
 			err = os.Setenv("PATH", path+";C:/Windows/System32/WindowsPowerShell/v1.0/")
 			if err != nil {
-				return nil, fmt.Errorf("Cannot add powershell to Windows PATH: %s", err.Error())
+				return nil, fmt.Errorf("cannot add powershell to Windows PATH: %s", err.Error())
 			}
 			_, err = exec.LookPath("powershell.exe")
 			if err != nil {
-				return nil, fmt.Errorf("Cannot find powershell.exe after addding default path to Windows PATH: %s", err.Error())
+				return nil, fmt.Errorf("cannot find powershell.exe after addding default path to Windows PATH: %s", err.Error())
 			}
 		}
 		tr.shellCmd = "powershell.exe"
@@ -169,7 +172,7 @@ func (t *TemplateResource) createStageFile() error {
 
 	tmpl, err := template.New(filepath.Base(t.Src)).Funcs(t.funcMap).ParseFiles(t.Src)
 	if err != nil {
-		return fmt.Errorf("Unable to process template %s, %s", t.Src, err)
+		return fmt.Errorf("unable to process template %s, %s", t.Src, err)
 	}
 
 	// create TempFile in Dest directory to avoid cross-filesystem issues
@@ -178,7 +181,7 @@ func (t *TemplateResource) createStageFile() error {
 		return err
 	}
 
-	if err = tmpl.Execute(temp, nil); err != nil {
+	if err = tmpl.Execute(temp, t.storeClient); err != nil {
 		// The key error to return is the failure to execute.
 		// to preserve that error ignore the errors in close and clean
 		temp.Close()           // nolint:errcheck

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -21,28 +19,27 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/projectcalico/calico/felix/fv/connectivity"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
-
 	"github.com/vishvananda/netlink"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/metrics"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/netlinkutils"
 )
 
-var _ = Context("etcd connection interruption", func() {
-
+var _ = infrastructure.DatastoreDescribe("etcd connection interruption", []apiconfig.DatastoreType{apiconfig.EtcdV3}, func(getInfra infrastructure.InfraFactory) {
 	var (
 		etcd   *containers.Container
 		tc     infrastructure.TopologyContainers
@@ -53,12 +50,26 @@ var _ = Context("etcd connection interruption", func() {
 	)
 
 	BeforeEach(func() {
-		tc, etcd, client, infra = infrastructure.StartNNodeEtcdTopology(2, infrastructure.DefaultTopologyOptions())
+		if NFTMode() {
+			Skip("Test is dataplane independent, skip for nftables")
+		}
+		infra = getInfra()
+		tc, client = infrastructure.StartNNodeTopology(2, infrastructure.DefaultTopologyOptions(), infra)
+		etcd = infra.(*infrastructure.EtcdDatastoreInfra).EtcdContainer
 		infrastructure.CreateDefaultProfile(client, "default", map[string]string{"default": ""}, "")
 		// Wait until the tunl0 device appears; it is created when felix inserts the ipip module
 		// into the kernel.
 		Eventually(func() error {
-			links, err := netlink.LinkList()
+			nlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := nlHandle.Close(); err != nil {
+					logrus.WithError(err).Warn("Failed to close netlink handle")
+				}
+			}()
+			links, err := netlinkutils.LinkListRetryEINTR(nlHandle)
 			if err != nil {
 				return err
 			}
@@ -74,32 +85,12 @@ var _ = Context("etcd connection interruption", func() {
 		for ii := range w {
 			wIP := fmt.Sprintf("10.65.%d.2", ii)
 			wName := fmt.Sprintf("w%d", ii)
+			infrastructure.AssignIP(wName, wIP, tc.Felixes[ii].Hostname, client)
 			w[ii] = workload.Run(tc.Felixes[ii], wName, "default", wIP, "8055", "tcp")
 			w[ii].Configure(client)
 		}
 
 		cc = &connectivity.Checker{}
-	})
-
-	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			for _, felix := range tc.Felixes {
-				felix.Exec("iptables-save", "-c")
-				felix.Exec("ipset", "list")
-				felix.Exec("ip", "r")
-			}
-		}
-
-		for _, wl := range w {
-			wl.Stop()
-		}
-		tc.Stop()
-
-		if CurrentGinkgoTestDescription().Failed {
-			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
-		}
-		etcd.Stop()
-		infra.Stop()
 	})
 
 	It("shouldn't use excessive CPU when etcd is stopped", func() {
@@ -135,14 +126,14 @@ var _ = Context("etcd connection interruption", func() {
 			// FIN or RST responses, which cleanly shut down the connection.  However, in order
 			// to test the GRPC-level keep-alive, we want to simulate a network or NAT change that
 			// starts to black-hole the TCP connection so that there are no responses of any kind.
-			var portRegexp = regexp.MustCompile(`sport=(\d+).*dport=2379`)
+			portRegexp := regexp.MustCompile(`sport=(\d+).*dport=2379`)
 			for _, felix := range tc.Felixes {
 				// Use conntrack to identify the source port that Felix is using.
 				out, err := felix.ExecOutput("conntrack", "-L")
 				Expect(err).NotTo(HaveOccurred())
 				logrus.WithField("output", out).WithError(err).Info("Conntrack entries")
 				found := false
-				for _, line := range strings.Split(out, "\n") {
+				for line := range strings.SplitSeq(out, "\n") {
 					matches := portRegexp.FindStringSubmatch(line)
 					if len(matches) < 2 {
 						continue

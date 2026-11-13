@@ -1,17 +1,27 @@
-// Copyright (c) 2019-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package calico
 
 import (
 	"reflect"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/klog/v2"
 
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
@@ -32,13 +42,29 @@ func aapiError(err error, key string) error {
 // This is common code. Refactor this workflow.
 func convertToAAPI(libcalicoObject runtime.Object) (res runtime.Object) {
 	switch obj := libcalicoObject.(type) {
+	case *v3.Tier:
+		aapiTier := &v3.Tier{}
+		TierConverter{}.convertToAAPI(obj, aapiTier)
+		return aapiTier
 	case *v3.NetworkPolicy:
 		aapiPolicy := &v3.NetworkPolicy{}
 		NetworkPolicyConverter{}.convertToAAPI(obj, aapiPolicy)
 		return aapiPolicy
+	case *v3.StagedKubernetesNetworkPolicy:
+		aapiPolicy := &v3.StagedKubernetesNetworkPolicy{}
+		StagedKubernetesNetworkPolicyConverter{}.convertToAAPI(obj, aapiPolicy)
+		return aapiPolicy
+	case *v3.StagedNetworkPolicy:
+		aapiPolicy := &v3.StagedNetworkPolicy{}
+		StagedNetworkPolicyConverter{}.convertToAAPI(obj, aapiPolicy)
+		return aapiPolicy
 	case *v3.GlobalNetworkPolicy:
 		aapiPolicy := &v3.GlobalNetworkPolicy{}
 		GlobalNetworkPolicyConverter{}.convertToAAPI(obj, aapiPolicy)
+		return aapiPolicy
+	case *v3.StagedGlobalNetworkPolicy:
+		aapiPolicy := &v3.StagedGlobalNetworkPolicy{}
+		StagedGlobalNetworkPolicyConverter{}.convertToAAPI(obj, aapiPolicy)
 		return aapiPolicy
 	case *v3.GlobalNetworkSet:
 		aapiNetworkSet := &v3.GlobalNetworkSet{}
@@ -92,18 +118,16 @@ func convertToAAPI(libcalicoObject runtime.Object) (res runtime.Object) {
 		aapi := &v3.CalicoNodeStatus{}
 		CalicoNodeStatusConverter{}.convertToAAPI(obj, aapi)
 		return aapi
-	case *libapi.IPAMConfig:
+	case *v3.IPAMConfiguration:
 		aapi := &v3.IPAMConfiguration{}
 		IPAMConfigConverter{}.convertToAAPI(obj, aapi)
 		return aapi
-	// BlockAffinity works off of the libapi objects since
-	// the v3 client is used for mostly internal operations.
-	case *libapi.BlockAffinity:
+	case *v3.BlockAffinity:
 		aapi := &v3.BlockAffinity{}
 		BlockAffinityConverter{}.convertToAAPI(obj, aapi)
 		return aapi
 	default:
-		klog.Infof("Unrecognized libcalico object (type %v)", reflect.TypeOf(libcalicoObject))
+		logrus.Tracef("Unrecognized libcalico object (type %v)", reflect.TypeOf(libcalicoObject))
 		return nil
 	}
 }

@@ -1,17 +1,20 @@
 - name: key-cert-provisioner
   run:
-    when: "${FORCE_RUN} or change_in(['/*', '/key-cert-provisioner/'], {exclude: ['/**/.gitignore', '/**/README.md', '/**/LICENSE']})"
+    when: "${CHANGE_IN(key-cert-provisioner)}"
   dependencies:
     - Prerequisites
   task:
-    agent:
-      machine:
-        type: e1-standard-2
-        os_image: ubuntu2004
+    env_vars:
+      - name: BUILD_CACHE_GROUP
+        value: "calico"
     prologue:
       commands:
         - cd key-cert-provisioner
     jobs:
-      - name: key-cert-provisioner tests
+      - name: "key-cert-provisioner: CI"
         commands:
           - ../.semaphore/run-and-monitor ci.log make ci
+    epilogue:
+      always:
+        commands:
+          - 'test-results publish --name "${SEMAPHORE_JOB_NAME}" ./report/*.xml || true'

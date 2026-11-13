@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ import (
 	"context"
 	"fmt"
 
+	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-
-	calico "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 type policyStrategy struct {
@@ -50,14 +49,14 @@ func (policyStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Obj
 
 func (policyStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	return field.ErrorList{}
-	//return validation.ValidatePolicy(obj.(*calico.Policy))
+	// return validation.ValidatePolicy(obj.(*calico.Policy))
 }
 
-func (policyStrategy) AllowCreateOnUpdate() bool {
+func (policyStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (policyStrategy) AllowUnconditionalUpdate() bool {
+func (policyStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -80,9 +79,9 @@ func (policyStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Objec
 func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	policy, ok := obj.(*calico.NetworkPolicy)
 	if !ok {
-		return nil, nil, fmt.Errorf("given object is not a Policy.")
+		return nil, nil, fmt.Errorf("given object is not a Policy")
 	}
-	return labels.Set(policy.ObjectMeta.Labels), PolicyToSelectableFields(policy), nil
+	return labels.Set(policy.Labels), PolicyToSelectableFields(policy), nil
 }
 
 // MatchPolicy is the filter used by the generic etcd backend to watch events
@@ -100,5 +99,6 @@ func PolicyToSelectableFields(obj *calico.NetworkPolicy) fields.Set {
 	return fields.Set{
 		"metadata.name":      obj.Name,
 		"metadata.namespace": obj.Namespace,
+		"spec.tier":          obj.Spec.Tier,
 	}
 }

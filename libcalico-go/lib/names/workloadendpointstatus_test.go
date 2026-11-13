@@ -15,13 +15,11 @@
 package names_test
 
 import (
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/felix/proto"
-	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 )
@@ -38,23 +36,14 @@ var _ = DescribeTable("WorkloadEndpointKey to endpoint-status filename",
 	Entry("Nil key", nil, ""),
 )
 
-var _ = DescribeTable("WorkloadEndpointID to model.WorkloadEndpointKey",
-	func(wepID *proto.WorkloadEndpointID, hostname string, expectedKey *model.WorkloadEndpointKey) {
-		genKey := names.WorkloadEndpointIDToWorkloadEndpointKey(wepID, hostname)
-		Expect(genKey).To(Equal(expectedKey))
-	},
-	Entry("Valid workload endpoint ID", &proto.WorkloadEndpointID{OrchestratorId: "k8s", WorkloadId: "default/testpod1", EndpointId: "eth0"}, "cluster-node-0", &model.WorkloadEndpointKey{Hostname: "cluster-node-0", OrchestratorID: "k8s", WorkloadID: "default/testpod1", EndpointID: "eth0"}),
-	Entry("Nil ID", nil, "", nil),
-)
-
 var _ = DescribeTable("V3 WorkloadEndpoint to model WorkloadEndpointKey",
-	func(ep *v3.WorkloadEndpoint, expectedKey *model.WorkloadEndpointKey) {
+	func(ep *internalapi.WorkloadEndpoint, expectedKey *model.WorkloadEndpointKey) {
 		genKey, err := names.V3WorkloadEndpointToWorkloadEndpointKey(ep)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(genKey).To(BeEquivalentTo(expectedKey))
 	},
 	Entry("Valid, FV endpoint (etcd datastore)",
-		&v3.WorkloadEndpoint{
+		&internalapi.WorkloadEndpoint{
 			//"felixfv default%2Fworkload-endpoint-status-tests-0-idx7 workload-endpoint-status-tests-0-idx7"
 			TypeMeta: v1.TypeMeta{
 				Kind:       "WorkloadEndpoint",
@@ -77,7 +66,7 @@ var _ = DescribeTable("V3 WorkloadEndpoint to model WorkloadEndpointKey",
 				Finalizers:                 nil,
 				ManagedFields:              nil,
 			},
-			Spec: v3.WorkloadEndpointSpec{
+			Spec: internalapi.WorkloadEndpointSpec{
 				Orchestrator:               "felixfv",
 				Workload:                   "workload-endpoint-status-tests-0-idx7",
 				Node:                       "felix-0-821432-15-felixfv",
@@ -105,7 +94,7 @@ var _ = DescribeTable("V3 WorkloadEndpoint to model WorkloadEndpointKey",
 	),
 
 	Entry("Valid, FV endpoint (kubernetes datastore)",
-		&v3.WorkloadEndpoint{
+		&internalapi.WorkloadEndpoint{
 			//"k8s default%2Fworkload-endpoint-status-tests-0-idx3 eth0"
 			TypeMeta: v1.TypeMeta{
 				Kind:       "WorkloadEndpoint",
@@ -128,7 +117,7 @@ var _ = DescribeTable("V3 WorkloadEndpoint to model WorkloadEndpointKey",
 				Finalizers:                 nil,
 				ManagedFields:              nil,
 			},
-			Spec: v3.WorkloadEndpointSpec{
+			Spec: internalapi.WorkloadEndpointSpec{
 				Orchestrator:               "k8s",
 				Workload:                   "workload-endpoint-status-tests-0-idx3",
 				Node:                       "felix-0-821432-9-felixfv",

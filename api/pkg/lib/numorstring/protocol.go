@@ -119,7 +119,7 @@ func (p Protocol) NumValue() (uint8, error) {
 	return (Uint8OrString)(p).NumValue()
 }
 
-// SupportsPorts returns whether this protocol supports ports.  This returns true if
+// SupportsProtocols returns whether this protocol supports ports.  This returns true if
 // the numerical or string version of the protocol indicates TCP (6), UDP (17), or SCTP (132).
 func (p Protocol) SupportsPorts() bool {
 	num, err := p.NumValue()
@@ -137,9 +137,9 @@ func (p Protocol) SupportsPorts() bool {
 // OpenAPISchemaType is used by the kube-openapi generator when constructing
 // the OpenAPI spec of this type.
 // See: https://github.com/kubernetes/kube-openapi/tree/master/pkg/generators
-func (_ Protocol) OpenAPISchemaType() []string { return []string{"string"} }
+func (Protocol) OpenAPISchemaType() []string { return []string{"string"} }
 
 // OpenAPISchemaFormat is used by the kube-openapi generator when constructing
 // the OpenAPI spec of this type.
 // See: https://github.com/kubernetes/kube-openapi/tree/master/pkg/generators
-func (_ Protocol) OpenAPISchemaFormat() string { return "int-or-string" }
+func (Protocol) OpenAPISchemaFormat() string { return "int-or-string" }

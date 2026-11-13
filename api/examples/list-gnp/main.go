@@ -19,16 +19,14 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
 )
 
 func main() {
 	// Create a new config based on kubeconfig file.
-	var kubeconfig *string
-	kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	kubeconfig := flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.Parse()
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {

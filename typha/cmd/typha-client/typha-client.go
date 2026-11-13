@@ -20,15 +20,14 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/docopt/docopt-go"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/docopt/docopt-go"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/typha/pkg/buildinfo"
+	"github.com/projectcalico/calico/pkg/buildinfo"
 	"github.com/projectcalico/calico/typha/pkg/config"
 	"github.com/projectcalico/calico/typha/pkg/discovery"
-	"github.com/projectcalico/calico/typha/pkg/logutils"
+	"github.com/projectcalico/calico/typha/pkg/logging"
 	"github.com/projectcalico/calico/typha/pkg/syncclient"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 )
@@ -71,14 +70,14 @@ func (s *syncerCallbacks) OnUpdates(updates []api.Update) {
 
 func main() {
 	// Set up logging.
-	logutils.ConfigureEarlyLogging()
-	logutils.ConfigureLogging(&config.Config{
+	logging.ConfigureEarlyLogging()
+	logging.ConfigureLogging(&config.Config{
 		LogSeverityScreen:       "info",
 		DebugDisableLogDropping: true,
 	})
 
 	// Parse command-line args.
-	version := "Version:            " + buildinfo.GitVersion + "\n" +
+	version := "Version:            " + buildinfo.Version + "\n" +
 		"Full git commit ID: " + buildinfo.GitRevision + "\n" +
 		"Build date:         " + buildinfo.BuildDate + "\n"
 	p := &docopt.Parser{OptionsFirst: false, SkipHelpFlags: false}
@@ -88,7 +87,7 @@ func main() {
 		log.Fatalf("Failed to parse usage, exiting: %v", err)
 	}
 	buildInfoLogCxt := log.WithFields(log.Fields{
-		"version":    buildinfo.GitVersion,
+		"version":    buildinfo.Version,
 		"buildDate":  buildinfo.BuildDate,
 		"gitCommit":  buildinfo.GitRevision,
 		"GOMAXPROCS": runtime.GOMAXPROCS(0),
@@ -113,7 +112,7 @@ func main() {
 
 	hostname, _ := os.Hostname()
 	discoverer := discovery.New(discovery.WithAddrOverride(addr))
-	client := syncclient.New(discoverer, buildinfo.GitVersion, hostname, "typha command-line client", callbacks, options)
+	client := syncclient.New(discoverer, buildinfo.Version, hostname, "typha command-line client", callbacks, options)
 	err = client.Start(context.Background())
 	if err != nil {
 		log.WithError(err).Panic("Client failed")

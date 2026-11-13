@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@ package resources
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	kapiv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -29,14 +32,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
-	"github.com/projectcalico/calico/libcalico-go/lib/json"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	validatorv3 "github.com/projectcalico/calico/libcalico-go/lib/validator/v3"
 )
@@ -50,15 +49,17 @@ const (
 	nodeBgpVXLANTunnelMACAddrV6Annotation = "projectcalico.org/VXLANTunnelMACAddrV6"
 	nodeBgpIpv6AddrAnnotation             = "projectcalico.org/IPv6Address"
 	nodeBgpAsnAnnotation                  = "projectcalico.org/ASNumber"
-	nodeBgpCIDAnnotation                  = "projectcalico.org/RouteReflectorClusterID"
 	nodeK8sLabelAnnotation                = "projectcalico.org/kube-labels"
 	nodeWireguardIpv4IfaceAddrAnnotation  = "projectcalico.org/IPv4WireguardInterfaceAddr"
 	nodeWireguardIpv6IfaceAddrAnnotation  = "projectcalico.org/IPv6WireguardInterfaceAddr"
 	nodeWireguardPublicKeyAnnotation      = "projectcalico.org/WireguardPublicKey"
 	nodeWireguardPublicKeyV6Annotation    = "projectcalico.org/WireguardPublicKeyV6"
+	nodeInterfacesAnnotation              = "projectcalico.org/Interfaces"
+
+	RouteReflectorClusterIDAnnotation = "projectcalico.org/RouteReflectorClusterID"
 )
 
-func NewNodeClient(c *kubernetes.Clientset, usePodCIDR bool) K8sResourceClient {
+func NewNodeClient(c kubernetes.Interface, usePodCIDR bool) K8sResourceClient {
 	return &nodeClient{
 		clientSet:  c,
 		usePodCIDR: usePodCIDR,
@@ -69,7 +70,7 @@ type validatorFunc func(string) error
 
 // Implements the api.Client interface for Nodes.
 type nodeClient struct {
-	clientSet  *kubernetes.Clientset
+	clientSet  kubernetes.Interface
 	usePodCIDR bool
 }
 
@@ -89,7 +90,7 @@ func (c *nodeClient) Update(ctx context.Context, kvp *model.KVPair) (*model.KVPa
 		return nil, K8sErrorToCalico(err, kvp.Key)
 	}
 
-	node, err := mergeCalicoNodeIntoK8sNode(kvp.Value.(*libapiv3.Node), oldNode)
+	node, err := mergeCalicoNodeIntoK8sNode(kvp.Value.(*internalapi.Node), oldNode)
 	if err != nil {
 		return nil, err
 	}
@@ -141,31 +142,13 @@ func (c *nodeClient) List(ctx context.Context, list model.ListInterface, revisio
 	logContext := log.WithField("Resource", "Node")
 	logContext.Debug("Received List request")
 	nl := list.(model.ResourceListOptions)
-	kvps := []*model.KVPair{}
-
-	if nl.Name != "" {
-		// The node is already fully qualified, so perform a Get instead.
-		// If the entry does not exist then we just return an empty list.
-		kvp, err := c.Get(ctx, model.ResourceKey{Name: nl.Name, Kind: libapiv3.KindNode}, revision)
-		if err != nil {
-			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-				return nil, err
-			}
-			return &model.KVPairList{
-				KVPairs:  kvps,
-				Revision: revision,
-			}, nil
-		}
-
-		kvps = append(kvps, kvp)
-		return &model.KVPairList{
-			KVPairs:  kvps,
-			Revision: revision,
-		}, nil
-	}
 
 	// List all nodes.
 	listFunc := func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+		if nl.Name != "" {
+			// Filtering to a single node.
+			opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", nl.Name).String()
+		}
 		nodes, err := c.clientSet.CoreV1().Nodes().List(ctx, opts)
 		if err != nil {
 			return nil, err
@@ -187,20 +170,20 @@ func (c *nodeClient) EnsureInitialized() error {
 	return nil
 }
 
-func (c *nodeClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
+func (c *nodeClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
 	// Build watch options to pass to k8s.
-	opts := metav1.ListOptions{ResourceVersion: revision, Watch: true, AllowWatchBookmarks: false}
 	rlo, ok := list.(model.ResourceListOptions)
 	if !ok {
 		return nil, fmt.Errorf("ListInterface is not a ResourceListOptions: %s", list)
 	}
+	k8sOpts := watchOptionsToK8sListOptions(options)
 	if len(rlo.Name) != 0 {
 		// We've been asked to watch a specific node resource.
 		log.WithField("name", rlo.Name).Debug("Watching a single node")
-		opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", rlo.Name).String()
+		k8sOpts.FieldSelector = fields.OneTermEqualSelector("metadata.name", rlo.Name).String()
 	}
 
-	k8sWatch, err := c.clientSet.CoreV1().Nodes().Watch(ctx, opts)
+	k8sWatch, err := c.clientSet.CoreV1().Nodes().Watch(ctx, k8sOpts)
 	if err != nil {
 		return nil, K8sErrorToCalico(err, list)
 	}
@@ -217,7 +200,7 @@ func (c *nodeClient) Watch(ctx context.Context, list model.ListInterface, revisi
 // K8sNodeToCalico converts a Kubernetes format node, with Calico annotations, to a Calico Node.
 func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, error) {
 	// Create a new CalicoNode resource and copy the settings across from the k8s Node.
-	calicoNode := libapiv3.NewNode()
+	calicoNode := internalapi.NewNode()
 	calicoNode.ObjectMeta.Name = k8sNode.Name
 	SetCalicoMetadataFromK8sAnnotations(calicoNode, k8sNode)
 
@@ -229,11 +212,11 @@ func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, erro
 	}
 
 	// Extract the BGP configuration stored in the annotations.
-	bgpSpec := &libapiv3.NodeBGPSpec{}
+	bgpSpec := &internalapi.NodeBGPSpec{}
 	annotations := k8sNode.ObjectMeta.Annotations
 	bgpSpec.IPv4Address = getAnnotation(k8sNode, nodeBgpIpv4AddrAnnotation, validatorv3.ValidateCIDRv4)
 	bgpSpec.IPv6Address = getAnnotation(k8sNode, nodeBgpIpv6AddrAnnotation, validatorv3.ValidateCIDRv6)
-	bgpSpec.RouteReflectorClusterID = getAnnotation(k8sNode, nodeBgpCIDAnnotation, validatorv3.ValidateIPv4Network)
+	bgpSpec.RouteReflectorClusterID = getAnnotation(k8sNode, RouteReflectorClusterIDAnnotation, validatorv3.ValidateIPv4Network)
 
 	asnString, ok := annotations[nodeBgpAsnAnnotation]
 	if ok {
@@ -246,10 +229,10 @@ func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, erro
 	}
 
 	// Initialize the wireguard spec. We'll include it if it contains non-zero data.
-	wireguardSpec := &libapiv3.NodeWireguardSpec{}
+	wireguardSpec := &internalapi.NodeWireguardSpec{}
 
 	// Add in an orchestrator reference back to the Kubernetes node name.
-	calicoNode.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: k8sNode.Name, Orchestrator: apiv3.OrchestratorKubernetes}}
+	calicoNode.Spec.OrchRefs = []internalapi.OrchRef{{NodeName: k8sNode.Name, Orchestrator: apiv3.OrchestratorKubernetes}}
 
 	// If using host-local IPAM, assign an IPIP and wireguard tunnel address statically. They can both have the same IP.
 	if usePodCIDR && k8sNode.Spec.PodCIDR != "" {
@@ -273,12 +256,12 @@ func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, erro
 	}
 
 	// Only set the BGP spec if it is not empty.
-	if !reflect.DeepEqual(*bgpSpec, libapiv3.NodeBGPSpec{}) {
+	if !reflect.DeepEqual(*bgpSpec, internalapi.NodeBGPSpec{}) {
 		calicoNode.Spec.BGP = bgpSpec
 	}
 
 	// Only set the Wireguard spec if it is not empty.
-	if !reflect.DeepEqual(*wireguardSpec, libapiv3.NodeWireguardSpec{}) {
+	if !reflect.DeepEqual(*wireguardSpec, internalapi.NodeWireguardSpec{}) {
 		calicoNode.Spec.Wireguard = wireguardSpec
 	}
 
@@ -289,10 +272,10 @@ func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, erro
 	calicoNode.Spec.VXLANTunnelMACAddrV6 = getAnnotation(k8sNode, nodeBgpVXLANTunnelMACAddrV6Annotation, validatorv3.ValidateMAC)
 
 	// Set the node status
-	nodeStatus := libapiv3.NodeStatus{}
+	nodeStatus := internalapi.NodeStatus{}
 	nodeStatus.WireguardPublicKey = annotations[nodeWireguardPublicKeyAnnotation]
 	nodeStatus.WireguardPublicKeyV6 = annotations[nodeWireguardPublicKeyV6Annotation]
-	if !reflect.DeepEqual(nodeStatus, libapiv3.NodeStatus{}) {
+	if !reflect.DeepEqual(nodeStatus, internalapi.NodeStatus{}) {
 		calicoNode.Status = nodeStatus
 	}
 
@@ -307,42 +290,70 @@ func K8sNodeToCalico(k8sNode *kapiv1.Node, usePodCIDR bool) (*model.KVPair, erro
 	// Fill the list of all addresses from the calico Node
 	fillAllAddresses(calicoNode, k8sNode)
 
+	// Fill the node with all detected interfaces
+	fillAllInterfaces(calicoNode, k8sNode)
+
 	// Create the resource key from the node name.
 	return &model.KVPair{
 		Key: model.ResourceKey{
 			Name: k8sNode.Name,
-			Kind: libapiv3.KindNode,
+			Kind: internalapi.KindNode,
 		},
 		Value:    calicoNode,
 		Revision: k8sNode.ObjectMeta.ResourceVersion,
 	}, nil
 }
 
-func fillAllAddresses(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node) {
+func fillAllAddresses(calicoNode *internalapi.Node, k8sNode *kapiv1.Node) {
 	if bgp := calicoNode.Spec.BGP; bgp != nil {
 		if addr := bgp.IPv4Address; addr != "" {
-			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, libapiv3.NodeAddress{Address: addr, Type: libapiv3.CalicoNodeIP})
+			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, internalapi.NodeAddress{Address: addr, Type: internalapi.CalicoNodeIP})
 		}
 		if addr := bgp.IPv6Address; addr != "" {
-			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, libapiv3.NodeAddress{Address: addr, Type: libapiv3.CalicoNodeIP})
+			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, internalapi.NodeAddress{Address: addr, Type: internalapi.CalicoNodeIP})
 		}
 	}
 
 	for _, kaddr := range k8sNode.Status.Addresses {
 		switch kaddr.Type {
 		case kapiv1.NodeInternalIP:
-			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, libapiv3.NodeAddress{Address: kaddr.Address, Type: libapiv3.InternalIP})
+			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, internalapi.NodeAddress{Address: kaddr.Address, Type: internalapi.InternalIP})
 		case kapiv1.NodeExternalIP:
-			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, libapiv3.NodeAddress{Address: kaddr.Address, Type: libapiv3.ExternalIP})
+			calicoNode.Spec.Addresses = append(calicoNode.Spec.Addresses, internalapi.NodeAddress{Address: kaddr.Address, Type: internalapi.ExternalIP})
 		default:
 			continue
 		}
 	}
 }
 
+func fillAllInterfaces(calicoNode *internalapi.Node, k8sNode *kapiv1.Node) {
+	annotations := k8sNode.ObjectMeta.Annotations
+	interfaces := []internalapi.NodeInterface{}
+	if _, ok := annotations[nodeInterfacesAnnotation]; !ok {
+		// The annotation is not present, so we don't have any interfaces to fill.
+		return
+	}
+	err := json.Unmarshal([]byte(annotations[nodeInterfacesAnnotation]), &interfaces)
+	if err != nil {
+		log.WithError(err).Error("Failed to unmarshal node interface annotation")
+		return
+	}
+	// Validate addresses in interfaces.
+	for i, iface := range interfaces {
+		for j, addr := range iface.Addresses {
+			if net.ParseIP(addr) == nil {
+				log.WithFields(log.Fields{"interface": iface.Name, "address": addr}).Error("Invalid IP address in interface, skipping")
+				// Remove invalid address
+				interfaces[i].Addresses = append(interfaces[i].Addresses[:j], interfaces[i].Addresses[j+1:]...)
+			}
+		}
+	}
+	calicoNode.Spec.Interfaces = interfaces
+}
+
 // mergeCalicoNodeIntoK8sNode takes a k8s node and a Calico node and puts the values from the Calico
 // node into the k8s node.
-func mergeCalicoNodeIntoK8sNode(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node) (*kapiv1.Node, error) {
+func mergeCalicoNodeIntoK8sNode(calicoNode *internalapi.Node, k8sNode *kapiv1.Node) (*kapiv1.Node, error) {
 	// Nodes inherit labels from Kubernetes, but we also have our own set of labels that are stored in an annotation.
 	// For nodes that are being updated, we want to avoid writing k8s labels that we inherited into our annotation
 	// and we don't want to touch the k8s labels directly.  Take a copy of the node resource and update its labels
@@ -389,7 +400,7 @@ func mergeCalicoNodeIntoK8sNode(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node)
 		delete(k8sNode.Annotations, nodeBgpIpv4IPIPTunnelAddrAnnotation)
 		delete(k8sNode.Annotations, nodeBgpIpv6AddrAnnotation)
 		delete(k8sNode.Annotations, nodeBgpAsnAnnotation)
-		delete(k8sNode.Annotations, nodeBgpCIDAnnotation)
+		delete(k8sNode.Annotations, RouteReflectorClusterIDAnnotation)
 	} else {
 		// If the BGP spec is not nil, then handle each field within the BGP spec individually.
 		if calicoNode.Spec.BGP.IPv4Address != "" {
@@ -417,9 +428,9 @@ func mergeCalicoNodeIntoK8sNode(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node)
 		}
 
 		if calicoNode.Spec.BGP.RouteReflectorClusterID != "" {
-			k8sNode.Annotations[nodeBgpCIDAnnotation] = calicoNode.Spec.BGP.RouteReflectorClusterID
+			k8sNode.Annotations[RouteReflectorClusterIDAnnotation] = calicoNode.Spec.BGP.RouteReflectorClusterID
 		} else {
-			delete(k8sNode.Annotations, nodeBgpCIDAnnotation)
+			delete(k8sNode.Annotations, RouteReflectorClusterIDAnnotation)
 		}
 	}
 
@@ -452,6 +463,18 @@ func mergeCalicoNodeIntoK8sNode(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node)
 		delete(k8sNode.Annotations, nodeWireguardPublicKeyV6Annotation)
 	}
 
+	// Handle detected interfaces
+	if calicoNode.Spec.Interfaces != nil {
+		interfaces, err := json.Marshal(calicoNode.Spec.Interfaces)
+		if err != nil {
+			log.WithError(err).Error("Error serializing interfaces")
+		} else {
+			k8sNode.Annotations[nodeInterfacesAnnotation] = string(interfaces)
+		}
+	} else {
+		delete(k8sNode.Annotations, nodeInterfacesAnnotation)
+	}
+
 	return k8sNode, nil
 }
 
@@ -462,7 +485,7 @@ func mergeCalicoNodeIntoK8sNode(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node)
 //
 // Note: if a Kubernetes label shadows a Calico label, the Calico label will be lost when the resource is written
 // back to the datastore.  This is consistent with kube-controllers' behavior.
-func mergeCalicoAndK8sLabels(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node) error {
+func mergeCalicoAndK8sLabels(calicoNode *internalapi.Node, k8sNode *kapiv1.Node) error {
 	// Now, copy the Kubernetes Node labels over.  Note: this may overwrite Calico labels of the same name, but that's
 	// consistent with the kube-controllers behavior.
 	for k, v := range k8sNode.Labels {
@@ -488,7 +511,7 @@ func mergeCalicoAndK8sLabels(calicoNode *libapiv3.Node, k8sNode *kapiv1.Node) er
 
 // restoreCalicoLabels tries to undo the transformation done by mergeCalicoLabels.  If no changes are needed, it
 // returns the input value; otherwise, it returns a copy.
-func restoreCalicoLabels(calicoNode *libapiv3.Node) (*libapiv3.Node, error) {
+func restoreCalicoLabels(calicoNode *internalapi.Node) (*internalapi.Node, error) {
 	rawLabels := calicoNode.Annotations[nodeK8sLabelAnnotation]
 	if rawLabels == "" {
 		return calicoNode, nil

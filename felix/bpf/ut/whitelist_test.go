@@ -17,13 +17,13 @@ package ut_test
 import (
 	"testing"
 
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
-	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
-
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	v4 "github.com/projectcalico/calico/felix/bpf/conntrack/v4"
 	"github.com/projectcalico/calico/felix/bpf/routes"
+	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
 	"github.com/projectcalico/calico/felix/ip"
 )
 
@@ -59,7 +59,7 @@ func TestAllowFromWorkloadExitHost(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		ct, err := conntrack.LoadMapMem(ctMap)
 		Expect(err).NotTo(HaveOccurred())
@@ -93,6 +93,117 @@ func TestAllowFromWorkloadExitHost(t *testing.T) {
 	})
 }
 
+func TestSkipIngressRedirect(t *testing.T) {
+	RegisterTestingT(t)
+
+	bpfIfaceName = "HWvwl"
+	defer func() { bpfIfaceName = "" }()
+	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
+	Expect(err).NotTo(HaveOccurred())
+	udp := l4.(*layers.UDP)
+
+	ctMap := conntrack.Map()
+	err = ctMap.EnsureExists()
+	Expect(err).NotTo(HaveOccurred())
+	resetCTMap(ctMap) // ensure it is clean
+	defer resetCTMap(ctMap)
+
+	hostIP = node1ip
+	// Insert a reverse route for the source workload.
+	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal := routes.NewValue(routes.FlagsRemoteWorkload | routes.FlagInIPAMPool).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	rtKey = routes.NewKey(dstV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagSkipIngressRedir|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	defer resetRTMap(rtMap)
+	ctKey := conntrack.NewKey(uint8(ipv4.Protocol),
+		ipv4.SrcIP, uint16(udp.SrcPort), ipv4.DstIP, uint16(udp.DstPort))
+	skbMark = 0
+	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+
+		ct, err := conntrack.LoadMapMem(ctMap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ct).Should(HaveKey(ctKey))
+
+		ctr := ct[ctKey]
+
+		// Approved by HEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// Not approved by WEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
+		Expect(ctr.Flags() & v4.FlagNoRedirPeer).To(Equal(v4.FlagNoRedirPeer))
+	})
+
+	// Reset route map and add reverse route from local workload with skip ingress redirect flag
+	resetRTMap(rtMap)
+	rtKey = routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagSkipIngressRedir|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	rtKey = routes.NewKey(dstV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+
+	resetCTMap(ctMap)
+
+	skbMark = 0
+	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+
+		ct, err := conntrack.LoadMapMem(ctMap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ct).Should(HaveKey(ctKey))
+
+		ctr := ct[ctKey]
+
+		// Approved by src WEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// Not approved by dst WEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
+		Expect(ctr.Flags() & v4.FlagNoRedirPeer).To(Equal(v4.FlagNoRedirPeer))
+	})
+
+	// A local workload sending to a local workload that opts out of ingress
+	// redirect: the opt-out belongs to the destination, so only the
+	// destination's route carries the flag.
+	resetRTMap(rtMap)
+	rtKey = routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	rtKey = routes.NewKey(dstV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagSkipIngressRedir|routes.FlagInIPAMPool, 2).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+
+	resetCTMap(ctMap)
+
+	skbMark = 0
+	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+
+		ct, err := conntrack.LoadMapMem(ctMap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ct).Should(HaveKey(ctKey))
+
+		// Without the flag on the conntrack entry, every packet after the
+		// first would be peer-redirected to the destination with its L2
+		// header unmodified.
+		Expect(ct[ctKey].Flags() & v4.FlagNoRedirPeer).To(Equal(v4.FlagNoRedirPeer))
+	})
+}
+
 func TestAllowEnterHostToWorkload(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -116,7 +227,7 @@ func TestAllowEnterHostToWorkload(t *testing.T) {
 	err = rtMap.Update(rtKey, rtVal)
 	Expect(err).NotTo(HaveOccurred())
 	rtKey = routes.NewKey(dstV4CIDR).AsBytes()
-	rtVal = routes.NewValueWithIfIndex(routes.FlagsRemoteWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
 	err = rtMap.Update(rtKey, rtVal)
 	Expect(err).NotTo(HaveOccurred())
 	defer resetRTMap(rtMap)
@@ -128,7 +239,7 @@ func TestAllowEnterHostToWorkload(t *testing.T) {
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		ct, err := conntrack.LoadMapMem(ctMap)
 		Expect(err).NotTo(HaveOccurred())
@@ -138,7 +249,7 @@ func TestAllowEnterHostToWorkload(t *testing.T) {
 
 		// Approved by HEP
 		Expect(ctr.Data().A2B.Approved).To(BeTrue())
-		// NOt approved by WEP yet
+		// Not approved by WEP yet
 		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
 	})
 
@@ -195,7 +306,7 @@ func TestAllowWorkloadToWorkload(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		ct, err := conntrack.LoadMapMem(ctMap)
 		Expect(err).NotTo(HaveOccurred())
@@ -290,7 +401,7 @@ func TestAllowFromHostExitHost(t *testing.T) {
 		respPkt := udpResponseRaw(pktBytes)
 		res, err := bpfrun(respPkt)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		dumpCTMap(ctMap)
 
@@ -338,7 +449,7 @@ func TestAllowEnterHostToWorkloadV6(t *testing.T) {
 	err = rtMapV6.Update(rtKey, rtVal)
 	Expect(err).NotTo(HaveOccurred())
 	rtKey = routes.NewKeyV6(dstV6CIDR).AsBytes()
-	rtVal = routes.NewValueV6WithIfIndex(routes.FlagsRemoteWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	rtVal = routes.NewValueV6WithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
 	err = rtMapV6.Update(rtKey, rtVal)
 	Expect(err).NotTo(HaveOccurred())
 	defer resetRTMap(rtMapV6)
@@ -352,7 +463,7 @@ func TestAllowEnterHostToWorkloadV6(t *testing.T) {
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		ct, err := conntrack.LoadMapMemV6(ctMapV6)
 		Expect(err).NotTo(HaveOccurred())
@@ -362,7 +473,7 @@ func TestAllowEnterHostToWorkloadV6(t *testing.T) {
 
 		// Approved by HEP
 		Expect(ctr.Data().A2B.Approved).To(BeTrue())
-		// NOt approved by WEP yet
+		// Not approved by WEP yet
 		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
 	}, withIPv6())
 

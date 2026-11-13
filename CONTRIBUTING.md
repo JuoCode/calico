@@ -20,6 +20,10 @@ for both you and your reviewer!
 Simple bug fixes can just be raised as a pull request. Make sure you describe the bug in the pull request description,
 and please try to reproduce the bug in a unit test. This will help ensure the bug stays fixed!
 
+### Did AI tools help write it?
+
+That's fine, and it doesn't change the process below. It does mean you should read [AI_POLICY.md](AI_POLICY.md) first: you are responsible for every line you submit, you need to disclose the assistance in the PR description, and you need to be able to explain the change yourself during review.
+
 ### Writing, testing, and building the code
 
 For more detailed information on the development process for Calico, see the [developer guide](DEVELOPER_GUIDE.md).
@@ -47,20 +51,23 @@ Once you've agreed on a design for your bugfix or new feature, development again
 #### Patching an older release
 
 If your contribution is intended for an older release, the change will need to be cherry-picked into the appropriate release branch after it has been reviewed
-and merged into master. **To make sure this happens, apply the `cherry-pick-candidate` label to the pull request or ask your reviewer to do so.**
+and merged into master.
 
-Once your reviewer agrees the patch is valid for cherry-picking, perform the following steps to create the cherry-pick PR.
+When picking changes to a release branch, you must cherry-pick the change to all release branches semantically after the target release as well. This ensures that if a user upgrades their cluster, they do not "lose" features that existed in a prior release.
 
-1. Check out the release branch corresponding to your target release, for example: `git fetch upstream; git checkout release-v2.5`.
-1. Create the cherry-pick branch based off of the target branch, for example: `git checkout -b cherry-pick-pr12345-v2.5 release-v2.5`
-1. Cherry-pick the commit to your new branch: `git cherry-pick [ORIGINAL_COMMIT_HASH]`
-1. Push the branch to your fork and create a PR against the appropriate `release-vX.Y` branch.
-   - Title the PR `[release-vX.Y] cherry-pick: ORIGINAL_TITLE`
-   - In the description, provide a link to the original PR so it can be traced more easily.
-   - Make sure the pull request is in the correct GitHub milestone for the next vX.Y.Z release.
-   - Make sure to write a release note, and apply the `release-note-required` label to the PR.
-1. Notify your original reviewer on the PR.
-1. Once your PR is merged, remove the `cherry-pick-candidate` label from the original PR and replace it with `cherry-pick-completed`.
+To create the cherry-pick PR, use `hack/cherry-pick-pull`:
+```
+<ENV_SETTINGS> ./hack/cherry-pick-pull origin/release-vX.YY <PR_NUMBER>
+```
+where `release-vX.YY` is the branch you are picking to.  In `<ENV_SETTINGS>` you may need (if you don't already have them in your environment):
+- `CHERRY_PICK=1`, to tell the script to use `git cherry-pick` instead of a sequence of individual commit patches
+- `GITHUB_TOKEN=<your GitHub token>`
+- `GITHUB_USER=<your GitHub user name>`
+- `FORK_REMOTE=<the remote name for the fork in which to create the PR branch>`.
+
+Then:
+- Make sure the pull request is in the correct GitHub milestone for the next vX.Y.Z release.
+- Get the pick PR approved, likely by asking the reviewer of the original PR, and merged.
 
 ### Release notes and documentation
 
@@ -82,7 +89,6 @@ Every PR needs one `release-note-*` label.
 
 Other optional labels:
 
-- `cherry-pick-candidate`: This PR should be cherry-picked to an earlier release. For bug fixes only.
 - `needs-operator-pr`: This PR is related to install and requires a corresponding change to the operator.
 
 ## Contributor Agreements

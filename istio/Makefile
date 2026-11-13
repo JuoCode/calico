@@ -1,0 +1,262 @@
+###############################################################################
+# Istio Component Makefile
+# Builds the Istio install-cni and pilot-discovery components
+###############################################################################
+include ../metadata.mk
+
+PACKAGE_NAME ?= github.com/projectcalico/calico/istio
+
+ISTIO_CNI_IMAGE ?= istio-install-cni
+ISTIO_PILOT_IMAGE ?= istio-pilot
+ISTIO_PROXYV2_IMAGE ?= istio-proxyv2
+ISTIO_ZTUNNEL_IMAGE ?= istio-ztunnel
+
+BUILD_IMAGES ?= $(ISTIO_CNI_IMAGE) $(ISTIO_PILOT_IMAGE) $(ISTIO_PROXYV2_IMAGE) $(ISTIO_ZTUNNEL_IMAGE)
+
+# Only amd64 and arm64 are supported. `=` (not `?=`) so env-provided ARCHES
+# from the release manager doesn't override the allowlist.
+ARCHES = amd64 arm64
+
+# Upstream version (configurable)
+ISTIO_VERSION ?= 1.31.3
+
+##############################################################################
+# Include lib.Makefile before anything else
+#   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
+#   that variable is evaluated when we declare DOCKER_RUN and siblings.
+##############################################################################
+include ../lib.Makefile
+
+###############################################################################
+# Source Download and Patching
+###############################################################################
+ISTIO_FETCHED = .istio.fetched
+ISTIO_DOWNLOADED = .istio.downloaded
+ZTUNNEL_DOWNLOADED = .ztunnel.downloaded
+
+DEP_PINS = dep-pins.txt
+
+.PHONY: init-istio-source init-ztunnel-source init-sources
+init-istio-source: $(ISTIO_DOWNLOADED)
+init-ztunnel-source: $(ZTUNNEL_DOWNLOADED)
+
+# init-sources is a barrier: all upstream sources must be downloaded and
+# patched before any per-arch image build runs. Without it, parallel sub-makes
+# race on creating the shared stamp files.
+init-sources: $(ISTIO_DOWNLOADED) $(ZTUNNEL_DOWNLOADED)
+
+# 	Each tree has its own patch root holding one directory per class, applied
+# 	in name order:
+# 	  patches/01-custom-patches/   - hand-written changes to the istio tree.
+# 	  patches/02-auto-gen-patches/ - derived from $(DEP_PINS); regenerated as a
+# 	                                 whole directory, not edited.
+# 	  ztunnel-patches/01-custom-patches/ - the same, for the ztunnel tree.
+#
+# 	Order matters: the baseline is taken after 01, so 02 is a delta on top of
+# 	it. They are applied by separate targets so the generator can start from a
+# 	tree with 01 but not 02. Trees are removed before extraction so a
+# 	re-extraction cannot mix in files, or a stale baseline, from an older tag.
+# 	-F0 drops patch's default fuzz: a stale patch fails rather than landing
+# 	somewhere approximate.
+$(ISTIO_FETCHED):
+	rm -rf istio && mkdir -p istio
+	$(call fetch_file,https://github.com/istio/istio/archive/refs/tags/$(ISTIO_VERSION).tar.gz,/tmp/calico-istio.tar.gz)
+	tar xz --strip-components=1 -C istio -f /tmp/calico-istio.tar.gz
+	rm -f /tmp/calico-istio.tar.gz
+	found=; \
+	for patch in patches/01-custom-patches/*.patch; do \
+		[ -f "$$patch" ] || continue; found=1; \
+		patch -d istio -p1 -F0 < "$$patch" || exit 1; \
+	done; \
+	[ -n "$$found" ] || { echo "error: no patches in patches/01-custom-patches/" >&2; exit 1; }
+# 	Record what the generator diffs against, before any dependency patch lands.
+	../hack/thirdparty/init-dep-baseline.sh istio
+	touch $@
+
+$(ISTIO_DOWNLOADED): $(ISTIO_FETCHED)
+# 	Reset to the fetch-time baseline so re-applying is idempotent.
+	cd istio && git checkout -- go.mod go.sum
+	for patch in patches/02-auto-gen-patches/*.patch; do \
+		if [ -f "$$patch" ]; then \
+			patch -d istio -p1 -F0 < "$$patch" || exit 1; \
+		fi; \
+	done
+	touch $@
+
+# 	Rebuild patches/02-auto-gen-patches/ from $(DEP_PINS), in the pinned Go toolchain --
+# 	go mod tidy's output depends on the Go version.
+.PHONY: regen-dep-patches
+regen-dep-patches: $(ISTIO_FETCHED)
+	$(DOCKER_GO_BUILD) ../hack/thirdparty/regen-dep-patch.sh istio $(DEP_PINS) patches/02-auto-gen-patches/0001-cve-dependency-fixes.patch
+
+# 	Fail if the checked-in patch is not what the pins produce.
+.PHONY: check-dep-patches
+check-dep-patches: regen-dep-patches
+	@changed=$$(git status --porcelain -- patches/02-auto-gen-patches); \
+	[ -z "$$changed" ] || { \
+		git --no-pager diff -- patches/02-auto-gen-patches; \
+		echo "$$changed"; \
+		echo "ERROR: patches/02-auto-gen-patches/ is not what $(DEP_PINS) produces."; \
+		echo "Run 'make -C istio regen-dep-patches' and commit the result."; \
+		exit 1; \
+	}
+
+$(ZTUNNEL_DOWNLOADED):
+	rm -rf ztunnel && mkdir -p ztunnel
+	$(call fetch_file,https://github.com/istio/ztunnel/archive/refs/tags/$(ISTIO_VERSION).tar.gz,/tmp/calico-ztunnel.tar.gz)
+	tar xz --strip-components=1 -C ztunnel -f /tmp/calico-ztunnel.tar.gz
+	rm -f /tmp/calico-ztunnel.tar.gz
+	found=; \
+	for patch in ztunnel-patches/01-custom-patches/*.patch; do \
+		[ -f "$$patch" ] || continue; found=1; \
+		patch -d ztunnel -p1 -F0 < "$$patch" || exit 1; \
+	done; \
+	[ -n "$$found" ] || { echo "error: no patches in ztunnel-patches/01-custom-patches/" >&2; exit 1; }
+	touch $@
+
+###############################################################################
+# Build
+###############################################################################
+.PHONY: build
+build: bin/pilot-discovery-$(ARCH) bin/install-cni-$(ARCH) bin/istio-cni-$(ARCH) bin/pilot-agent-$(ARCH) bin/ztunnel-$(ARCH)
+
+bin/install-cni-$(ARCH): BUILD_TAGS=agent,disable_pgv,grpcnotrace,retrynotrace
+bin/istio-cni-$(ARCH): BUILD_TAGS=agent,disable_pgv,grpcnotrace,retrynotrace
+bin/pilot-agent-$(ARCH): BUILD_TAGS=agent,disable_pgv,grpcnotrace,retrynotrace
+bin/pilot-discovery-$(ARCH): BUILD_TAGS=disable_pgv,vtprotobuf
+
+bin/install-cni-$(ARCH): $(ISTIO_DOWNLOADED)
+	$(call build_binary_dir,istio,./cni/cmd/install-cni,../$@)
+
+bin/istio-cni-$(ARCH): $(ISTIO_DOWNLOADED)
+	$(call build_binary_dir,istio,./cni/cmd/istio-cni,../$@)
+
+bin/pilot-agent-$(ARCH): $(ISTIO_DOWNLOADED)
+	$(call build_binary_dir,istio,./pilot/cmd/pilot-agent,../$@)
+
+bin/pilot-discovery-$(ARCH): $(ISTIO_DOWNLOADED)
+	$(call build_binary_dir,istio,./pilot/cmd/pilot-discovery,../$@)
+
+# cargo-auditable embeds the resolved crate list in the binary; without it,
+# image scanners (Trivy, Grype) cannot see ztunnel's Rust dependencies.
+bin/ztunnel-$(ARCH): $(ZTUNNEL_DOWNLOADED)
+	$(DOCKER_RUST_BUILD) \
+		sh -c 'cd ztunnel && cargo auditable build --release --locked $(if $(GOMAXPROCS),--jobs $(GOMAXPROCS))'
+	cp ztunnel/out/rust/$(RUST_TARGET)/release/ztunnel bin/ztunnel-$(ARCH)
+
+###############################################################################
+# Image
+###############################################################################
+ISTIO_CNI_IMAGE_CREATED = .istio-cni.created-$(ARCH)
+ISTIO_PILOT_IMAGE_CREATED = .istio-pilot.created-$(ARCH)
+ISTIO_PROXYV2_IMAGE_CREATED = .istio-proxyv2.created-$(ARCH)
+ISTIO_ZTUNNEL_IMAGE_CREATED = .istio-ztunnel.created-$(ARCH)
+
+# Build images for all architectures.
+#
+# Sources are downloaded once via the init-sources barrier, then per-arch
+# sub-makes run in parallel; each sub-image-% sub-make also builds its four
+# istio images concurrently via the inherited jobserver.
+#
+# DOCKER_RUN in lib.Makefile is :=-expanded (so GOARCH is baked at include
+# time), which is why per-arch parallelism has to be a sub-make per arch
+# rather than a flat target matrix in a single process.
+ISTIO_PARALLEL_JOBS ?= 4
+
+.PHONY: image-all
+image-all:
+	$(MAKE) init-sources
+	$(MAKE) -j$(ISTIO_PARALLEL_JOBS) $(addprefix sub-image-,$(VALIDARCHES))
+
+sub-image-%:
+	$(MAKE) image ARCH=$*
+
+.PHONY: image
+image: $(BUILD_IMAGES)
+
+# Producer image carrying the patched nftables + libnftnl RPMs that the
+# install-cni image installs in its almalinux build stage. Tag is
+# content-addressed; see hack/rpms/nftables/Makefile.
+include ../hack/rpms/nftables/image.mk
+
+.PHONY: nft-rpms-image
+# `| register` so binfmt is set up before cross-arch buildx.
+nft-rpms-image: | register
+	$(MAKE) -C ../hack/rpms/nftables image ARCH=$(ARCH)
+
+# istio-install-cni image
+$(ISTIO_CNI_IMAGE): $(ISTIO_CNI_IMAGE_CREATED)
+# Drop --pull from DOCKER_BUILD: with --pull=always, buildkit treats the
+# nft-rpms build context (docker-image://calico/nftables-rpms:<sha>-<arch>)
+# as a registry pull and fails when that tag hasn't been pushed yet (PR
+# builds, fresh local builds). Other base images are pinned by tag so cache
+# freshness is fine without --pull.
+$(ISTIO_CNI_IMAGE_CREATED): DOCKER_PULL :=
+$(ISTIO_CNI_IMAGE_CREATED): Dockerfile.install-cni bin/install-cni-$(ARCH) bin/istio-cni-$(ARCH) | register nft-rpms-image
+	$(DOCKER_BUILD) --build-context nft-rpms=docker-image://$(NFT_RPMS_IMAGE) -t $(ISTIO_CNI_IMAGE):latest-$(ARCH) -f Dockerfile.install-cni .
+	$(MAKE) retag-build-images-with-registries BUILD_IMAGES=$(ISTIO_CNI_IMAGE) VALIDARCHES=$(ARCH) IMAGETAG=latest
+	touch $@
+
+# istio-pilot image
+$(ISTIO_PILOT_IMAGE): $(ISTIO_PILOT_IMAGE_CREATED)
+$(ISTIO_PILOT_IMAGE_CREATED): Dockerfile.pilot bin/pilot-discovery-$(ARCH)
+	$(DOCKER_BUILD) -t $(ISTIO_PILOT_IMAGE):latest-$(ARCH) -f Dockerfile.pilot .
+	$(MAKE) retag-build-images-with-registries BUILD_IMAGES=$(ISTIO_PILOT_IMAGE) VALIDARCHES=$(ARCH) IMAGETAG=latest
+	touch $@
+
+# istio-proxyv2 image
+$(ISTIO_PROXYV2_IMAGE): $(ISTIO_PROXYV2_IMAGE_CREATED)
+$(ISTIO_PROXYV2_IMAGE_CREATED): Dockerfile.proxyv2 bin/pilot-agent-$(ARCH)
+	$(DOCKER_BUILD) --build-arg ISTIO_VERSION=$(ISTIO_VERSION) -t $(ISTIO_PROXYV2_IMAGE):latest-$(ARCH) -f Dockerfile.proxyv2 .
+	$(MAKE) retag-build-images-with-registries BUILD_IMAGES=$(ISTIO_PROXYV2_IMAGE) VALIDARCHES=$(ARCH) IMAGETAG=latest
+	touch $@
+
+# istio-ztunnel image
+$(ISTIO_ZTUNNEL_IMAGE): $(ISTIO_ZTUNNEL_IMAGE_CREATED)
+$(ISTIO_ZTUNNEL_IMAGE_CREATED): Dockerfile.ztunnel bin/ztunnel-$(ARCH)
+	$(DOCKER_BUILD) -t $(ISTIO_ZTUNNEL_IMAGE):latest-$(ARCH) -f Dockerfile.ztunnel .
+	$(MAKE) retag-build-images-with-registries BUILD_IMAGES=$(ISTIO_ZTUNNEL_IMAGE) VALIDARCHES=$(ARCH) IMAGETAG=latest
+	touch $@
+
+###############################################################################
+# Clean
+###############################################################################
+.PHONY: clean
+clean:
+	rm -fr bin/ istio/ ztunnel/
+	rm -f $(ISTIO_FETCHED) $(ISTIO_DOWNLOADED) $(ZTUNNEL_DOWNLOADED)
+	rm -f $(ISTIO_CNI_IMAGE_CREATED) $(ISTIO_PILOT_IMAGE_CREATED) $(ISTIO_PROXYV2_IMAGE_CREATED) $(ISTIO_ZTUNNEL_IMAGE_CREATED)
+	rm -f .release-*
+	-docker image rm -f $$(docker images $(ISTIO_CNI_IMAGE) -a -q)
+	-docker image rm -f $$(docker images $(ISTIO_PILOT_IMAGE) -a -q)
+	-docker image rm -f $$(docker images $(ISTIO_PROXYV2_IMAGE) -a -q)
+	-docker image rm -f $$(docker images $(ISTIO_ZTUNNEL_IMAGE) -a -q)
+
+###############################################################################
+# CI/CD
+###############################################################################
+.PHONY: ci
+ci: clean image
+
+.PHONY: cd
+cd: image-all cd-common
+
+###############################################################################
+# Release
+###############################################################################
+.PHONY: release-build release-publish
+release-build: .release-$(VERSION).created
+
+.release-$(VERSION).created:
+	$(MAKE) image-all RELEASE=true
+	$(MAKE) retag-build-images-with-registries IMAGETAG=$(VERSION) RELEASE=true
+	$(MAKE) retag-build-images-with-registries IMAGETAG=latest RELEASE=true
+	touch $@
+
+.PHONY: release-publish
+release-publish: release-prereqs bin/crane
+	@if $(REPO_ROOT)/hack/image-published $(CRANE_CMD) "$(DEV_REGISTRIES)" "$(BUILD_IMAGES)" "$(VERSION)" "$(VALIDARCHES)"; then \
+		echo "$(BUILD_IMAGES):$(VERSION) is already published, skipping"; \
+	else \
+		$(MAKE) push-images-to-registries push-manifests IMAGETAG=$(VERSION) RELEASE=$(RELEASE) CONFIRM=$(CONFIRM); \
+	fi

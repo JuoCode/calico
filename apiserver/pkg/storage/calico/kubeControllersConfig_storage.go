@@ -3,27 +3,34 @@
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 )
 
 // NewKubeControllersConfigurationStorage creates a new libcalico-based storage.Interface implementation for KubeControllersConfigurations
 func NewKubeControllersConfigurationStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc) {
 	c := CreateClientFromConfig()
+	return newKubeControllersConfigurationStorage(opts, c, false)
+}
+
+// NewKubeControllersConfigurationStatusStorage creates a storage that uses the UpdateStatus
+// method for writes, ensuring the status subresource is used when persisting changes.
+func NewKubeControllersConfigurationStatusStorage(opts Options) (registry.DryRunnableStorage, factory.DestroyFunc) {
+	c := CreateClientFromConfig()
+	return newKubeControllersConfigurationStorage(opts, c, true)
+}
+
+func newKubeControllersConfigurationStorage(opts Options, c clientv3.Interface, forStatus bool) (registry.DryRunnableStorage, factory.DestroyFunc) {
 	createFn := func(ctx context.Context, c clientv3.Interface, obj resourceObject, opts clientOpts) (resourceObject, error) {
 		oso := opts.(options.SetOptions)
 		res := obj.(*api.KubeControllersConfiguration)
@@ -32,6 +39,9 @@ func NewKubeControllersConfigurationStorage(opts Options) (registry.DryRunnableS
 	updateFn := func(ctx context.Context, c clientv3.Interface, obj resourceObject, opts clientOpts) (resourceObject, error) {
 		oso := opts.(options.SetOptions)
 		res := obj.(*api.KubeControllersConfiguration)
+		if forStatus {
+			return c.KubeControllersConfiguration().UpdateStatus(ctx, res, oso)
+		}
 		return c.KubeControllersConfiguration().Update(ctx, res, oso)
 	}
 	getFn := func(ctx context.Context, c clientv3.Interface, ns string, name string, opts clientOpts) (resourceObject, error) {
@@ -55,10 +65,10 @@ func NewKubeControllersConfigurationStorage(opts Options) (registry.DryRunnableS
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.KubeControllersConfiguration{}),
-		aapiListType:      reflect.TypeOf(aapi.KubeControllersConfigurationList{}),
-		libCalicoType:     reflect.TypeOf(api.KubeControllersConfiguration{}),
-		libCalicoListType: reflect.TypeOf(api.KubeControllersConfigurationList{}),
+		aapiType:          reflect.TypeFor[api.KubeControllersConfiguration](),
+		aapiListType:      reflect.TypeFor[api.KubeControllersConfigurationList](),
+		libCalicoType:     reflect.TypeFor[api.KubeControllersConfiguration](),
+		libCalicoListType: reflect.TypeFor[api.KubeControllersConfigurationList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -76,7 +86,7 @@ type KubeControllersConfigurationConverter struct {
 }
 
 func (gc KubeControllersConfigurationConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiKubeControllersConfiguration := aapiObj.(*aapi.KubeControllersConfiguration)
+	aapiKubeControllersConfiguration := aapiObj.(*api.KubeControllersConfiguration)
 	lcgKubeControllersConfiguration := &api.KubeControllersConfiguration{}
 	lcgKubeControllersConfiguration.TypeMeta = aapiKubeControllersConfiguration.TypeMeta
 	lcgKubeControllersConfiguration.ObjectMeta = aapiKubeControllersConfiguration.ObjectMeta
@@ -89,7 +99,7 @@ func (gc KubeControllersConfigurationConverter) convertToLibcalico(aapiObj runti
 
 func (gc KubeControllersConfigurationConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgKubeControllersConfiguration := libcalicoObject.(*api.KubeControllersConfiguration)
-	aapiKubeControllersConfiguration := aapiObj.(*aapi.KubeControllersConfiguration)
+	aapiKubeControllersConfiguration := aapiObj.(*api.KubeControllersConfiguration)
 	aapiKubeControllersConfiguration.Spec = lcgKubeControllersConfiguration.Spec
 	aapiKubeControllersConfiguration.Status = lcgKubeControllersConfiguration.Status
 	aapiKubeControllersConfiguration.TypeMeta = lcgKubeControllersConfiguration.TypeMeta
@@ -98,15 +108,15 @@ func (gc KubeControllersConfigurationConverter) convertToAAPI(libcalicoObject re
 
 func (gc KubeControllersConfigurationConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgKubeControllersConfigurationList := libcalicoListObject.(*api.KubeControllersConfigurationList)
-	aapiKubeControllersConfigurationList := aapiListObj.(*aapi.KubeControllersConfigurationList)
+	aapiKubeControllersConfigurationList := aapiListObj.(*api.KubeControllersConfigurationList)
 	if libcalicoListObject == nil {
-		aapiKubeControllersConfigurationList.Items = []aapi.KubeControllersConfiguration{}
+		aapiKubeControllersConfigurationList.Items = []api.KubeControllersConfiguration{}
 		return
 	}
 	aapiKubeControllersConfigurationList.TypeMeta = lcgKubeControllersConfigurationList.TypeMeta
 	aapiKubeControllersConfigurationList.ListMeta = lcgKubeControllersConfigurationList.ListMeta
 	for _, item := range lcgKubeControllersConfigurationList.Items {
-		aapiKubeControllersConfiguration := aapi.KubeControllersConfiguration{}
+		aapiKubeControllersConfiguration := api.KubeControllersConfiguration{}
 		gc.convertToAAPI(&item, &aapiKubeControllersConfiguration)
 		if matched, err := pred.Matches(&aapiKubeControllersConfiguration); err == nil && matched {
 			aapiKubeControllersConfigurationList.Items = append(aapiKubeControllersConfigurationList.Items, aapiKubeControllersConfiguration)

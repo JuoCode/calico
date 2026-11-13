@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,57 @@ package conversion
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"os"
+	"strconv"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
-	kapiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
+	kapiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/json"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+)
+
+var (
+	// Bandwidth in bits per second
+	minBandwidth = resource.MustParse("1k")
+	maxBandwidth = resource.MustParse("1P")
+	// Burst sizes in bits
+	minBurst     = resource.MustParse("1k")
+	defaultBurst = resource.MustParse("4Gi")                                    // 512 Mi bytes
+	maxBurst     = resource.MustParse(strconv.FormatUint(math.MaxUint32*8, 10)) // 34359738360, approx. 4Gi bytes
+	// Peakrate in bits per second
+	// Peakrate should always be greater than bandwidth, so we make the min and max slightly higher than those
+	minPeakrate = resource.MustParse("1.01k")
+	maxPeakrate = resource.MustParse("1.01P")
+	// Minburst in bytes (not bits because it is typically the MTU)
+	minMinburst = resource.MustParse("1k")
+	maxMinburst = resource.MustParse("100M")
+	// Packet rate in packets per second
+	// Packet rate and packet burst are limited to XT_LIMIT_SCALE (10k)
+	// See https://github.com/torvalds/linux/blob/16b70698aa3ae7888826d0c84567c72241cf6713/include/uapi/linux/netfilter/xt_limit.h#L8
+	minPacketRate = resource.MustParse("1")
+	maxPacketRate = resource.MustParse("10k")
+	// Packet burst sizes in number of packets
+	minPacketBurst     = resource.MustParse("1")
+	defaultPacketBurst = resource.MustParse("5")
+	maxPacketBurst     = resource.MustParse("10k")
+	// Maximum number of connections (absolute number of connections, no unit)
+	minNumConnections = resource.MustParse("1")
+	// The connection limit is an uint32 (maximum value 4294967295).
+	// See https://github.com/torvalds/linux/blob/16b70698aa3ae7888826d0c84567c72241cf6713/include/uapi/linux/netfilter/xt_connlimit.h#L25
+	maxNumConnections = resource.MustParse(strconv.FormatUint(math.MaxUint32, 10))
 )
 
 type defaultWorkloadEndpointConverter struct{}
@@ -43,7 +78,7 @@ func (wc defaultWorkloadEndpointConverter) VethNameForWorkload(namespace, podnam
 	// A SHA1 is always 20 bytes long, and so is sufficient for generating the
 	// veth name and mac addr.
 	h := sha1.New()
-	h.Write([]byte(fmt.Sprintf("%s.%s", namespace, podname)))
+	h.Write(fmt.Appendf(nil, "%s.%s", namespace, podname))
 	prefix := os.Getenv("FELIX_INTERFACEPREFIX")
 	if prefix == "" {
 		// Prefix is not set. Default to "cali"
@@ -121,10 +156,8 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 
 	// Build the labels map.  Start with the pod labels, and append two additional labels for
 	// namespace and orchestrator matches.
-	labels := pod.Labels
-	if labels == nil {
-		labels = make(map[string]string, 2)
-	}
+	labels := make(map[string]string)
+	maps.Copy(labels, pod.Labels)
 	labels[apiv3.LabelNamespace] = pod.Namespace
 	labels[apiv3.LabelOrchestrator] = apiv3.OrchestratorKubernetes
 
@@ -134,9 +167,8 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	}
 
 	// Pull out floating IP annotation
-	var floatingIPs []libapiv3.IPNAT
+	var floatingIPs []internalapi.IPNAT
 	if annotation, ok := pod.Annotations["cni.projectcalico.org/floatingIPs"]; ok && len(podIPNets) > 0 {
-
 		// Parse Annotation data
 		var ips []string
 		err := json.Unmarshal([]byte(annotation), &ips)
@@ -165,14 +197,14 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 		for _, ip := range ips {
 			if strings.Contains(ip, ":") {
 				if podnetV6 != nil {
-					floatingIPs = append(floatingIPs, libapiv3.IPNAT{
+					floatingIPs = append(floatingIPs, internalapi.IPNAT{
 						InternalIP: podnetV6.IP.String(),
 						ExternalIP: ip,
 					})
 				}
 			} else {
 				if podnetV4 != nil {
-					floatingIPs = append(floatingIPs, libapiv3.IPNAT{
+					floatingIPs = append(floatingIPs, internalapi.IPNAT{
 						InternalIP: podnetV4.IP.String(),
 						ExternalIP: ip,
 					})
@@ -188,8 +220,68 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	}
 
 	// Map any named ports through.
-	var endpointPorts []libapiv3.WorkloadEndpointPort
-	for _, container := range pod.Spec.Containers {
+	var endpointPorts []internalapi.WorkloadEndpointPort
+	endpointPorts = appendEndpointPorts(endpointPorts, pod, pod.Spec.Containers)
+	endpointPorts = appendEndpointPorts(endpointPorts, pod, pod.Spec.InitContainers)
+
+	// Get the container ID if present.  This is used in the CNI plugin to distinguish different pods that have
+	// the same name.  For example, restarted stateful set pods.
+	containerID := pod.Annotations[AnnotationContainerID]
+
+	qosControls, err := handleQoSControlsAnnotations(pod.Annotations)
+	if err != nil {
+		// If QoSControls can't be parsed, log the error but keep processing the workload
+		log.WithField("pod", pod).WithError(err).Warn("Error parsing QoSControl annotations")
+	}
+
+	// Create the workload endpoint.
+	wep := internalapi.NewWorkloadEndpoint()
+	wep.ObjectMeta = metav1.ObjectMeta{
+		Name:              wepName,
+		Namespace:         pod.Namespace,
+		CreationTimestamp: pod.CreationTimestamp,
+		UID:               pod.UID,
+		Labels:            labels,
+		GenerateName:      pod.GenerateName,
+	}
+	wep.Spec = internalapi.WorkloadEndpointSpec{
+		Orchestrator:               "k8s",
+		Node:                       pod.Spec.NodeName,
+		Pod:                        pod.Name,
+		ContainerID:                containerID,
+		Endpoint:                   "eth0",
+		InterfaceName:              interfaceName,
+		Profiles:                   profiles,
+		IPNetworks:                 ipNets,
+		Ports:                      endpointPorts,
+		IPNATs:                     floatingIPs,
+		ServiceAccountName:         pod.Spec.ServiceAccountName,
+		AllowSpoofedSourcePrefixes: sourcePrefixes,
+		QoSControls:                qosControls,
+	}
+
+	if v, ok := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]; ok {
+		if wep.Annotations == nil {
+			wep.Annotations = make(map[string]string)
+		}
+		wep.Annotations["k8s.v1.cni.cncf.io/network-status"] = v
+	}
+
+	// Embed the workload endpoint into a KVPair.
+	kvp := model.KVPair{
+		Key: model.ResourceKey{
+			Name:      wepName,
+			Namespace: pod.Namespace,
+			Kind:      internalapi.KindWorkloadEndpoint,
+		},
+		Value:    wep,
+		Revision: pod.ResourceVersion,
+	}
+	return &kvp, nil
+}
+
+func appendEndpointPorts(ports []internalapi.WorkloadEndpointPort, pod *kapiv1.Pod, containers []kapiv1.Container) []internalapi.WorkloadEndpointPort {
+	for _, container := range containers {
 		for _, containerPort := range container.Ports {
 			if containerPort.ContainerPort != 0 && (containerPort.HostPort != 0 || containerPort.Name != "") {
 				var modelProto numorstring.Protocol
@@ -209,7 +301,7 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 					continue
 				}
 
-				endpointPorts = append(endpointPorts, libapiv3.WorkloadEndpointPort{
+				ports = append(ports, internalapi.WorkloadEndpointPort{
 					Name:     containerPort.Name,
 					Protocol: modelProto,
 					Port:     uint16(containerPort.ContainerPort),
@@ -219,54 +311,7 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 			}
 		}
 	}
-
-	// Get the container ID if present.  This is used in the CNI plugin to distinguish different pods that have
-	// the same name.  For example, restarted stateful set pods.
-	containerID := pod.Annotations[AnnotationContainerID]
-
-	// Create the workload endpoint.
-	wep := libapiv3.NewWorkloadEndpoint()
-	wep.ObjectMeta = metav1.ObjectMeta{
-		Name:              wepName,
-		Namespace:         pod.Namespace,
-		CreationTimestamp: pod.CreationTimestamp,
-		UID:               pod.UID,
-		Labels:            labels,
-		GenerateName:      pod.GenerateName,
-	}
-	wep.Spec = libapiv3.WorkloadEndpointSpec{
-		Orchestrator:               "k8s",
-		Node:                       pod.Spec.NodeName,
-		Pod:                        pod.Name,
-		ContainerID:                containerID,
-		Endpoint:                   "eth0",
-		InterfaceName:              interfaceName,
-		Profiles:                   profiles,
-		IPNetworks:                 ipNets,
-		Ports:                      endpointPorts,
-		IPNATs:                     floatingIPs,
-		ServiceAccountName:         pod.Spec.ServiceAccountName,
-		AllowSpoofedSourcePrefixes: sourcePrefixes,
-	}
-
-	if v, ok := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]; ok {
-		if wep.Annotations == nil {
-			wep.Annotations = make(map[string]string)
-		}
-		wep.Annotations["k8s.v1.cni.cncf.io/network-status"] = v
-	}
-
-	// Embed the workload endpoint into a KVPair.
-	kvp := model.KVPair{
-		Key: model.ResourceKey{
-			Name:      wepName,
-			Namespace: pod.Namespace,
-			Kind:      libapiv3.KindWorkloadEndpoint,
-		},
-		Value:    wep,
-		Revision: pod.ResourceVersion,
-	}
-	return &kvp, nil
+	return ports
 }
 
 // HandleSourceIPSpoofingAnnotation parses the allowedSourcePrefixes annotation if present,
@@ -291,4 +336,229 @@ func HandleSourceIPSpoofingAnnotation(annot map[string]string) ([]string, error)
 		}
 	}
 	return sourcePrefixes, nil
+}
+
+func handleQoSControlsAnnotations(annotations map[string]string) (*internalapi.QoSControls, error) {
+	qosControls := &internalapi.QoSControls{}
+	var errs []error
+
+	// k8s bandwidth annotations
+	if str, found := annotations[AnnotationK8sQoSIngressBandwidth]; found {
+		ingressBandwidth, err := parseAndValidateQty(str, minBandwidth, maxBandwidth)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress bandwidth annotation: %w", err))
+		}
+		qosControls.IngressBandwidth = ingressBandwidth
+	}
+	if str, found := annotations[AnnotationK8sQoSEgressBandwidth]; found {
+		egressBandwidth, err := parseAndValidateQty(str, minBandwidth, maxBandwidth)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress bandwidth annotation: %w", err))
+		}
+		qosControls.EgressBandwidth = egressBandwidth
+	}
+
+	// calico bandwidth annotations (override k8s annotations if present)
+	if str, found := annotations[AnnotationQoSIngressBandwidth]; found {
+		ingressBandwidth, err := parseAndValidateQty(str, minBandwidth, maxBandwidth)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress bandwidth annotation: %w", err))
+		}
+		qosControls.IngressBandwidth = ingressBandwidth
+	}
+	if str, found := annotations[AnnotationQoSEgressBandwidth]; found {
+		egressBandwidth, err := parseAndValidateQty(str, minBandwidth, maxBandwidth)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress bandwidth annotation: %w", err))
+		}
+		qosControls.EgressBandwidth = egressBandwidth
+	}
+
+	// calico burst annotations
+	if str, found := annotations[AnnotationQoSIngressBurst]; found {
+		ingressBurst, err := parseAndValidateQty(str, minBurst, maxBurst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress burst annotation: %w", err))
+		}
+		qosControls.IngressBurst = ingressBurst
+	}
+	if str, found := annotations[AnnotationQoSEgressBurst]; found {
+		egressBurst, err := parseAndValidateQty(str, minBurst, maxBurst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress burst annotation: %w", err))
+		}
+		qosControls.EgressBurst = egressBurst
+	}
+
+	// calico peakrate annotations
+	if str, found := annotations[AnnotationQoSIngressPeakrate]; found {
+		ingressPeakrate, err := parseAndValidateQty(str, minPeakrate, maxPeakrate)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress peakrate annotation: %w", err))
+		}
+		qosControls.IngressPeakrate = ingressPeakrate
+	}
+	if str, found := annotations[AnnotationQoSEgressPeakrate]; found {
+		egressPeakrate, err := parseAndValidateQty(str, minPeakrate, maxPeakrate)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress peakrate annotation: %w", err))
+		}
+		qosControls.EgressPeakrate = egressPeakrate
+	}
+
+	// calico minburst/mtu annotations
+	if str, found := annotations[AnnotationQoSIngressMinburst]; found {
+		ingressMinburst, err := parseAndValidateQty(str, minMinburst, maxMinburst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress minburst annotation: %w", err))
+		}
+		qosControls.IngressMinburst = ingressMinburst
+	}
+	if str, found := annotations[AnnotationQoSEgressMinburst]; found {
+		egressMinburst, err := parseAndValidateQty(str, minMinburst, maxMinburst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress minburst annotation: %w", err))
+		}
+		qosControls.EgressMinburst = egressMinburst
+	}
+
+	// calico packet rate annotations
+	if str, found := annotations[AnnotationQoSIngressPacketRate]; found {
+		ingressPacketRate, err := parseAndValidateQty(str, minPacketRate, maxPacketRate)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress packet rate annotation: %w", err))
+		}
+		qosControls.IngressPacketRate = ingressPacketRate
+	}
+	if str, found := annotations[AnnotationQoSEgressPacketRate]; found {
+		egressPacketRate, err := parseAndValidateQty(str, minPacketRate, maxPacketRate)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress packet rate annotation: %w", err))
+		}
+		qosControls.EgressPacketRate = egressPacketRate
+	}
+
+	// calico packet burst annotations
+	if str, found := annotations[AnnotationQoSIngressPacketBurst]; found {
+		ingressPacketBurst, err := parseAndValidateQty(str, minPacketBurst, maxPacketBurst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress packet rate annotation: %w", err))
+		}
+		qosControls.IngressPacketBurst = ingressPacketBurst
+	}
+	if str, found := annotations[AnnotationQoSEgressPacketBurst]; found {
+		egressPacketBurst, err := parseAndValidateQty(str, minPacketBurst, maxPacketBurst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress packet rate annotation: %w", err))
+		}
+		qosControls.EgressPacketBurst = egressPacketBurst
+	}
+
+	// calico number of connections annotations
+	if str, found := annotations[AnnotationQoSIngressMaxConnections]; found {
+		ingressMaxConnections, err := parseAndValidateQty(str, minNumConnections, maxNumConnections)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing ingress max connections annotation: %w", err))
+		}
+		qosControls.IngressMaxConnections = ingressMaxConnections
+	}
+	if str, found := annotations[AnnotationQoSEgressMaxConnections]; found {
+		egressMaxConnections, err := parseAndValidateQty(str, minNumConnections, maxNumConnections)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing egress max connections annotation: %w", err))
+		}
+		qosControls.EgressMaxConnections = egressMaxConnections
+	}
+
+	// if burst is configured, bandwidth must be configured
+	if qosControls.IngressBurst != 0 && qosControls.IngressBandwidth == 0 {
+		errs = append(errs, fmt.Errorf("ingress bandwidth must be specified when ingress burst is specified"))
+		qosControls.IngressBurst = 0
+	}
+	if qosControls.EgressBurst != 0 && qosControls.EgressBandwidth == 0 {
+		errs = append(errs, fmt.Errorf("egress bandwidth must be specified when egress burst is specified"))
+		qosControls.EgressBurst = 0
+	}
+
+	// if peakrate is configured, bandwidth must be configured and peakrate must be greater than bandwidth
+	if qosControls.IngressPeakrate != 0 && (qosControls.IngressBandwidth == 0 || qosControls.IngressBandwidth >= qosControls.IngressPeakrate) {
+		errs = append(errs, fmt.Errorf("ingress peakrate must be greater than ingress bandwidth when specified"))
+		qosControls.IngressPeakrate = 0
+	}
+	if qosControls.EgressPeakrate != 0 && (qosControls.EgressBandwidth == 0 || qosControls.EgressBandwidth >= qosControls.EgressPeakrate) {
+		errs = append(errs, fmt.Errorf("egress peakrate must be greater than egress bandwidth when specified"))
+		qosControls.EgressPeakrate = 0
+	}
+
+	// if minburst is configured, peakrate must be configured
+	if qosControls.IngressMinburst != 0 && qosControls.IngressPeakrate == 0 {
+		errs = append(errs, fmt.Errorf("ingress peakrate must be specified when ingress minburst is specified"))
+		qosControls.IngressMinburst = 0
+	}
+	if qosControls.EgressMinburst != 0 && qosControls.EgressPeakrate == 0 {
+		errs = append(errs, fmt.Errorf("egress peakrate must be specified when egress minburst is specified"))
+		qosControls.EgressMinburst = 0
+	}
+
+	// if packet burst is configured, packet rate must be configured
+	if qosControls.IngressPacketBurst != 0 && qosControls.IngressPacketRate == 0 {
+		errs = append(errs, fmt.Errorf("ingress packet rate must be specified when ingress packet burst is specified"))
+		qosControls.IngressPacketBurst = 0
+	}
+	if qosControls.EgressPacketBurst != 0 && qosControls.EgressPacketRate == 0 {
+		errs = append(errs, fmt.Errorf("egress packet rate must be specified when egress packet burst is specified"))
+		qosControls.EgressPacketBurst = 0
+	}
+
+	// default burst values if bandwidth is configured
+	if qosControls.IngressBandwidth != 0 && qosControls.IngressBurst == 0 {
+		qosControls.IngressBurst = defaultBurst.Value()
+	}
+	if qosControls.EgressBandwidth != 0 && qosControls.EgressBurst == 0 {
+		qosControls.EgressBurst = defaultBurst.Value()
+	}
+
+	// default minburst values are configured in felix/dataplane/linux/qos/qos.go because they depend on the interface MTU
+
+	// default packet burst values if packet rate is configured
+	if qosControls.IngressPacketRate != 0 && qosControls.IngressPacketBurst == 0 {
+		qosControls.IngressPacketBurst = defaultPacketBurst.Value()
+	}
+	if qosControls.EgressPacketRate != 0 && qosControls.EgressPacketBurst == 0 {
+		qosControls.EgressPacketBurst = defaultPacketBurst.Value()
+	}
+
+	// Calico DSCP value for egress traffic annotation.
+	if str, found := annotations[AnnotationQoSEgressDSCP]; found {
+		dscp := numorstring.DSCPFromString(str)
+		err := dscp.Validate()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error parsing DSCP annotation: %w", err))
+		} else {
+			qosControls.DSCP = &dscp
+		}
+	}
+
+	// return nil if no control is configured
+	if (*qosControls == internalapi.QoSControls{}) {
+		qosControls = nil
+	}
+
+	return qosControls, errors.Join(errs...)
+}
+
+func parseAndValidateQty(str string, minQty, maxQty resource.Quantity) (int64, error) {
+	qty, err := resource.ParseQuantity(str)
+	if err != nil {
+		return 0, err
+	}
+
+	if qty.Value() < minQty.Value() {
+		return minQty.Value(), fmt.Errorf("resource specified is too small (less than %v), setting it to %v", minQty, minQty)
+	}
+	if qty.Value() > maxQty.Value() {
+		return maxQty.Value(), fmt.Errorf("resource specified is too large (more than %v), setting it to %v", maxQty, maxQty)
+	}
+
+	return qty.Value(), nil
 }

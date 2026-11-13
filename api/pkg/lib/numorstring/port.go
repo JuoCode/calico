@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,8 +39,13 @@ func SinglePort(port uint16) Port {
 	return Port{MinPort: port, MaxPort: port}
 }
 
-func NamedPort(name string) Port {
-	return Port{PortName: name}
+func NamedPort(name string) (Port, error) {
+	if !nameRegex.MatchString(name) {
+		msg := fmt.Sprintf("invalid name for named port (%s)", name)
+		return Port{}, errors.New(msg)
+	}
+
+	return Port{PortName: name}, nil
 }
 
 // PortFromRange creates a Port struct representing a range of ports.
@@ -62,6 +67,15 @@ var (
 // PortFromString creates a Port struct from its string representation.  A port
 // may either be single value "1234", a range of values "100:200" or a named port: "name".
 func PortFromString(s string) (Port, error) {
+	p, err := parsePort(s)
+	if err == nil && p.MinPort > p.MaxPort {
+		return PortFromRange(p.MinPort, p.MaxPort)
+	}
+	return p, err
+}
+
+// parsePort is PortFromString without the check that a range is ascending.
+func parsePort(s string) (Port, error) {
 	if allDigits.MatchString(s) {
 		// Port is all digits, it should parse as a single port.
 		num, err := strconv.ParseUint(s, 10, 16)
@@ -81,16 +95,11 @@ func PortFromString(s string) (Port, error) {
 			msg := fmt.Sprintf("invalid maximum port number in range (%s)", s)
 			return Port{}, errors.New(msg)
 		} else {
-			return PortFromRange(uint16(pmin), uint16(pmax))
+			return Port{MinPort: uint16(pmin), MaxPort: uint16(pmax)}, nil
 		}
 	}
 
-	if !nameRegex.MatchString(s) {
-		msg := fmt.Sprintf("invalid name for named port (%s)", s)
-		return Port{}, errors.New(msg)
-	}
-
-	return NamedPort(s), nil
+	return NamedPort(s)
 }
 
 // UnmarshalJSON implements the json.Unmarshaller interface.
@@ -101,7 +110,8 @@ func (p *Port) UnmarshalJSON(b []byte) error {
 			return err
 		}
 
-		if v, err := PortFromString(s); err != nil {
+		// A stored descending range must not fail the decode of a whole list; the validator rejects it.
+		if v, err := parsePort(s); err != nil {
 			return err
 		} else {
 			*p = v
@@ -146,9 +156,18 @@ func (p Port) String() string {
 // OpenAPISchemaType is used by the kube-openapi generator when constructing
 // the OpenAPI spec of this type.
 // See: https://github.com/kubernetes/kube-openapi/tree/master/pkg/generators
-func (_ Port) OpenAPISchemaType() []string { return []string{"string"} }
+func (Port) OpenAPISchemaType() []string { return []string{"string"} }
 
 // OpenAPISchemaFormat is used by the kube-openapi generator when constructing
 // the OpenAPI spec of this type.
 // See: https://github.com/kubernetes/kube-openapi/tree/master/pkg/generators
-func (_ Port) OpenAPISchemaFormat() string { return "int-or-string" }
+func (Port) OpenAPISchemaFormat() string { return "int-or-string" }
+
+func AllPortsAreNamed(ports []Port) bool {
+	for _, p := range ports {
+		if len(p.PortName) == 0 {
+			return false
+		}
+	}
+	return true
+}

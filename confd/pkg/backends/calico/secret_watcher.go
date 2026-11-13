@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 type secretWatchData struct {
@@ -39,43 +37,32 @@ type secretWatchData struct {
 	secret *v1.Secret
 }
 
+type secretWatcherInterface interface {
+	GetSecret(name, key string) (string, error)
+	MarkStale()
+	SweepStale()
+}
+
 type secretWatcher struct {
 	client       *client
 	namespace    string
-	k8sClientset *kubernetes.Clientset
+	k8sClientset kubernetes.Interface
 	mutex        sync.Mutex
 	watches      map[string]*secretWatchData
 }
 
-func NewSecretWatcher(c *client) (*secretWatcher, error) {
+func NewSecretWatcher(c *client, k8sClient kubernetes.Interface) (*secretWatcher, error) {
 	sw := &secretWatcher{
-		client:  c,
-		watches: make(map[string]*secretWatchData),
+		client:       c,
+		k8sClientset: k8sClient,
+		watches:      make(map[string]*secretWatchData),
 	}
 
 	// Find the namespace we're running in.
 	sw.namespace = os.Getenv("NAMESPACE")
 	if sw.namespace == "" {
-		// Default to kube-system.
 		sw.namespace = "kube-system"
 	}
-
-	// set up k8s client
-	// attempt 1: KUBECONFIG env var
-	cfgFile := os.Getenv("KUBECONFIG")
-	cfg, err := winutils.BuildConfigFromFlags("", cfgFile)
-	if err != nil {
-		log.WithError(err).Info("KUBECONFIG environment variable not found, attempting in-cluster")
-		// attempt 2: in cluster config
-		if cfg, err = winutils.GetInClusterConfig(); err != nil {
-			return nil, err
-		}
-	}
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	sw.k8sClientset = clientset
 
 	return sw, nil
 }
@@ -96,7 +83,12 @@ func (sw *secretWatcher) ensureWatchingSecret(name string) {
 		log.Debugf("Start a watch for secret '%v' (namespace %v)", name, sw.namespace)
 		// We're not watching this secret yet, so start a watch for it.
 		watcher := cache.NewListWatchFromClient(sw.k8sClientset.CoreV1().RESTClient(), "secrets", sw.namespace, fields.OneTermEqualSelector("metadata.name", name))
-		_, controller := cache.NewInformer(watcher, &v1.Secret{}, 0, sw)
+		_, controller := cache.NewInformerWithOptions(cache.InformerOptions{
+			ListerWatcher: watcher,
+			ObjectType:    &v1.Secret{},
+			ResyncPeriod:  0,
+			Handler:       sw,
+		})
 		sw.watches[name] = &secretWatchData{stopCh: make(chan struct{})}
 		go controller.Run(sw.watches[name].stopCh)
 		log.Debugf("Controller for secret '%v' is now running", name)
@@ -169,32 +161,47 @@ func (sw *secretWatcher) SweepStale() {
 	}
 }
 
-func (sw *secretWatcher) OnAdd(obj interface{}, isInInitialList bool) {
+func (sw *secretWatcher) OnAdd(obj any, isInInitialList bool) {
 	log.Debug("Secret added")
 	sw.updateSecret(obj.(*v1.Secret))
-	sw.client.recheckPeerConfig()
+	sw.client.recheckPeerConfig("secret added")
 }
 
-func (sw *secretWatcher) OnUpdate(oldObj, newObj interface{}) {
+func (sw *secretWatcher) OnUpdate(oldObj, newObj any) {
 	log.Debug("Secret updated")
 	sw.updateSecret(newObj.(*v1.Secret))
-	sw.client.recheckPeerConfig()
+	sw.client.recheckPeerConfig("secret updated")
 }
 
-func (sw *secretWatcher) OnDelete(obj interface{}) {
+func (sw *secretWatcher) OnDelete(obj any) {
 	log.Debug("Secret deleted")
-	sw.deleteSecret(obj.(*v1.Secret))
-	sw.client.recheckPeerConfig()
+	// Delete events can carry a cache.DeletedFinalStateUnknown tombstone
+	// instead of the secret; DeletionHandlingObjectToName reads the name from
+	// either, including a tombstone that carries only a key.
+	name, err := cache.DeletionHandlingObjectToName(obj)
+	if err != nil {
+		log.WithError(err).Warn("Skipping secret delete event")
+		return
+	}
+	sw.deleteSecret(name.Name)
+	sw.client.recheckPeerConfig("secret deleted")
 }
 
 func (sw *secretWatcher) updateSecret(secret *v1.Secret) {
 	sw.mutex.Lock()
 	defer sw.mutex.Unlock()
-	sw.watches[secret.Name].secret = secret
+	if w, ok := sw.watches[secret.Name]; ok {
+		w.secret = secret
+	}
 }
 
-func (sw *secretWatcher) deleteSecret(secret *v1.Secret) {
+// deleteSecret drops the secret's cached value but keeps its watch. The watch
+// owns a goroutine that only SweepStale may stop, and the secret may be
+// recreated while a BGP peer still references it.
+func (sw *secretWatcher) deleteSecret(name string) {
 	sw.mutex.Lock()
 	defer sw.mutex.Unlock()
-	delete(sw.watches, secret.Name)
+	if w, ok := sw.watches[name]; ok {
+		w.secret = nil
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,20 @@ import (
 	"net"
 
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	corev1 "k8s.io/api/core/v1"
 
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+)
+
+// VMAddressPersistence controls whether KubeVirt VirtualMachine workloads
+// maintain persistent IP addresses across VM lifecycle events.
+type VMAddressPersistence string
+
+const (
+	// VMAddressPersistenceEnabled enables IP persistence for KubeVirt VMs.
+	VMAddressPersistenceEnabled VMAddressPersistence = "Enabled"
+	// VMAddressPersistenceDisabled disables IP persistence for KubeVirt VMs.
+	VMAddressPersistenceDisabled VMAddressPersistence = "Disabled"
 )
 
 // AssignIPArgs defines the set of arguments for assigning a specific IP address.
@@ -42,6 +54,16 @@ type AssignIPArgs struct {
 
 	// If specified, the attributes of reserved IPv4 addresses in the block.
 	HostReservedAttr *HostReservedAttr
+
+	// The intended use for the IP address.  Determines the affinityType of the
+	// host and, when non-empty, is enforced against the containing pool's
+	// AllowedUses (the assignment fails if the pool does not allow this use).
+	IntendedUse v3.IPPoolAllowedUse
+
+	// MaxAllocToHandlePerIPVersion specifies the maximum number of IPs per IP version (IPv4/IPv6)
+	// that can be allocated for this handle. If 0, no limit is enforced.
+	// Used for KubeVirt VMI pods to ensure only one IP allocation per VMI per IP version.
+	MaxAllocToHandlePerIPVersion int
 }
 
 // AutoAssignArgs defines the set of arguments for assigning one or more
@@ -86,6 +108,14 @@ type AutoAssignArgs struct {
 	// The intended use for the IP address.  Used to filter the available IP pools on their AllowedUses field.
 	// This field is required.
 	IntendedUse v3.IPPoolAllowedUse
+
+	// MaxAllocToHandlePerIPVersion specifies the maximum number of IPs per IP version (IPv4/IPv6)
+	// that can be allocated across all blocks for this handle. If 0, no limit is enforced.
+	// Used for KubeVirt VMI pods to ensure only one IP allocation per VMI per IP version.
+	MaxAllocToHandlePerIPVersion int
+
+	// The namespace object for namespaceSelector support.
+	Namespace *corev1.Namespace
 }
 
 // IPAMConfig contains global configuration options for Calico IPAM.
@@ -105,6 +135,23 @@ type IPAMConfig struct {
 	// If non-zero, MaxBlocksPerHost specifies the max number of blocks that may
 	// be affine to a node.
 	MaxBlocksPerHost int
+
+	// KubeVirtVMAddressPersistence controls whether KubeVirt VirtualMachine workloads
+	// maintain persistent IP addresses across VM lifecycle events.
+	// When set to VMAddressPersistenceEnabled, Calico automatically ensures that KubeVirt VMs retain their
+	// IP addresses when their underlying pods are recreated during VM operations such as
+	// reboot, live migration, or pod eviction. IP persistency is ensured when the
+	// VirtualMachineInstance (VMI) resource is deleted and recreated by the VM controller.
+	// When set to VMAddressPersistenceDisabled, VMs receive new IP addresses whenever their pods are recreated,
+	// following standard pod IP allocation behavior. Live migration target pods are not allowed
+	// when this is set to VMAddressPersistenceDisabled and will result in an error.
+	// If nil, defaults to VMAddressPersistenceEnabled (IP persistence enabled if not specified).
+	KubeVirtVMAddressPersistence *VMAddressPersistence
+
+	// IPCooldownSeconds is the minimum age of a released IP in a block before it is re-used.
+	// If set to zero, IPs can be re-used immediately (but are still handled with a FIFO queue to
+	// minimize immediate reuse).
+	IPCooldownSeconds int `json:"ipCooldownSeconds,omitempty"`
 }
 
 // GetUtilizationArgs defines the set of arguments for requesting IP utilization.
@@ -115,6 +162,10 @@ type GetUtilizationArgs struct {
 }
 
 // BlockUtilization reports IP utilization for a single allocation block.
+//
+// InUse and Reserved overlap: an IP allocated before an IPReservation covered it
+// is counted in both.  Free excludes both, so it cannot be derived by
+// subtracting the other fields from Capacity.
 type BlockUtilization struct {
 	// This block's CIDR.
 	CIDR net.IPNet
@@ -122,17 +173,47 @@ type BlockUtilization struct {
 	// Number of possible IPs in this block.
 	Capacity int
 
-	// Number of available IPs in this block.
-	Available int
+	// Number of allocated IPs in this block, whether or not they are also reserved.
+	InUse int
+
+	// Number of InUse IPs released and waiting out their cooldown before reuse.
+	Cooling int
+
+	// Number of reserved IPs in this block, whether or not they are also allocated.
+	Reserved int
+
+	// Number of IPs in this block that are neither allocated nor reserved.
+	Free int
 }
 
 // PoolUtilization reports IP utilization for a single IP pool.
+//
+// The counts cover the whole pool CIDR, including space that no allocation block
+// has been carved from yet, so Capacity is not the sum of the blocks' capacities.
+// The other fields mean the same as in BlockUtilization.
 type PoolUtilization struct {
 	// This pool's name.
 	Name string
 
 	// This pool's CIDR.
 	CIDR net.IPNet
+
+	// Number of possible IPs in this pool. A pool nested inside this one is counted here too, so totals summed across
+	// pools double count it.
+	Capacity int
+
+	// Number of allocated IPs in this pool, whether or not they are also reserved.
+	InUse int
+
+	// Number of InUse IPs released and waiting out their cooldown before reuse.
+	Cooling int
+
+	// Number of reserved IPs in this pool, whether or not they are also allocated.
+	Reserved int
+
+	// Number of IPs in this pool that are neither allocated nor reserved. Like Capacity, it covers any nested pool's
+	// space, so a nested pool's allocations read as free here.
+	Free int
 
 	// Utilization for each of this pool's blocks.
 	Blocks []BlockUtilization
@@ -185,10 +266,121 @@ type ReleaseOptions struct {
 	SequenceNumber *uint64
 }
 
+// MoveOptions specifies a transfer of an allocated address between handles. See
+// Interface.MoveIPToHandle.
+type MoveOptions struct {
+	// ToHandle is the handle that will own the address after the move.
+	ToHandle string
+
+	// Attrs replaces the allocation's attributes as part of the move. A move onto the
+	// handle that already owns the address returns early and leaves the attributes as
+	// they are.
+	Attrs map[string]string
+
+	// ExpectedOwner is required: the move only proceeds if the allocation's current owner
+	// attributes identify this workload.
+	ExpectedOwner *AttributeOwner
+
+	// If provided, the move only proceeds if the allocation currently sits on this handle.
+	ExpectedHandle string
+}
+
+type AffinityConfig struct {
+	AffinityType AffinityType
+	Host         string
+}
+
+type AffinityType string
+
+const (
+	AffinityTypeHost    AffinityType = "host"
+	AffinityTypeVirtual AffinityType = "virtual"
+)
+
 func (opts *ReleaseOptions) AsNetIP() (*cnet.IP, error) {
 	ip := cnet.ParseIP(opts.Address)
 	if ip != nil {
 		return ip, nil
 	}
 	return nil, fmt.Errorf("failed to parse IP: %s", opts.Address)
+}
+
+// AttributeOwner represents the owner of an IP allocation attribute.
+type AttributeOwner struct {
+	// Namespace is the Kubernetes namespace of the pod.
+	Namespace string
+	// Name is the name of the pod.
+	Name string
+}
+
+// OwnerAttributeUpdates specifies the attribute values to set for ActiveOwnerAttrs and/or AlternateOwnerAttrs.
+// These are the actual values that will be written to the IP allocation.
+type OwnerAttributeUpdates struct {
+	// ActiveOwnerAttrs specifies attributes to set for ActiveOwnerAttrs.
+	// If nil and ClearActiveOwner is false, ActiveOwnerAttrs is not modified.
+	// If ClearActiveOwner is true, ActiveOwnerAttrs must be nil (error if both are set).
+	ActiveOwnerAttrs map[string]string
+
+	// ClearActiveOwner indicates that ActiveOwnerAttrs should be cleared (set to nil).
+	// If true, ActiveOwnerAttrs must be nil. An error is returned if both are set.
+	ClearActiveOwner bool
+
+	// AlternateOwnerAttrs specifies attributes to set for AlternateOwnerAttrs.
+	// If nil and ClearAlternateOwner is false, AlternateOwnerAttrs is not modified.
+	// If ClearAlternateOwner is true, AlternateOwnerAttrs must be nil (error if both are set).
+	AlternateOwnerAttrs map[string]string
+
+	// ClearAlternateOwner indicates that AlternateOwnerAttrs should be cleared (set to nil).
+	// If true, AlternateOwnerAttrs must be nil. An error is returned if both are set.
+	ClearAlternateOwner bool
+}
+
+// OwnerAttributePreconditions specifies expected owners for verification before setting attributes.
+// These are used to prevent overwriting attributes that belong to a different pod.
+type OwnerAttributePreconditions struct {
+	// ExpectedActiveOwner verifies current ActiveOwnerAttrs matches the specified owner before setting.
+	// If nil, no match on ExpectedActiveOwner is performed.
+	// Verification can still occur via VerifyActiveOwnerEmpty if that field is true.
+	// An error is returned if both ExpectedActiveOwner and VerifyActiveOwnerEmpty are set.
+	ExpectedActiveOwner *AttributeOwner
+
+	// VerifyActiveOwnerEmpty verifies that ActiveOwnerAttrs is empty (nil or empty map) before setting.
+	// If true, ActiveOwnerAttrs must be empty for the operation to proceed.
+	// An error is returned if both ExpectedActiveOwner and VerifyActiveOwnerEmpty are set.
+	VerifyActiveOwnerEmpty bool
+
+	// ExpectedAlternateOwner verifies current AlternateOwnerAttrs matches the specified owner before setting.
+	// If nil, no match on ExpectedAlternateOwner is performed.
+	// Verification can still occur via VerifyAlternateOwnerEmpty if that field is true.
+	// An error is returned if both ExpectedAlternateOwner and VerifyAlternateOwnerEmpty are set.
+	ExpectedAlternateOwner *AttributeOwner
+
+	// VerifyAlternateOwnerEmpty verifies that AlternateOwnerAttrs is empty (nil or empty map) before setting.
+	// If true, AlternateOwnerAttrs must be empty for the operation to proceed.
+	// An error is returned if both ExpectedAlternateOwner and VerifyAlternateOwnerEmpty are set.
+	VerifyAlternateOwnerEmpty bool
+}
+
+// expectedActiveOwner returns the expected active owner for precondition verification.
+// Returns nil if no check is needed. Safe to call on a nil receiver.
+func (p *OwnerAttributePreconditions) expectedActiveOwner() *AttributeOwner {
+	if p == nil {
+		return nil
+	}
+	if p.VerifyActiveOwnerEmpty {
+		return EmptyAttributeOwner()
+	}
+	return p.ExpectedActiveOwner
+}
+
+// expectedAlternateOwner returns the expected alternate owner for precondition verification.
+// Returns nil if no check is needed. Safe to call on a nil receiver.
+func (p *OwnerAttributePreconditions) expectedAlternateOwner() *AttributeOwner {
+	if p == nil {
+		return nil
+	}
+	if p.VerifyAlternateOwnerEmpty {
+		return EmptyAttributeOwner()
+	}
+	return p.ExpectedAlternateOwner
 }

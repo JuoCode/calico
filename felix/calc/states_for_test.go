@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,16 +18,26 @@ import (
 	"fmt"
 	"strings"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	. "github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	kapiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/felix/dataplane/mock"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/types"
+	"github.com/projectcalico/calico/lib/std/uniquelabels"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	. "github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	calinet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
+
+// Canned tiers/policies.
+
+var tier1_order20 = Tier{
+	Order: &order20,
+}
 
 // Pre-defined datastore states.  Each State object wraps up the complete state
 // of the datastore as well as the expected state of the dataplane.  The state
@@ -36,9 +46,13 @@ import (
 // from any state to any other state (by feeding in the corresponding
 // datastore updates) and then assert that the dataplane matches the resulting
 // state.
+//
+// Notice that most of these pre-defined states are compounded. A small test
+// might prefer to start with a simpler state instead.
 
 // empty is the base state, with nothing in the datastore or dataplane.
-var empty = NewState().withName("<empty>")
+var empty = NewState().withName("<empty>").
+	withIPSet(rules.IPSetIDAllIstioWEPs, []string{})
 
 // initialisedStore builds on empty, adding in the ready flag and global config.
 var initialisedStore = empty.withKVUpdates(
@@ -47,51 +61,54 @@ var initialisedStore = empty.withKVUpdates(
 ).withName("<initialised>")
 
 // withPolicy adds a tier and policy containing selectors for all and b=="b"
-var pol1KVPair = KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20}
-var pol1KVPairAlways = KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_always}
-var pol1KVPairOnDemand = KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_ondemand}
+var (
+	pol1KVPair         = KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20}
+	pol1KVPairAlways   = KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_always}
+	pol1KVPairOnDemand = KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_ondemand}
+)
 
 var withPolicy = initialisedStore.withKVUpdates(
+	KVPair{Key: TierKey{Name: "default"}, Value: &tier1_order20},
 	pol1KVPair,
 ).withName("with policy")
 
 var withPolicyAlways = initialisedStore.withKVUpdates(
 	pol1KVPairAlways,
 ).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withIPSet(allSelectorId, []string{}).withIPSet(bEqBSelectorId, []string{}).withName("with always-programmed policy")
 
 // withPolicyIngressOnly adds a tier and ingress policy containing selectors for all
 var withPolicyIngressOnly = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_ingress_only},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_ingress_only},
 ).withName("with ingress-only policy")
 
 // withPolicyEgressOnly adds a tier and egress policy containing selectors for b=="b"
 var withPolicyEgressOnly = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_egress_only},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_egress_only},
 ).withName("with egress-only policy")
 
 // withUntrackedPolicy adds a tier and policy containing selectors for all and b=="b"
 var withUntrackedPolicy = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_untracked},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_untracked},
 ).withName("with untracked policy")
 
 // withPreDNATPolicy adds a tier and policy containing selectors for all and a=="a"
 var withPreDNATPolicy = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pre-dnat-pol-1"}, Value: &policy1_order20_pre_dnat},
+	KVPair{Key: PolicyKey{Name: "pre-dnat-pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_pre_dnat},
 ).withName("with pre-DNAT policy")
 
 // withHttpMethodPolicy adds a policy containing http method selector.
 var withHttpMethodPolicy = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_http_match},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_http_match},
 ).withTotalALPPolicies(
 	1,
 ).withName("with http-method policy")
 
 // withServiceAccountPolicy adds two policies containing service account selector.
 var withServiceAccountPolicy = initialisedStore.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_src_service_account},
-	KVPair{Key: PolicyKey{Name: "pol-2"}, Value: &policy1_order20_dst_service_account},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_src_service_account},
+	KVPair{Key: PolicyKey{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_dst_service_account},
 ).withTotalALPPolicies(
 	2,
 ).withName("with service-account policy")
@@ -103,43 +120,43 @@ var withNonALPPolicy = withPolicy.withTotalALPPolicies(
 
 // Routes for local workloads.  Most of the tests pre-date route generation so they don't have a
 // local host resource; hence we get routes with no next hop.
-var routelocalWlTenDotOne = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlTenDotOne = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "10.0.0.1/32",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
 }
 
-var routelocalWlTenDotTwo = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlTenDotTwo = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "10.0.0.2/32",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
 }
 
-var routelocalWlTenDotThree = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlTenDotThree = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "10.0.0.3/32",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
 }
 
-var routelocalWlV6ColonOne = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlV6ColonOne = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "fc00:fe11::1/128",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
 }
 
-var routelocalWlV6ColonTwo = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlV6ColonTwo = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "fc00:fe11::2/128",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
 }
 
-var routelocalWlV6ColonThree = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var routelocalWlV6ColonThree = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	Dst:           "fc00:fe11::3/128",
 	DstNodeName:   localHostname,
 	LocalWorkload: true,
@@ -159,15 +176,19 @@ var localEp1WithPolicy = withPolicy.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withRoutes(
 	// Routes for the local WEPs.
@@ -176,6 +197,399 @@ var localEp1WithPolicy = withPolicy.withKVUpdates(
 	routelocalWlV6ColonOne,
 	routelocalWlV6ColonTwo,
 ).withName("ep1 local, policy")
+
+// withPolicyAndTier adds a tier and policy containing selectors for all and b=="b"
+var withPolicyAndTier = initialisedStore.withKVUpdates(
+	KVPair{Key: TierKey{Name: "tier-1"}, Value: &tier1_order20},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_tier1_order20},
+).withName("with policy")
+
+// localEp1WithPolicyAndTier adds a local endpoint to the mix.  It matches all and b=="b".
+var localEp1WithPolicyAndTier = withPolicyAndTier.withKVUpdates(
+	KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32", // ep1
+	"fc00:fe11::1/128",
+	"10.0.0.2/32", // ep1 and ep2
+	"fc00:fe11::2/128",
+}).withIPSet(bEqBSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withActivePolicies(
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+).withActiveProfiles(
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
+).withEndpoint(
+	localWlEp1Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-1",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withRoutes(
+	// Routes for the local WEPs.
+	routelocalWlTenDotOne,
+	routelocalWlTenDotTwo,
+	routelocalWlV6ColonOne,
+	routelocalWlV6ColonTwo,
+).withName("ep1 local, policy with non-default tier")
+
+// States for testing a policy that changes tiers via UPDATE. Both tiers exist
+// throughout; only the policy's Tier field changes. This exercises the tier
+// migration path in the policy sorter and active rules calculator.
+
+var tier2_order30 = Tier{
+	Order: &order30,
+}
+
+// withTwoTiersPolicyInTier1 has both tier-1 and tier-2 resources, with the policy in tier-1.
+var withTwoTiersPolicyInTier1 = initialisedStore.withKVUpdates(
+	KVPair{Key: TierKey{Name: "tier-1"}, Value: &tier1_order20},
+	KVPair{Key: TierKey{Name: "tier-2"}, Value: &tier2_order30},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_tier1_order20},
+).withName("two tiers, policy in tier-1")
+
+// localEp1WithTwoTiersPolicyInTier1 has the endpoint matching pol-1 which is in tier-1.
+var localEp1WithTwoTiersPolicyInTier1 = withTwoTiersPolicyInTier1.withKVUpdates(
+	KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withIPSet(bEqBSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withActivePolicies(
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+).withActiveProfiles(
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
+).withEndpoint(
+	localWlEp1Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-1",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withRoutes(
+	routelocalWlTenDotOne,
+	routelocalWlTenDotTwo,
+	routelocalWlV6ColonOne,
+	routelocalWlV6ColonTwo,
+).withName("ep1 local, two tiers, policy in tier-1")
+
+// localEp1WithTwoTiersPolicyInTier2 is the same setup but with the policy moved to tier-2.
+// The only datastore change from the above is the policy's Tier field.
+var localEp1WithTwoTiersPolicyInTier2 = withTwoTiersPolicyInTier1.withKVUpdates(
+	KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_tier2_order20},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withIPSet(bEqBSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withActivePolicies(
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+).withActiveProfiles(
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
+).withEndpoint(
+	localWlEp1Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-2",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withRoutes(
+	routelocalWlTenDotOne,
+	routelocalWlTenDotTwo,
+	routelocalWlV6ColonOne,
+	routelocalWlV6ColonTwo,
+).withName("ep1 local, two tiers, policy in tier-2")
+
+// localEp2WithPolicyAndTier adds a different endpoint that doesn't match b=="b".
+// This tests an empty IP set.
+var localEp2WithPolicyAndTier = withPolicyAndTier.withKVUpdates(
+	KVPair{Key: localWlEpKey2, Value: &localWlEp2},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.2/32", // ep1 and ep2
+	"fc00:fe11::2/128",
+	"10.0.0.3/32", // ep2
+	"fc00:fe11::3/128",
+}).withIPSet(
+	bEqBSelectorId, []string{},
+).withActivePolicies(
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+).withActiveProfiles(
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+).withEndpoint(
+	localWlEp2Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-1",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withRoutes(
+	// Routes for the local WEPs.
+	routelocalWlTenDotTwo,
+	routelocalWlTenDotThree,
+	routelocalWlV6ColonTwo,
+	routelocalWlV6ColonThree,
+).withName("ep2 local, policy")
+
+// Policy ordering tests.  We keep the names of the policies the same but we
+// change their orders to check that order trumps name.
+var commLocalEp1WithOneTierPolicy123 = commercialPolicyOrderState(
+	[3]float64{order10, order20, order30},
+	[3]types.PolicyID{
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+	},
+)
+
+var commLocalEp1WithOneTierPolicy321 = commercialPolicyOrderState(
+	[3]float64{order30, order20, order10},
+	[3]types.PolicyID{
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+	},
+)
+
+var commLocalEp1WithOneTierPolicyAlpha = commercialPolicyOrderState(
+	[3]float64{order10, order10, order10},
+	[3]types.PolicyID{
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+	},
+)
+
+func commercialPolicyOrderState(policyOrders [3]float64, expectedIDs [3]types.PolicyID) State {
+	policies := [3]Policy{}
+	for i := range policies {
+		policies[i] = Policy{
+			Tier:          "tier-1",
+			Order:         &policyOrders[i],
+			Selector:      "a == 'a'",
+			InboundRules:  []Rule{{SrcSelector: allSelector}},
+			OutboundRules: []Rule{{SrcSelector: bEpBSelector}},
+		}
+	}
+	state := initialisedStore.withKVUpdates(
+		KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+		KVPair{Key: TierKey{Name: "tier-1"}, Value: &tier1_order20},
+		KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[0]},
+		KVPair{Key: PolicyKey{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[1]},
+		KVPair{Key: PolicyKey{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[2]},
+	).withIPSet(allSelectorId, []string{
+		"10.0.0.1/32", // ep1
+		"fc00:fe11::1/128",
+		"10.0.0.2/32", // ep1 and ep2
+		"fc00:fe11::2/128",
+	}).withIPSet(bEqBSelectorId, []string{
+		"10.0.0.1/32",
+		"fc00:fe11::1/128",
+		"10.0.0.2/32",
+		"fc00:fe11::2/128",
+	}).withActivePolicies(
+		types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+	).withActiveProfiles(
+		types.ProfileID{Name: "prof-1"},
+		types.ProfileID{Name: "prof-2"},
+		types.ProfileID{Name: "prof-missing"},
+	).withEndpoint(
+		localWlEp1Id,
+		[]mock.TierInfo{
+			{
+				Name:            "tier-1",
+				IngressPolicies: expectedIDs[:],
+				EgressPolicies:  expectedIDs[:],
+			},
+		},
+	).withRoutes(
+		// Routes for the local WEPs.
+		routelocalWlTenDotOne,
+		routelocalWlTenDotTwo,
+		routelocalWlV6ColonOne,
+		routelocalWlV6ColonTwo,
+	).withName(fmt.Sprintf("ep1 local, 1 tier, policies %v", expectedIDs[:]))
+	return state
+}
+
+// Tier ordering tests.  We keep the names of the tiers constant but adjust
+// their orders.
+var localEp1WithTiers123 = tierOrderState(
+	[3]float64{order10, order20, order30},
+	[3]string{"tier-1", "tier-2", "tier-3"},
+)
+
+var localEp1WithTiers321 = tierOrderState(
+	[3]float64{order30, order20, order10},
+	[3]string{"tier-3", "tier-2", "tier-1"},
+)
+
+// These tests use the same order for each tier, checking that the name is
+// used as a tie breaker.
+var localEp1WithTiersAlpha = tierOrderState(
+	[3]float64{order10, order10, order10},
+	[3]string{"tier-1", "tier-2", "tier-3"},
+)
+
+var localEp1WithTiersAlpha2 = tierOrderState(
+	[3]float64{order20, order20, order20},
+	[3]string{"tier-1", "tier-2", "tier-3"},
+)
+
+var localEp1WithTiersAlpha3 = tierOrderState(
+	[3]float64{order20, order20, order10},
+	[3]string{"tier-3", "tier-1", "tier-2"},
+)
+
+func tierOrderState(tierOrders [3]float64, expectedOrder [3]string) State {
+	tiers := [3]Tier{}
+	for i := range tiers {
+		tiers[i] = Tier{
+			Order: &tierOrders[i],
+		}
+	}
+
+	// initialize three policies with the same order but different tier names
+	pol1Tier1 := policy1_order20
+	pol1Tier1.Tier = "tier-1"
+	pol1Tier2 := policy1_order20
+	pol1Tier2.Tier = "tier-2"
+	pol1Tier3 := policy1_order20
+	pol1Tier3.Tier = "tier-3"
+
+	state := initialisedStore.withKVUpdates(
+		KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+		KVPair{Key: TierKey{Name: "tier-1"}, Value: &tiers[0]},
+		KVPair{Key: PolicyKey{Name: "tier-1-pol", Kind: v3.KindGlobalNetworkPolicy}, Value: &pol1Tier1},
+		KVPair{Key: TierKey{Name: "tier-2"}, Value: &tiers[1]},
+		KVPair{Key: PolicyKey{Name: "tier-2-pol", Kind: v3.KindGlobalNetworkPolicy}, Value: &pol1Tier2},
+		KVPair{Key: TierKey{Name: "tier-3"}, Value: &tiers[2]},
+		KVPair{Key: PolicyKey{Name: "tier-3-pol", Kind: v3.KindGlobalNetworkPolicy}, Value: &pol1Tier3},
+	).withIPSet(
+		allSelectorId, ep1IPs,
+	).withIPSet(
+		bEqBSelectorId, ep1IPs,
+	).withActivePolicies(
+		types.PolicyID{Name: "tier-1-pol", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "tier-2-pol", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "tier-3-pol", Kind: v3.KindGlobalNetworkPolicy},
+	).withActiveProfiles(
+		types.ProfileID{Name: "prof-1"},
+		types.ProfileID{Name: "prof-2"},
+		types.ProfileID{Name: "prof-missing"},
+	).withEndpoint(
+		localWlEp1Id,
+		[]mock.TierInfo{
+			{
+				Name:            expectedOrder[0],
+				IngressPolicies: []types.PolicyID{{Name: expectedOrder[0] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+				EgressPolicies:  []types.PolicyID{{Name: expectedOrder[0] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+			},
+			{
+				Name:            expectedOrder[1],
+				IngressPolicies: []types.PolicyID{{Name: expectedOrder[1] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+				EgressPolicies:  []types.PolicyID{{Name: expectedOrder[1] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+			},
+			{
+				Name:            expectedOrder[2],
+				IngressPolicies: []types.PolicyID{{Name: expectedOrder[2] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+				EgressPolicies:  []types.PolicyID{{Name: expectedOrder[2] + "-pol", Kind: v3.KindGlobalNetworkPolicy}},
+			},
+		},
+	).withRoutes(
+		// Routes for the local WEPs.
+		routelocalWlTenDotOne,
+		routelocalWlTenDotTwo,
+		routelocalWlV6ColonOne,
+		routelocalWlV6ColonTwo,
+	).withName(fmt.Sprintf("tier-order-state%v", expectedOrder[:]))
+	return state
+}
+
+// localEpsWithPolicyAndTier contains both of the above endpoints, which have some
+// overlapping IPs.  When we sequence this with the states above, we test
+// overlapping IP addition and removal.
+var localEpsWithPolicyAndTier = withPolicyAndTier.withKVUpdates(
+	// Two local endpoints with overlapping IPs.
+	KVPair{Key: localWlEpKey1, Value: &localWlEp1},
+	KVPair{Key: localWlEpKey2, Value: &localWlEp2},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32", // ep1
+	"fc00:fe11::1/128",
+	"10.0.0.2/32", // ep1 and ep2
+	"fc00:fe11::2/128",
+	"10.0.0.3/32", // ep2
+	"fc00:fe11::3/128",
+}).withIPSet(bEqBSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+}).withActivePolicies(
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+).withActiveProfiles(
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
+).withEndpoint(
+	localWlEp1Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-1",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withEndpoint(
+	localWlEp2Id,
+	[]mock.TierInfo{
+		{
+			Name:            "tier-1",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
+	},
+).withRoutes(
+	// Routes for the local WEPs.
+	routelocalWlTenDotOne,
+	routelocalWlTenDotTwo,
+	routelocalWlTenDotThree,
+	routelocalWlV6ColonOne,
+	routelocalWlV6ColonTwo,
+	routelocalWlV6ColonThree,
+).withName("2 local, overlapping IPs & a policy")
 
 var localEp1WithPolicyAlways = localEp1WithPolicy.withKVUpdates(
 	pol1KVPairAlways,
@@ -187,7 +601,7 @@ var localEp1WithPolicyOnDemand = localEp1WithPolicy.withKVUpdates(
 
 // localEp1WithNamedPortPolicy as above but with named port in the policy.
 var localEp1WithNamedPortPolicy = localEp1WithPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
 ).withIPSet(namedPortAllTCPID, []string{
 	"10.0.0.1,tcp:8080",
 	"10.0.0.2,tcp:8080",
@@ -198,7 +612,7 @@ var localEp1WithNamedPortPolicy = localEp1WithPolicy.withKVUpdates(
 // localEp1WithNamedPortPolicy as above but with negated named port in the policy.
 var localEp1WithNegatedNamedPortPolicy = empty.withKVUpdates(
 	KVPair{Key: localWlEpKey1, Value: &localWlEp1},
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_negated_named_port_tcpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_negated_named_port_tcpport},
 ).withIPSet(namedPortAllLessFoobarTCPID, []string{
 	"10.0.0.1,tcp:8080",
 	"10.0.0.2,tcp:8080",
@@ -211,17 +625,17 @@ var localEp1WithNegatedNamedPortPolicy = empty.withKVUpdates(
 	"fc00:fe11::1/128",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
 		{
-			Name:               "default",
-			IngressPolicyNames: []string{"pol-1"},
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
 		},
 	},
 ).withRoutes(
@@ -235,7 +649,7 @@ var localEp1WithNegatedNamedPortPolicy = empty.withKVUpdates(
 // As above but using the destination fields in the policy instead of source.
 var localEp1WithNegatedNamedPortPolicyDest = localEp1WithNegatedNamedPortPolicy.withKVUpdates(
 	KVPair{
-		Key:   PolicyKey{Name: "pol-1"},
+		Key:   PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 		Value: &policy1_order20_with_selector_and_negated_named_port_tcpport_dest,
 	},
 ).withName("ep1 local, negated named port policy in destination fields")
@@ -243,7 +657,7 @@ var localEp1WithNegatedNamedPortPolicyDest = localEp1WithNegatedNamedPortPolicy.
 // A host endpoint with a named port
 var localHostEp1WithNamedPortPolicy = empty.withKVUpdates(
 	KVPair{Key: hostEpWithNameKey, Value: &hostEpWithNamedPorts},
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
 ).withIPSet(namedPortAllTCPID, []string{
 	"10.0.0.1,tcp:8080",
 	"10.0.0.2,tcp:8080",
@@ -255,24 +669,28 @@ var localHostEp1WithNamedPortPolicy = empty.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-1"},
 ).withEndpoint(
 	"named",
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withName("Host endpoint, named port policy")
 
 // As above but with no selector in the rules.
 var localEp1WithNamedPortPolicyNoSelector = localEp1WithNamedPortPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_named_port_tcpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_named_port_tcpport},
 ).withName("ep1 local, named port only")
 
 // As above but with negated named port.
 var localEp1WithNegatedNamedPortPolicyNoSelector = localEp1WithNamedPortPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_named_port_tcpport_negated},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_named_port_tcpport_negated},
 ).withName("ep1 local, negated named port only")
 
 // localEp1WithIngressPolicy is as above except ingress policy only.
@@ -284,15 +702,19 @@ var localEp1WithIngressPolicy = withPolicyIngressOnly.withKVUpdates(
 	"10.0.0.2/32", // ep1 and ep2
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: nil},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  nil,
+		},
 	},
 ).withRoutes(
 	// Routes for the local WEPs.
@@ -304,7 +726,7 @@ var localEp1WithIngressPolicy = withPolicyIngressOnly.withKVUpdates(
 
 // localEp1WithNamedPortPolicy as above but with UDP named port in the policy.
 var localEp1WithNamedPortPolicyUDP = localEp1WithPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_named_port_udpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_named_port_udpport},
 ).withIPSet(namedPortAllUDPID, []string{
 	"10.0.0.1,udp:9091",
 	"10.0.0.2,udp:9091",
@@ -325,15 +747,19 @@ var hostEp1WithPolicy = withPolicy.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	hostEpWithNameId,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withName("host ep1, policy")
 
@@ -345,15 +771,19 @@ var hostEp1WithIngressPolicy = withPolicyIngressOnly.withKVUpdates(
 	"10.0.0.2/32", // ep1 and ep2
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	hostEpWithNameId,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: nil},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  nil,
+		},
 	},
 ).withName("host ep1, ingress-only policy")
 
@@ -365,15 +795,19 @@ var hostEp1WithEgressPolicy = withPolicyEgressOnly.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	hostEpWithNameId,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: nil, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: nil,
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withName("host ep1, egress-only policy")
 
@@ -390,18 +824,22 @@ var hostEp1WithUntrackedPolicy = withUntrackedPolicy.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withUntrackedPolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpointUntracked(
 	hostEpWithNameId,
 	[]mock.TierInfo{},
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 	[]mock.TierInfo{},
 ).withName("host ep1, untracked policy")
@@ -414,34 +852,46 @@ var hostEp1WithPreDNATPolicy = withPreDNATPolicy.withKVUpdates(
 	"10.0.0.2/32", // ep1 and ep2
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pre-dnat-pol-1"},
+	types.PolicyID{Name: "pre-dnat-pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withPreDNATPolicies(
-	proto.PolicyID{Tier: "default", Name: "pre-dnat-pol-1"},
+	types.PolicyID{Name: "pre-dnat-pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpointUntracked(
 	hostEpWithNameId,
 	[]mock.TierInfo{},
 	[]mock.TierInfo{},
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pre-dnat-pol-1"}, EgressPolicyNames: nil},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pre-dnat-pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  nil,
+		},
 	},
 ).withName("host ep1, pre-DNAT policy")
 
 var hostEp1WithTrackedAndUntrackedPolicy = hostEp1WithUntrackedPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-2"}, Value: &policy1_order20},
+	KVPair{Key: PolicyKey{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20},
 ).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
-	proto.PolicyID{Tier: "default", Name: "pol-2"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+	types.PolicyID{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
 ).withEndpointUntracked(
 	hostEpWithNameId,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-2"}, EgressPolicyNames: []string{"pol-2"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 	[]mock.TierInfo{},
 ).withName("host ep1, tracked+untracked policy")
@@ -454,14 +904,18 @@ var hostEp2WithPolicy = withPolicy.withKVUpdates(
 	"10.0.0.3/32", // ep2
 	"fc00:fe11::3/128",
 }).withIPSet(bEqBSelectorId, []string{}).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
 ).withEndpoint(
 	hostEpNoNameId,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withName("host ep2, policy")
 
@@ -469,23 +923,36 @@ var hostEp2WithPolicy = withPolicy.withKVUpdates(
 // change their orders to check that order trumps name.
 var localEp1WithOneTierPolicy123 = policyOrderState(
 	[3]float64{order10, order20, order30},
-	[3]string{"pol-1", "pol-2", "pol-3"},
+	[3]types.PolicyID{
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+	},
 )
 
 var localEp1WithOneTierPolicy321 = policyOrderState(
 	[3]float64{order30, order20, order10},
-	[3]string{"pol-3", "pol-2", "pol-1"},
+	[3]types.PolicyID{
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+	},
 )
 
 var localEp1WithOneTierPolicyAlpha = policyOrderState(
 	[3]float64{order10, order10, order10},
-	[3]string{"pol-1", "pol-2", "pol-3"},
+	[3]types.PolicyID{
+		{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
+	},
 )
 
-func policyOrderState(policyOrders [3]float64, expectedOrder [3]string) State {
+func policyOrderState(policyOrders [3]float64, expectedOrder [3]types.PolicyID) State {
 	policies := [3]Policy{}
 	for i := range policies {
 		policies[i] = Policy{
+			Tier:          "default",
 			Order:         &policyOrders[i],
 			Selector:      "a == 'a'",
 			InboundRules:  []Rule{{SrcSelector: allSelector}},
@@ -494,9 +961,9 @@ func policyOrderState(policyOrders [3]float64, expectedOrder [3]string) State {
 	}
 	state := initialisedStore.withKVUpdates(
 		KVPair{Key: localWlEpKey1, Value: &localWlEp1},
-		KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policies[0]},
-		KVPair{Key: PolicyKey{Name: "pol-2"}, Value: &policies[1]},
-		KVPair{Key: PolicyKey{Name: "pol-3"}, Value: &policies[2]},
+		KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[0]},
+		KVPair{Key: PolicyKey{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[1]},
+		KVPair{Key: PolicyKey{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy}, Value: &policies[2]},
 	).withIPSet(allSelectorId, []string{
 		"10.0.0.1/32", // ep1
 		"fc00:fe11::1/128",
@@ -508,17 +975,17 @@ func policyOrderState(policyOrders [3]float64, expectedOrder [3]string) State {
 		"10.0.0.2/32",
 		"fc00:fe11::2/128",
 	}).withActivePolicies(
-		proto.PolicyID{Tier: "default", Name: "pol-1"},
-		proto.PolicyID{Tier: "default", Name: "pol-2"},
-		proto.PolicyID{Tier: "default", Name: "pol-3"},
+		types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "pol-2", Kind: v3.KindGlobalNetworkPolicy},
+		types.PolicyID{Name: "pol-3", Kind: v3.KindGlobalNetworkPolicy},
 	).withActiveProfiles(
-		proto.ProfileID{Name: "prof-1"},
-		proto.ProfileID{Name: "prof-2"},
-		proto.ProfileID{Name: "prof-missing"},
+		types.ProfileID{Name: "prof-1"},
+		types.ProfileID{Name: "prof-2"},
+		types.ProfileID{Name: "prof-missing"},
 	).withEndpoint(
 		localWlEp1Id,
 		[]mock.TierInfo{
-			{Name: "default", IngressPolicyNames: expectedOrder[:], EgressPolicyNames: expectedOrder[:]},
+			{Name: "default", IngressPolicies: expectedOrder[:], EgressPolicies: expectedOrder[:]},
 		},
 	).withRoutes(
 		// Routes for the local WEPs.
@@ -542,14 +1009,18 @@ var localEp2WithPolicy = withPolicy.withKVUpdates(
 }).withIPSet(
 	bEqBSelectorId, []string{},
 ).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
 ).withEndpoint(
 	localWlEp2Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withRoutes(
 	// Routes for the local WEPs.
@@ -579,21 +1050,29 @@ var localEpsWithPolicy = withPolicy.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "pol-1"},
+	types.PolicyID{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withEndpoint(
 	localWlEp2Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"pol-1"}, EgressPolicyNames: []string{"pol-1"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 ).withRoutes(
 	// Routes for the local WEPs.
@@ -606,7 +1085,7 @@ var localEpsWithPolicy = withPolicy.withKVUpdates(
 ).withName("2 local, overlapping IPs & a policy")
 
 var localEpsWithNamedPortsPolicy = localEpsWithPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_named_port_tcpport},
 ).withIPSet(
 	allSelectorId, nil,
 ).withIPSet(namedPortAllTCPID, []string{
@@ -619,7 +1098,7 @@ var localEpsWithNamedPortsPolicy = localEpsWithPolicy.withKVUpdates(
 }).withName("2 local, overlapping IPs & a named port policy")
 
 var localEpsWithNamedPortsPolicyTCPPort2 = localEpsWithPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_selector_and_named_port_tcpport2},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_selector_and_named_port_tcpport2},
 ).withIPSet(
 	allSelectorId, nil,
 ).withIPSet(namedPortAllTCP2ID, []string{
@@ -638,7 +1117,7 @@ var localEpsWithNamedPortsPolicyTCPPort2 = localEpsWithPolicy.withKVUpdates(
 // localEpsWithMismatchedNamedPortsPolicy contains a policy that has named port matches where the
 // rule has a protocol that doesn't match that in the named port definitions in the endpoint.
 var localEpsWithMismatchedNamedPortsPolicy = localEpsWithPolicy.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "pol-1"}, Value: &policy1_order20_with_named_port_mismatched_protocol},
+	KVPair{Key: PolicyKey{Name: "pol-1", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy1_order20_with_named_port_mismatched_protocol},
 ).withIPSet(
 	allSelectorId, nil,
 ).withIPSet(
@@ -663,10 +1142,10 @@ var localEpsWithOverlappingIPsAndInheritedLabels = empty.withKVUpdates(
 	localWlEp2Id,
 	[]mock.TierInfo{},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
 ).withRoutes(
 	// Routes for the local WEPs.
 	routelocalWlTenDotOne,
@@ -680,22 +1159,22 @@ var localEpsWithOverlappingIPsAndInheritedLabels = empty.withKVUpdates(
 // Building on the above, we add a policy to match on the inherited label, which should produce
 // a named port.
 var localEpsAndNamedPortPolicyMatchingInheritedLabelOnEP1 = localEpsWithOverlappingIPsAndInheritedLabels.withKVUpdates(
-	KVPair{Key: PolicyKey{Name: "inherit-pol"}, Value: &policy_with_named_port_inherit},
+	KVPair{Key: PolicyKey{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy}, Value: &policy_with_named_port_inherit},
 ).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "inherit-pol"},
+	types.PolicyID{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{{
-		Name:               "default",
-		IngressPolicyNames: []string{"inherit-pol"},
-		EgressPolicyNames:  []string{"inherit-pol"},
+		Name:            "default",
+		IngressPolicies: []types.PolicyID{{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy}},
+		EgressPolicies:  []types.PolicyID{{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy}},
 	}},
 ).withEndpoint(
 	localWlEp2Id,
 	[]mock.TierInfo{{
-		Name:               "default",
-		IngressPolicyNames: []string{"inherit-pol"},
-		EgressPolicyNames:  []string{"inherit-pol"},
+		Name:            "default",
+		IngressPolicies: []types.PolicyID{{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy}},
+		EgressPolicies:  []types.PolicyID{{Name: "inherit-pol", Kind: v3.KindGlobalNetworkPolicy}},
 	}},
 ).withIPSet(namedPortInheritIPSetID, []string{
 	"10.0.0.1,tcp:8080", // ep1
@@ -767,9 +1246,9 @@ var localEpsAndNamedPortPolicyEP2ProfileRemoved = localEpsAndNamedPortPolicyMatc
 	"fc00:fe11::2,tcp:8080",
 	// ep2 no longer matches
 }).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withName("2 local WEPs with policy matching inherited label on WEP1; WEP2 has no profile")
 
 // Then do the same for EP1.
@@ -810,28 +1289,28 @@ var localEpsWithPolicyUpdatedIPs = localEpsWithPolicy.withKVUpdates(
 	"fc00:fe12::2/128",
 }).withRoutes(
 	// Routes for the local WEPs.
-	proto.RouteUpdate{
-		Type:          proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
 		Dst:           "11.0.0.1/32",
 		DstNodeName:   localHostname,
 		LocalWorkload: true,
 	},
-	proto.RouteUpdate{
-		Type:          proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
 		Dst:           "11.0.0.2/32",
 		DstNodeName:   localHostname,
 		LocalWorkload: true,
 	},
 	routelocalWlTenDotTwo,
 	routelocalWlTenDotThree,
-	proto.RouteUpdate{
-		Type:          proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
 		Dst:           "fc00:fe12::1/128",
 		DstNodeName:   localHostname,
 		LocalWorkload: true,
 	},
-	proto.RouteUpdate{
-		Type:          proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
 		Dst:           "fc00:fe12::2/128",
 		DstNodeName:   localHostname,
 		LocalWorkload: true,
@@ -842,8 +1321,7 @@ var localEpsWithPolicyUpdatedIPs = localEpsWithPolicy.withKVUpdates(
 
 // withProfile adds a profile to the initialised state.
 var withProfile = initialisedStore.withKVUpdates(
-	KVPair{Key: ProfileRulesKey{ProfileKey: ProfileKey{Name: "prof-1"}}, Value: &profileRules1},
-	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profileLabels1Tag1},
+	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profile1},
 ).withName("profile")
 
 // localEpsWithProfile contains a pair of overlapping IP endpoints and a profile
@@ -865,10 +1343,10 @@ var localEpsWithProfile = withProfile.withKVUpdates(
 	"10.0.0.2/32",
 	"fc00:fe11::2/128",
 }).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{},
@@ -910,7 +1388,7 @@ var localEpsWithNonMatchingProfile = withProfile.withKVUpdates(
 // localEpsWithUpdatedProfile Follows on from localEpsWithProfile, changing the
 // profile to use a different tag and selector.
 var localEpsWithUpdatedProfile = localEpsWithProfile.withKVUpdates(
-	KVPair{Key: ProfileRulesKey{ProfileKey: ProfileKey{Name: "prof-1"}}, Value: &profileRules1TagUpdate},
+	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profile1TagUpdate},
 ).withIPSet(
 	tag1LabelID, nil,
 ).withIPSet(
@@ -931,14 +1409,13 @@ var localEpsWithUpdatedProfile = localEpsWithProfile.withKVUpdates(
 ).withName("2 local, overlapping IPs & updated profile")
 
 var localEpsWithUpdatedProfileNegatedTags = localEpsWithUpdatedProfile.withKVUpdates(
-	KVPair{Key: ProfileRulesKey{ProfileKey: ProfileKey{Name: "prof-1"}}, Value: &profileRules1NegatedTagSelUpdate},
+	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profile1NegatedTagSelUpdate},
 )
 
 // withProfileTagInherit adds a profile that includes rules that match on
 // tags as labels.  I.e. a tag of name foo should be equivalent to label foo=""
 var withProfileTagInherit = initialisedStore.withKVUpdates(
-	KVPair{Key: ProfileRulesKey{ProfileKey: ProfileKey{Name: "prof-1"}}, Value: &profileRulesWithTagInherit},
-	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profileLabels1Tag1},
+	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profile1WithTagInherit},
 ).withName("profile")
 
 var localEpsWithTagInheritProfile = withProfileTagInherit.withKVUpdates(
@@ -953,10 +1430,10 @@ var localEpsWithTagInheritProfile = withProfileTagInherit.withKVUpdates(
 }).withIPSet(
 	tagFoobarSelectorId, []string{},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id, []mock.TierInfo{},
 ).withEndpoint(
@@ -972,8 +1449,7 @@ var localEpsWithTagInheritProfile = withProfileTagInherit.withKVUpdates(
 ).withName("2 local, overlapping IPs & a tag inherit profile")
 
 var withProfileTagOverridden = initialisedStore.withKVUpdates(
-	KVPair{Key: ProfileRulesKey{ProfileKey: ProfileKey{Name: "prof-1"}}, Value: &profileRulesWithTagInherit},
-	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profileLabelsTag1},
+	KVPair{Key: ResourceKey{Kind: v3.KindProfile, Name: "prof-1"}, Value: profile1WithTagOverridden},
 ).withName("profile")
 
 // localEpsWithTagOverriddenProfile Checks that tags-inherited labels can be
@@ -993,10 +1469,10 @@ var localEpsWithTagOverriddenProfile = withProfileTagOverridden.withKVUpdates(
 	"10.0.0.2/32", // ep1 and ep2
 	"fc00:fe11::2/128",
 }).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-3"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-3"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{},
@@ -1066,57 +1542,101 @@ var hostEp1WithPolicyAndANetworkSetMatchingBEqB = hostEp1WithPolicy.withKVUpdate
 	"12.1.0.0/24",
 })
 
+// The next three states exercise overlap-suppression dedup on the remove path (CORE-13009). When
+// NFTables mode is not disabled (the FV default is "Auto"), the all() IP set is programmed as an
+// nftables interval set, which rejects overlapping CIDRs, so Felix suppresses nested CIDRs upstream:
+// only the broadest CIDR covering each address is programmed. The interesting transition is removing
+// a CIDR while a broader ancestor still covers it — the removed CIDR was never its own set member, so
+// nothing must be emitted, and descendants the ancestor still covers must stay suppressed.
+
+// hostEp1WithPolicyAndOverlapAncestor adds a NetworkSet contributing a single broad CIDR.
+var hostEp1WithPolicyAndOverlapAncestor = hostEp1WithPolicy.withKVUpdates(
+	KVPair{Key: netSetOverlapKey, Value: &netSetOverlapAncestor},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32", // ep1
+	"fc00:fe11::1/128",
+	"10.0.0.2/32", // ep1 and ep2
+	"fc00:fe11::2/128",
+	"10.65.0.0/16", // ancestor CIDR
+}).withName("host ep1, policy, overlap netset ancestor only")
+
+// hostEp1WithPolicyAndOverlapNested adds two further CIDRs nested inside the ancestor; both are
+// suppressed, so the programmed all() set is unchanged from the ancestor-only state.
+var hostEp1WithPolicyAndOverlapNested = hostEp1WithPolicyAndOverlapAncestor.withKVUpdates(
+	KVPair{Key: netSetOverlapKey, Value: &netSetOverlapNested},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+	"10.65.0.0/16", // ancestor; the nested /24 and /32 are suppressed.
+}).withName("host ep1, policy, overlap netset ancestor + nested (suppressed)")
+
+// hostEp1WithPolicyAndOverlapMiddleRemoved drops the middle /24 while the ancestor and leaf remain.
+// The removed /24 was never programmed and the leaf is still covered by the ancestor, so the
+// programmed all() set must be unchanged. The buggy remove path re-exposed the leaf and emitted a
+// spurious removal of the /24, both of which this state catches.
+var hostEp1WithPolicyAndOverlapMiddleRemoved = hostEp1WithPolicyAndOverlapNested.withKVUpdates(
+	KVPair{Key: netSetOverlapKey, Value: &netSetOverlapMiddleRemoved},
+).withIPSet(allSelectorId, []string{
+	"10.0.0.1/32",
+	"fc00:fe11::1/128",
+	"10.0.0.2/32",
+	"fc00:fe11::2/128",
+	"10.65.0.0/16", // ancestor still covers the leaf, so nothing changes.
+}).withName("host ep1, policy, overlap netset middle removed under live ancestor")
+
 // RouteUpdate expected for ipPoolWithVXLAN.
-var routeUpdateIPPoolVXLAN = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateIPPoolVXLAN = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_VXLAN,
 	Dst:         ipPoolWithVXLAN.CIDR.String(),
 	NatOutgoing: ipPoolWithVXLAN.Masquerade,
 }
 
 // RouteUpdate expected for ipPool2WithVXLAN.
-var routeUpdateIPPool2VXLAN = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateIPPool2VXLAN = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_VXLAN,
 	Dst:         ipPool2WithVXLAN.CIDR.String(),
 	NatOutgoing: ipPool2WithVXLAN.Masquerade,
 }
 
 // RouteUpdate expected for ipPoolWithVXLANSlash32.
-var routeUpdateIPPoolVXLANSlash32 = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateIPPoolVXLANSlash32 = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_VXLAN,
 	Dst:         ipPoolWithVXLANSlash32.CIDR.String(),
 	NatOutgoing: ipPoolWithVXLANSlash32.Masquerade,
 }
 
 // RouteUpdate expected for ipPoolWithVXLANCrossSubnet.
-var routeUpdateIPPoolVXLANCrossSubnet = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateIPPoolVXLANCrossSubnet = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_VXLAN,
 	Dst:         ipPoolWithVXLANCrossSubnet.CIDR.String(),
 	NatOutgoing: ipPoolWithVXLANCrossSubnet.Masquerade,
 }
 
 // RouteUpdate expected for v6IPPoolWithVXLAN.
-var routeUpdateV6IPPoolVXLAN = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateV6IPPoolVXLAN = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_VXLAN,
 	Dst:         v6IPPoolWithVXLAN.CIDR.String(),
 	NatOutgoing: v6IPPoolWithVXLAN.Masquerade,
 }
 
 // RouteUpdate expected for ipPoolWithIPIP.
-var routeUpdateIPPoolIPIP = proto.RouteUpdate{
-	Type:        proto.RouteType_CIDR_INFO,
+var routeUpdateIPPoolIPIP = types.RouteUpdate{
+	Types:       proto.RouteType_CIDR_INFO,
 	IpPoolType:  proto.IPPoolType_IPIP,
 	Dst:         ipPoolWithIPIP.CIDR.String(),
 	NatOutgoing: ipPoolWithIPIP.Masquerade,
 }
 
 // RouteUpdate expected for the remote host with its normal IP.
-var routeUpdateRemoteHost = proto.RouteUpdate{
-	Type:        proto.RouteType_REMOTE_HOST,
+var routeUpdateRemoteHost = types.RouteUpdate{
+	Types:       proto.RouteType_REMOTE_HOST,
 	IpPoolType:  proto.IPPoolType_NONE,
 	Dst:         remoteHostIP.String() + "/32",
 	DstNodeName: remoteHostname,
@@ -1124,8 +1644,8 @@ var routeUpdateRemoteHost = proto.RouteUpdate{
 }
 
 // RouteUpdate expected for the second remote host.
-var routeUpdateRemoteHost2 = proto.RouteUpdate{
-	Type:        proto.RouteType_REMOTE_HOST,
+var routeUpdateRemoteHost2 = types.RouteUpdate{
+	Types:       proto.RouteType_REMOTE_HOST,
 	IpPoolType:  proto.IPPoolType_NONE,
 	Dst:         remoteHost2IP.String() + "/32",
 	DstNodeName: remoteHostname2,
@@ -1133,8 +1653,8 @@ var routeUpdateRemoteHost2 = proto.RouteUpdate{
 }
 
 // RouteUpdate expected for the remote host with its normal IPv6 address.
-var routeUpdateRemoteHostV6 = proto.RouteUpdate{
-	Type:        proto.RouteType_REMOTE_HOST,
+var routeUpdateRemoteHostV6 = types.RouteUpdate{
+	Types:       proto.RouteType_REMOTE_HOST,
 	IpPoolType:  proto.IPPoolType_NONE,
 	Dst:         remoteHostIPv6.String() + "/128",
 	DstNodeName: remoteHostname,
@@ -1146,10 +1666,10 @@ var routeUpdateRemoteHostV6 = proto.RouteUpdate{
 var vxlanWithWEPIPs = empty.withKVUpdates(
 	KVPair{Key: GlobalConfigKey{Name: "RouteSource"}, Value: &workloadIPs},
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLAN},
-	KVPair{Key: remoteHost2IPKey, Value: &remoteHost2IP},
+	KVPair{Key: remoteNode2ResKey, Value: nodeBGPv4Res(remoteHostname2, remoteHost2IP)},
 	KVPair{Key: remoteHost2VXLANTunnelConfigKey, Value: remoteHost2VXLANTunnelIP},
 ).withName("VXLAN using WorkloadIPs").withVTEPs(
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname2,
 		Mac:            "66:40:18:59:1f:16",
 		Ipv4Addr:       remoteHost2VXLANTunnelIP,
@@ -1159,17 +1679,22 @@ var vxlanWithWEPIPs = empty.withKVUpdates(
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost2,
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHost2IP.String() + "/32",
+	},
 )
 
-// Adds in an workload on remoteHost2 and expected route.
+// Adds in a workload on remoteHost2 and expected route.
 var vxlanWithWEPIPsAndWEP = vxlanWithWEPIPs.withKVUpdates(
 	KVPair{Key: remoteWlEpKey2, Value: &remoteWlEp1},
 ).withName("VXLAN using WorkloadIPs and a WEP").withRoutes(
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost2,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.5/32",
 		DstNodeName: remoteHostname2,
@@ -1182,17 +1707,17 @@ var vxlanWithWEPIPsAndWEP = vxlanWithWEPIPs.withKVUpdates(
 // Since this new host sorts lower than the original, its should mask the route of the
 // WEP on the other node.
 var vxlanWithWEPIPsAndWEPDuplicate = vxlanWithWEPIPsAndWEP.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 	KVPair{Key: remoteWlEpKey1, Value: &remoteWlEp1},
 ).withName("VXLAN using WorkloadIPs and overlapping WEPs").withVTEPs(
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname2,
 		Mac:            "66:40:18:59:1f:16",
 		Ipv4Addr:       remoteHost2VXLANTunnelIP,
 		ParentDeviceIp: remoteHost2IP.String(),
 	},
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1202,13 +1727,22 @@ var vxlanWithWEPIPsAndWEPDuplicate = vxlanWithWEPIPsAndWEP.withKVUpdates(
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost,
 	routeUpdateRemoteHost2,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.5/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		NatOutgoing: true,
+	},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHost2IP.String() + "/32",
+	},
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
 	},
 )
 
@@ -1216,26 +1750,31 @@ var vxlanWithWEPIPsAndWEPDuplicate = vxlanWithWEPIPsAndWEP.withKVUpdates(
 var vxlanWithBlock = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLAN},
 	KVPair{Key: remoteIPAMBlockKey, Value: &remoteIPAMBlock},
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 ).withName("VXLAN").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
 		ParentDeviceIp: remoteHostIP.String(),
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
-).withRoutes(vxlanWithBlockRoutes...)
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+).withRoutes(vxlanWithBlockRoutes...).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
+)
 
-var vxlanWithBlockRoutes = []proto.RouteUpdate{
+var vxlanWithBlockRoutes = []types.RouteUpdate{
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost,
 	// Single route for the block.
 	{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -1245,22 +1784,48 @@ var vxlanWithBlockRoutes = []proto.RouteUpdate{
 }
 
 var (
-	remoteNodeResKey = ResourceKey{Name: remoteHostname, Kind: apiv3.KindNode}
-	localNodeResKey  = ResourceKey{Name: localHostname, Kind: apiv3.KindNode}
+	remoteNodeResKey  = ResourceKey{Name: remoteHostname, Kind: internalapi.KindNode}
+	remoteNode2ResKey = ResourceKey{Name: remoteHostname2, Kind: internalapi.KindNode}
+	localNodeResKey   = ResourceKey{Name: localHostname, Kind: internalapi.KindNode}
 )
+
+// nodeBGPv4Res builds an internalapi.Node resource carrying just an IPv4 BGP
+// address — the v3 replacement for the old HostIPKey value.
+func nodeBGPv4Res(name string, ip calinet.IP) *internalapi.Node {
+	return &internalapi.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{IPv4Address: ip.String() + "/32"},
+		},
+	}
+}
 
 // As vxlanWithBlock but with a host sharing the same IP.  No route update because we tie-break on host name.
 var vxlanWithBlockDupNodeIP = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteHost2IPKey, Value: &remoteHostIP},
-).withName("VXLAN with dup node IP")
+	KVPair{Key: remoteNode2ResKey, Value: nodeBGPv4Res(remoteHostname2, remoteHostIP)},
+).withName("VXLAN with dup node IP").withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
+)
 
 var vxlanWithDupNodeIPRemoved = vxlanWithBlockDupNodeIP.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: nil},
-).withName("VXLAN with dup node IP removed").withVTEPs().withRoutes(
+	KVPair{Key: remoteNodeResKey, Value: nil},
+).withName("VXLAN with dup node IP removed").withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
+).withVTEPs().withRoutes(
 	routeUpdateIPPoolVXLAN,
 	// Remote host 2 but with remotehost's IP:
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         remoteHostIP.String() + "/32",
 		DstNodeName: remoteHostname2,
@@ -1268,8 +1833,8 @@ var vxlanWithDupNodeIPRemoved = vxlanWithBlockDupNodeIP.withKVUpdates(
 	},
 	// Single route for the block.  No IP because the block belongs to remotehost and its IP was
 	// removed.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -1277,23 +1842,23 @@ var vxlanWithDupNodeIPRemoved = vxlanWithBlockDupNodeIP.withKVUpdates(
 	},
 )
 
-// As vxlanWithBlock but with node resources instead of host IPs.
+// As vxlanWithBlock but with the remote node resource carrying the host IP in
+// /24 form rather than the default /32 (the latter is what nodeBGPv4Res emits).
 var vxlanWithBlockNodeRes = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: nil},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: localHostname,
+			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: remoteHostIP.String() + "/24",
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIP.String() + "/24",
 	},
-).withName("VXLAN with node resource (node resources)")
+).withName("VXLAN with node resource (/24 BGP address)")
 
 // As vxlanWithBlock but with some superfluous IPv6 resources (VXLAN is IPv4 only).
 var vxlanWithIPv6Resources = vxlanWithBlock.withKVUpdates(
@@ -1301,18 +1866,20 @@ var vxlanWithIPv6Resources = vxlanWithBlock.withKVUpdates(
 	KVPair{Key: remotev6IPAMBlockKey, Value: &remotev6IPAMBlock},
 ).withRoutes(
 	append(vxlanWithBlockRoutes,
-		proto.RouteUpdate{
-			Type:        proto.RouteType_REMOTE_WORKLOAD,
+		types.RouteUpdate{
+			Types:       proto.RouteType_REMOTE_WORKLOAD,
 			IpPoolType:  proto.IPPoolType_NO_ENCAP,
 			Dst:         "feed:beef:0:0:1::/96",
 			DstNodeName: remoteHostname,
 		},
-		proto.RouteUpdate{
-			Type:       proto.RouteType_CIDR_INFO,
+		types.RouteUpdate{
+			Types:      proto.RouteType_CIDR_INFO,
 			IpPoolType: proto.IPPoolType_NO_ENCAP,
 			Dst:        "feed:beef::/64",
 		},
 	)...,
+).withExpectedEncapsulation(
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false, NoEncapEnabled: false},
 ).withName("VXLAN with IPv6 Resources")
 
 // Minimal VXLAN set-up with a MAC address override for the remote node.
@@ -1320,7 +1887,7 @@ var vxlanWithMAC = vxlanWithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANTunnelMACConfigKey, Value: remoteHostVXLANTunnelMAC},
 ).withName("VXLAN MAC").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            remoteHostVXLANTunnelMAC,
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1333,16 +1900,16 @@ var vxlanWithMAC = vxlanWithBlock.withKVUpdates(
 // other node.
 var vxlanWithBlockAndBorrows = vxlanWithBlock.withKVUpdates(
 	KVPair{Key: remoteIPAMBlockKey, Value: &remoteIPAMBlockWithBorrows},
-	KVPair{Key: remoteHost2IPKey, Value: &remoteHost2IP},
+	KVPair{Key: remoteNode2ResKey, Value: nodeBGPv4Res(remoteHostname2, remoteHost2IP)},
 	KVPair{Key: remoteHost2VXLANTunnelConfigKey, Value: remoteHost2VXLANTunnelIP},
 ).withName("VXLAN borrow").withVTEPs(
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
 		ParentDeviceIp: remoteHostIP.String(),
 	},
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname2,
 		Mac:            "66:40:18:59:1f:16",
 		Ipv4Addr:       remoteHost2VXLANTunnelIP,
@@ -1353,21 +1920,31 @@ var vxlanWithBlockAndBorrows = vxlanWithBlock.withKVUpdates(
 	routeUpdateRemoteHost,
 	routeUpdateRemoteHost2,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		NatOutgoing: true,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.2/32",
 		DstNodeName: remoteHostname2,
 		DstNodeIp:   remoteHost2IP.String(),
 		NatOutgoing: true,
+		Borrowed:    true,
+	},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHost2IP.String() + "/32",
 	},
 )
 
@@ -1376,7 +1953,7 @@ var vxlanWithBlockAndDifferentTunnelIP = vxlanWithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP2},
 ).withName("VXLAN different tunnel IP").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP2,
@@ -1386,10 +1963,10 @@ var vxlanWithBlockAndDifferentTunnelIP = vxlanWithBlock.withKVUpdates(
 
 // vxlanWithBlock but with a different node IP.
 var vxlanWithBlockAndDifferentNodeIP = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: &remoteHost2IP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHost2IP)},
 ).withName("VXLAN different node IP").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1397,21 +1974,26 @@ var vxlanWithBlockAndDifferentNodeIP = vxlanWithBlock.withKVUpdates(
 	},
 ).withRoutes(
 	routeUpdateIPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         remoteHost2IP.String() + "/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHost2IP.String(),
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHost2IP.String(),
 		NatOutgoing: true,
+	},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHost2IP.String() + "/32",
 	},
 )
 
@@ -1423,21 +2005,22 @@ var vxlanBlockOwnerSwitch = vxlanWithBlockAndBorrows.withKVUpdates(
 	routeUpdateRemoteHost,
 	routeUpdateRemoteHost2,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname2,
 		DstNodeIp:   remoteHost2IP.String(),
 		NatOutgoing: true,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.2/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		NatOutgoing: true,
+		Borrowed:    true,
 	},
 ).withName("VXLAN owner switch")
 
@@ -1445,21 +2028,21 @@ var vxlanBlockOwnerSwitch = vxlanWithBlockAndBorrows.withKVUpdates(
 var vxlanLocalBlockWithBorrows = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLAN},
 
-	KVPair{Key: localHostIPKey, Value: &localHostIP},
+	KVPair{Key: localNodeResKey, Value: nodeBGPv4Res(localHostname, localHostIP)},
 	KVPair{Key: localHostVXLANTunnelConfigKey, Value: localHostVXLANTunnelIP},
 
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 
 	KVPair{Key: localIPAMBlockKey, Value: &localIPAMBlockWithBorrows},
 ).withVTEPs(
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
 		ParentDeviceIp: remoteHostIP.String(),
 	},
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           localHostname,
 		Mac:            "66:48:f6:56:dc:f1",
 		Ipv4Addr:       localHostVXLANTunnelIP,
@@ -1468,36 +2051,48 @@ var vxlanLocalBlockWithBorrows = empty.withKVUpdates(
 ).withRoutes(
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.0/29",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 		NatOutgoing: true,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		// Route for the borrowed IP - this is marked remote because the pod is hosted on a remote node,
+		// but also marked as local because it's borrowed from a block on the local node.
+		Types:       proto.RouteType_REMOTE_WORKLOAD | proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.2/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		NatOutgoing: true,
+		Borrowed:    true,
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: localHostname,
+		Ipv4Addr: localHostIP.String() + "/32",
+	},
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
 )
 
-var localVXLANWep1Route1 = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var localVXLANWep1Route1 = types.RouteUpdate{
+	Types:         proto.RouteType_LOCAL_WORKLOAD,
 	IpPoolType:    proto.IPPoolType_VXLAN,
 	Dst:           "10.0.0.1/32",
 	DstNodeName:   localHostname,
@@ -1506,14 +2101,17 @@ var localVXLANWep1Route1 = proto.RouteUpdate{
 	LocalWorkload: true,
 }
 
-var localVXLANWep1Route2 = proto.RouteUpdate{
-	Type:          proto.RouteType_LOCAL_WORKLOAD,
+var localVXLANWep1Route2 = types.RouteUpdate{
+	// The IPAM block 10.0.0.0/29 is assigned to the local host, but the IPAM
+	// block attributes mark 10.0.0.2/32 as borrowed by a remote host.
+	Types:         proto.RouteType_REMOTE_WORKLOAD | proto.RouteType_LOCAL_WORKLOAD,
 	IpPoolType:    proto.IPPoolType_VXLAN,
 	Dst:           "10.0.0.2/32",
 	DstNodeName:   localHostname,
 	DstNodeIp:     localHostIP.String(),
 	NatOutgoing:   true,
 	LocalWorkload: true,
+	Borrowed:      true,
 }
 
 // As vxlanLocalBlockWithBorrows but with a local workload.  The local workload has an IP that overlaps with
@@ -1523,16 +2121,16 @@ var vxlanLocalBlockWithBorrowsLocalWEP = vxlanLocalBlockWithBorrows.withKVUpdate
 ).withRoutes(
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.0/29",
 		DstNodeName: localHostname,
@@ -1546,37 +2144,37 @@ var vxlanLocalBlockWithBorrowsLocalWEP = vxlanLocalBlockWithBorrows.withKVUpdate
 	routelocalWlV6ColonOne,
 	routelocalWlV6ColonTwo,
 ).withName("VXLAN local with borrows with local WEP override").withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withEndpoint("orch/wl1/ep1", []mock.TierInfo{})
 
 // As vxlanLocalBlockWithBorrows but using Node resources instead of host IPs.
 var vxlanLocalBlockWithBorrowsNodeRes = vxlanLocalBlockWithBorrows.withKVUpdates(
-	KVPair{Key: localHostIPKey, Value: nil},
-	KVPair{Key: remoteHostIPKey, Value: nil},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: nil},
+	KVPair{Key: remoteNodeResKey, Value: nil},
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: remoteHostIPWithPrefix,
 		}},
 	}},
-	KVPair{Key: localNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: localHostIPWithPrefix,
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIPWithPrefix,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIPWithPrefix,
 	},
@@ -1589,93 +2187,104 @@ var vxlanLocalBlockWithBorrowsCrossSubnetNodeRes = vxlanLocalBlockWithBorrowsNod
 ).withRoutes(
 	routeUpdateIPPoolVXLANCrossSubnet,
 	routeUpdateRemoteHost,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.0/29",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 		SameSubnet:  true, // cross subnet.
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		// Route for the borrowed IP - this is marked remote because the pod is hosted on a remote node,
+		// but also marked as local because it's borrowed from a block on the local node.
+		Types:       proto.RouteType_REMOTE_WORKLOAD | proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.2/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		SameSubnet:  true, // cross subnet.
+		Borrowed:    true,
 	},
 ).withName("VXLAN local with borrows cross subnet (node resources)")
 
 // As vxlanLocalBlockWithBorrowsCrossSubnetNodeRes but hosts are in a different pool.
 var vxlanLocalBlockWithBorrowsDifferentSubnetNodeRes = vxlanLocalBlockWithBorrowsNodeRes.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLANCrossSubnet},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: remoteHostIP.String(), // Omitting the /32 here to check the v3 validator is used for this resource.
 		}},
 	}},
-	KVPair{Key: localNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: localHostIP.String() + "/32",
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIP.String() + "/32",
 	},
 ).withRoutes(
 	routeUpdateIPPoolVXLANCrossSubnet,
 	routeUpdateRemoteHost,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.0/29",
 		DstNodeName: localHostname,
 		DstNodeIp:   localHostIP.String(),
 		SameSubnet:  true, // cross subnet.
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		// Route for the borrowed IP - this is marked remote because the pod is hosted on a remote node,
+		// but also marked as local because it's borrowed from a block on the local node.
+		Types:       proto.RouteType_REMOTE_WORKLOAD | proto.RouteType_LOCAL_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.2/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 		SameSubnet:  false, // subnets don't match.
+		Borrowed:    true,
 	},
 ).withName("VXLAN cross subnet different subnet (node resources)")
 
 // vxlanWithBlockAndBorrows but missing the VTEP information for the first host.
 var vxlanWithBlockAndBorrowsAndMissingFirstVTEP = vxlanWithBlockAndBorrows.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: nil},
-).withName("VXLAN borrow missing VTEP").withVTEPs(
-	proto.VXLANTunnelEndpointUpdate{
+	KVPair{Key: remoteNodeResKey, Value: nil},
+).withName("VXLAN borrow missing VTEP").withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname2,
+		Ipv4Addr: remoteHost2IP.String() + "/32",
+	},
+).withVTEPs(
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname2,
 		Mac:            "66:40:18:59:1f:16",
 		Ipv4Addr:       remoteHost2VXLANTunnelIP,
@@ -1685,20 +2294,21 @@ var vxlanWithBlockAndBorrowsAndMissingFirstVTEP = vxlanWithBlockAndBorrows.withK
 	routeUpdateIPPoolVXLAN,
 	routeUpdateRemoteHost2,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
 		NatOutgoing: true,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.2/32",
 		DstNodeName: remoteHostname2,
 		DstNodeIp:   remoteHost2IP.String(),
 		NatOutgoing: true,
+		Borrowed:    true,
 	},
 )
 
@@ -1709,15 +2319,15 @@ var vxlanToIPIPSwitch = vxlanWithBlock.withKVUpdates(
 	routeUpdateIPPoolIPIP,
 	routeUpdateRemoteHost,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_IPIP,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: true, VxlanEnabled: false, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: true, VxlanEnabled: false, VxlanEnabledV6: false},
 )
 
 var vxlanBlockDelete = vxlanWithBlock.withKVUpdates(
@@ -1728,7 +2338,7 @@ var vxlanBlockDelete = vxlanWithBlock.withKVUpdates(
 	routeUpdateRemoteHost,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1737,12 +2347,12 @@ var vxlanBlockDelete = vxlanWithBlock.withKVUpdates(
 )
 
 var vxlanHostIPDelete = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteHostIPKey, Value: nil},
-).withName("VXLAN host IP removed").withRoutes(
+	KVPair{Key: remoteNodeResKey, Value: nil},
+).withName("VXLAN host IP removed").withHostMetadata().withRoutes(
 	routeUpdateIPPoolVXLAN,
 	// Host removed but keep the route without the node IP.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -1759,11 +2369,11 @@ var vxlanTunnelIPDelete = vxlanWithBlock.withKVUpdates(
 var vxlanSlash32 = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLANSlash32},
 	KVPair{Key: remoteIPAMSlash32BlockKey, Value: &remoteIPAMBlockSlash32},
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 ).withName("VXLAN /32").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1773,8 +2383,8 @@ var vxlanSlash32 = empty.withKVUpdates(
 	// No CIDR_INFO route, it gets subsumed into the REMOTE_WORKLOAD one.
 	routeUpdateRemoteHost,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.0.0/32",
 		DstNodeName: remoteHostname,
@@ -1782,16 +2392,21 @@ var vxlanSlash32 = empty.withKVUpdates(
 		NatOutgoing: true,
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
 )
 
 var vxlanSlash32NoBlock = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLANSlash32},
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 ).withName("VXLAN /32 no block").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1801,16 +2416,21 @@ var vxlanSlash32NoBlock = empty.withKVUpdates(
 	routeUpdateIPPoolVXLANSlash32,
 	routeUpdateRemoteHost,
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
+	},
 )
 
 var vxlanSlash32NoPool = empty.withKVUpdates(
 	KVPair{Key: remoteIPAMSlash32BlockKey, Value: &remoteIPAMBlockSlash32},
-	KVPair{Key: remoteHostIPKey, Value: &remoteHostIP},
+	KVPair{Key: remoteNodeResKey, Value: nodeBGPv4Res(remoteHostname, remoteHostIP)},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
 ).withName("VXLAN /32 no pool").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -1819,12 +2439,17 @@ var vxlanSlash32NoPool = empty.withKVUpdates(
 ).withRoutes(
 	routeUpdateRemoteHost,
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_NONE,
 		Dst:         "10.0.0.0/32",
 		DstNodeName: remoteHostname,
 		DstNodeIp:   remoteHostIP.String(),
+	},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
+		Hostname: remoteHostname,
+		Ipv4Addr: remoteHostIP.String() + "/32",
 	},
 )
 
@@ -1832,38 +2457,38 @@ var vxlanSlash32NoPool = empty.withKVUpdates(
 var vxlanV6WithBlock = empty.withKVUpdates(
 	KVPair{Key: v6IPPoolKey, Value: &v6IPPoolWithVXLAN},
 	KVPair{Key: remotev6IPAMBlockKey, Value: &remotev6IPAMBlock},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv6Address: remoteHostIPv6.String() + "/96",
 		}},
 	}},
 	KVPair{Key: remoteHostVXLANV6TunnelConfigKey, Value: remoteHostVXLANV6TunnelIP},
 ).withName("VXLAN IPv6").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		MacV6:            "66:a0:68:c9:4c:79",
 		Ipv6Addr:         remoteHostVXLANV6TunnelIP,
 		ParentDeviceIpv6: remoteHostIPv6.String(),
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: false, VxlanEnabledV6: true},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: false, VxlanEnabledV6: true},
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv6Addr: remoteHostIPv6.String() + "/96",
 	},
 ).withRoutes(vxlanV6WithBlockRoutes...)
 
-var vxlanV6WithBlockRoutes = []proto.RouteUpdate{
+var vxlanV6WithBlockRoutes = []types.RouteUpdate{
 	routeUpdateV6IPPoolVXLAN,
 	routeUpdateRemoteHostV6,
 	// Single route for the block.
 	{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -1880,7 +2505,7 @@ var vxlanV6BlockDelete = vxlanV6WithBlock.withKVUpdates(
 	routeUpdateRemoteHostV6,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		MacV6:            "66:a0:68:c9:4c:79",
 		Ipv6Addr:         remoteHostVXLANV6TunnelIP,
@@ -1889,16 +2514,16 @@ var vxlanV6BlockDelete = vxlanV6WithBlock.withKVUpdates(
 )
 
 var vxlanV6NodeResIPDelete = vxlanV6WithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{}},
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{}},
 	}},
-).withHostMetadataV4V6().withName("VXLAN IPv6 Node Resource IP removed").withRoutes(
+).withHostMetadata().withName("VXLAN IPv6 Node Resource IP removed").withRoutes(
 	routeUpdateV6IPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -1907,20 +2532,20 @@ var vxlanV6NodeResIPDelete = vxlanV6WithBlock.withKVUpdates(
 ).withVTEPs()
 
 var vxlanV6NodeResBGPDelete = vxlanV6WithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: nil},
+		Spec: internalapi.NodeSpec{BGP: nil},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 	},
 ).withName("VXLAN IPv6 Node Resource BGP removed").withRoutes(
 	routeUpdateV6IPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -1930,10 +2555,10 @@ var vxlanV6NodeResBGPDelete = vxlanV6WithBlock.withKVUpdates(
 
 var vxlanV6NodeResDelete = vxlanV6WithBlock.withKVUpdates(
 	KVPair{Key: remoteNodeResKey, Value: nil},
-).withHostMetadataV4V6().withName("VXLAN IPv6 Node Resource removed").withRoutes(
+).withHostMetadata().withName("VXLAN IPv6 Node Resource removed").withRoutes(
 	routeUpdateV6IPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -1949,7 +2574,7 @@ var vxlanV6WithMAC = vxlanV6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANV6TunnelMACConfigKey, Value: remoteHostVXLANV6TunnelMAC},
 ).withName("VXLAN IPv6 with MAC").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		MacV6:            remoteHostVXLANV6TunnelMAC,
 		Ipv6Addr:         remoteHostVXLANV6TunnelIP,
@@ -1965,24 +2590,24 @@ var vxlanV4V6WithBlock = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLAN},
 	KVPair{Key: remoteIPAMBlockKey, Value: &remoteIPAMBlock},
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: remoteHostVXLANTunnelIP},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: remoteHostIP.String() + "/24",
 			IPv6Address: remoteHostIPv6.String() + "/96",
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIP.String() + "/24",
 		Ipv6Addr: remoteHostIPv6.String() + "/96",
 	},
 ).withName("VXLAN IPv4+IPv6").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              "66:3e:ca:a4:db:65",
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -1992,7 +2617,7 @@ var vxlanV4V6WithBlock = empty.withKVUpdates(
 		ParentDeviceIpv6: remoteHostIPv6.String(),
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: true},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: true},
 ).withRoutes(append(vxlanWithBlockRoutes, vxlanV6WithBlockRoutes...)...)
 
 var vxlanV4V6BlockV6Delete = vxlanV4V6WithBlock.withKVUpdates(
@@ -2003,7 +2628,7 @@ var vxlanV4V6BlockV6Delete = vxlanV4V6WithBlock.withKVUpdates(
 		routeUpdateRemoteHostV6)...,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              "66:3e:ca:a4:db:65",
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -2023,7 +2648,7 @@ var vxlanV4V6BlockV4Delete = vxlanV4V6WithBlock.withKVUpdates(
 		routeUpdateRemoteHost)...,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              "66:3e:ca:a4:db:65",
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -2035,16 +2660,16 @@ var vxlanV4V6BlockV4Delete = vxlanV4V6WithBlock.withKVUpdates(
 )
 
 var vxlanV4V6NodeResIPv4Delete = vxlanV4V6WithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv6Address: remoteHostIPv6.String() + "/96",
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv6Addr: remoteHostIPv6.String() + "/96",
 	},
@@ -2052,8 +2677,8 @@ var vxlanV4V6NodeResIPv4Delete = vxlanV4V6WithBlock.withKVUpdates(
 	append(vxlanV6WithBlockRoutes,
 		routeUpdateIPPoolVXLAN,
 		// Host removed but keep the route without the node IP.
-		proto.RouteUpdate{
-			Type:        proto.RouteType_REMOTE_WORKLOAD,
+		types.RouteUpdate{
+			Types:       proto.RouteType_REMOTE_WORKLOAD,
 			IpPoolType:  proto.IPPoolType_VXLAN,
 			Dst:         "10.0.1.0/29",
 			DstNodeName: remoteHostname,
@@ -2062,7 +2687,7 @@ var vxlanV4V6NodeResIPv4Delete = vxlanV4V6WithBlock.withKVUpdates(
 		})...,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		MacV6:            "66:a0:68:c9:4c:79",
 		Ipv6Addr:         remoteHostVXLANV6TunnelIP,
@@ -2071,24 +2696,24 @@ var vxlanV4V6NodeResIPv4Delete = vxlanV4V6WithBlock.withKVUpdates(
 )
 
 var vxlanV4V6NodeResIPv6Delete = vxlanV4V6WithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{BGP: &internalapi.NodeBGPSpec{
 			IPv4Address: remoteHostIP.String() + "/24",
 		}},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIP.String() + "/24",
 	},
 ).withName("VXLAN IPv4+IPv6 Node Resource IPv6 removed").withRoutes(
 	append(vxlanWithBlockRoutes,
 		routeUpdateV6IPPoolVXLAN,
-		proto.RouteUpdate{
-			Type:        proto.RouteType_REMOTE_WORKLOAD,
+		types.RouteUpdate{
+			Types:       proto.RouteType_REMOTE_WORKLOAD,
 			IpPoolType:  proto.IPPoolType_VXLAN,
 			Dst:         "feed:beef:0:0:1::/96",
 			DstNodeName: remoteHostname,
@@ -2096,7 +2721,7 @@ var vxlanV4V6NodeResIPv6Delete = vxlanV4V6WithBlock.withKVUpdates(
 		})...,
 ).withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -2105,21 +2730,21 @@ var vxlanV4V6NodeResIPv6Delete = vxlanV4V6WithBlock.withKVUpdates(
 )
 
 var vxlanV4V6NodeResBGPDelete = vxlanV4V6WithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{BGP: nil},
+		Spec: internalapi.NodeSpec{BGP: nil},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 	},
 ).withName("VXLAN IPv4+IPv6 Node Resource BGP removed").withRoutes(
 	routeUpdateIPPoolVXLAN,
 	// Host removed but keep the route without the node IP.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -2127,8 +2752,8 @@ var vxlanV4V6NodeResBGPDelete = vxlanV4V6WithBlock.withKVUpdates(
 		NatOutgoing: true,
 	},
 	routeUpdateV6IPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -2138,11 +2763,11 @@ var vxlanV4V6NodeResBGPDelete = vxlanV4V6WithBlock.withKVUpdates(
 
 var vxlanV4V6NodeResDelete = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteNodeResKey, Value: nil},
-).withHostMetadataV4V6().withName("VXLAN IPv4+IPv6 Node Resource removed").withRoutes(
+).withHostMetadata().withName("VXLAN IPv4+IPv6 Node Resource removed").withRoutes(
 	routeUpdateIPPoolVXLAN,
 	// Host removed but keep the route without the node IP.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -2150,8 +2775,8 @@ var vxlanV4V6NodeResDelete = vxlanV4V6WithBlock.withKVUpdates(
 		NatOutgoing: true,
 	},
 	routeUpdateV6IPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "feed:beef:0:0:1::/96",
 		DstNodeName: remoteHostname,
@@ -2163,7 +2788,7 @@ var vxlanV4V6TunnelIPv4Delete = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANTunnelConfigKey, Value: nil},
 ).withName("VXLAN IPv4+IPv6 tunnel IPv4 removed").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		MacV6:            "66:a0:68:c9:4c:79",
 		Ipv6Addr:         remoteHostVXLANV6TunnelIP,
@@ -2175,7 +2800,7 @@ var vxlanV4V6TunnelIPv6Delete = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANV6TunnelConfigKey, Value: nil},
 ).withName("VXLAN IPv4+IPv6 tunnel IPv6 removed").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:           remoteHostname,
 		Mac:            "66:3e:ca:a4:db:65",
 		Ipv4Addr:       remoteHostVXLANTunnelIP,
@@ -2188,7 +2813,7 @@ var vxlanV4V6WithMAC = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANV6TunnelMACConfigKey, Value: remoteHostVXLANV6TunnelMAC},
 ).withName("VXLAN IPv4+IPv6 with IPv4+IPv6 MAC").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              remoteHostVXLANTunnelMAC,
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -2203,7 +2828,7 @@ var vxlanV4V6WithV4MAC = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANTunnelMACConfigKey, Value: remoteHostVXLANTunnelMAC},
 ).withName("VXLAN IPv4+IPv6 with IPv4+IPv6 MAC").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              remoteHostVXLANTunnelMAC,
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -2218,7 +2843,7 @@ var vxlanV4V6WithV6MAC = vxlanV4V6WithBlock.withKVUpdates(
 	KVPair{Key: remoteHostVXLANV6TunnelMACConfigKey, Value: remoteHostVXLANV6TunnelMAC},
 ).withName("VXLAN IPv4+IPv6 with IPv4+IPv6 MAC").withVTEPs(
 	// VTEP for the remote node.
-	proto.VXLANTunnelEndpointUpdate{
+	types.VXLANTunnelEndpointUpdate{
 		Node:             remoteHostname,
 		Mac:              "66:3e:ca:a4:db:65",
 		Ipv4Addr:         remoteHostVXLANTunnelIP,
@@ -2234,14 +2859,14 @@ var hostInIPPool = vxlanWithBlock.withKVUpdates(
 	KVPair{Key: hostCoveringIPPoolKey, Value: &hostCoveringIPPool},
 ).withName("host in IP pool").withRoutes(
 	routeUpdateIPPoolVXLAN,
-	proto.RouteUpdate{
-		Type:        proto.RouteType_CIDR_INFO,
+	types.RouteUpdate{
+		Types:       proto.RouteType_CIDR_INFO,
 		IpPoolType:  proto.IPPoolType_NO_ENCAP,
 		Dst:         hostCoveringIPPool.CIDR.String(),
 		NatOutgoing: true,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_HOST,
 		IpPoolType:  proto.IPPoolType_NO_ENCAP, // Host now marked as inside the IP pool.
 		Dst:         remoteHostIP.String() + "/32",
 		DstNodeName: remoteHostname,
@@ -2249,8 +2874,8 @@ var hostInIPPool = vxlanWithBlock.withKVUpdates(
 		NatOutgoing: true,
 	},
 	// Single route for the block.
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_WORKLOAD,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_WORKLOAD,
 		IpPoolType:  proto.IPPoolType_VXLAN,
 		Dst:         "10.0.1.0/29",
 		DstNodeName: remoteHostname,
@@ -2258,20 +2883,20 @@ var hostInIPPool = vxlanWithBlock.withKVUpdates(
 		NatOutgoing: true,
 	},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false, NoEncapEnabled: false},
 )
 
 // we start from vxlan setup as the test framework expects vxlan enabled
 var nodesWithMoreIPs = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: remoteHostIPWithPrefix,
 			},
-			Addresses: []apiv3.NodeAddress{
+			Addresses: []internalapi.NodeAddress{
 				{
 					Address: remoteHostIPWithPrefix,
 				},
@@ -2281,15 +2906,15 @@ var nodesWithMoreIPs = vxlanWithBlock.withKVUpdates(
 			},
 		},
 	}},
-	KVPair{Key: localNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: localHostIPWithPrefix,
 			},
-			Addresses: []apiv3.NodeAddress{
+			Addresses: []internalapi.NodeAddress{
 				{
 					Address: localHostIPWithPrefix,
 				},
@@ -2299,12 +2924,12 @@ var nodesWithMoreIPs = vxlanWithBlock.withKVUpdates(
 			},
 		},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIPWithPrefix,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIPWithPrefix,
 	},
@@ -2312,20 +2937,20 @@ var nodesWithMoreIPs = vxlanWithBlock.withKVUpdates(
 	withName("routes for nodes with more IPs")
 
 var nodesWithMoreIPsRoutes = append(vxlanWithBlockRoutes[0:len(vxlanWithBlockRoutes):len(vxlanWithBlockRoutes) /* force copy */],
-	proto.RouteUpdate{
-		Type:        proto.RouteType_REMOTE_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_REMOTE_HOST,
 		Dst:         "1.2.3.4/32",
 		DstNodeIp:   remoteHostIP.String(),
 		DstNodeName: remoteHostname,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeIp:   localHostIP.String(),
 		DstNodeName: localHostname,
 	},
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		Dst:         "4.3.2.1/32",
 		DstNodeIp:   localHostIP.String(),
 		DstNodeName: localHostname,
@@ -2334,15 +2959,15 @@ var nodesWithMoreIPsRoutes = append(vxlanWithBlockRoutes[0:len(vxlanWithBlockRou
 
 var nodesWithMoreIPsAndDuplicates = nodesWithMoreIPs.withKVUpdates(
 	KVPair{
-		Key: remoteNodeResKey, Value: &apiv3.Node{
+		Key: remoteNodeResKey, Value: &internalapi.Node{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: remoteHostname,
 			},
-			Spec: apiv3.NodeSpec{
-				BGP: &apiv3.NodeBGPSpec{
+			Spec: internalapi.NodeSpec{
+				BGP: &internalapi.NodeBGPSpec{
 					IPv4Address: remoteHostIPWithPrefix,
 				},
-				Addresses: []apiv3.NodeAddress{
+				Addresses: []internalapi.NodeAddress{
 					{
 						Address: "1.2.3.4",
 					},
@@ -2362,27 +2987,27 @@ var nodesWithMoreIPsAndDuplicates = nodesWithMoreIPs.withKVUpdates(
 			},
 		},
 	},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIPWithPrefix,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIPWithPrefix,
 	},
 ).withName("routes for nodes with more IPs and duplicates")
 
 var nodesWithDifferentAddressTypes = nodesWithMoreIPs.withKVUpdates(
-	KVPair{Key: localNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: localHostIPWithPrefix,
 			},
-			Addresses: []apiv3.NodeAddress{
+			Addresses: []internalapi.NodeAddress{
 				{
 					Address: localHostIPWithPrefix,
 				},
@@ -2398,27 +3023,27 @@ var nodesWithDifferentAddressTypes = nodesWithMoreIPs.withKVUpdates(
 			},
 		},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{ // from nodesWithMoreIPs
+).withHostMetadata(
+	&proto.HostMetadataUpdate{ // from nodesWithMoreIPs
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIPWithPrefix,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIPWithPrefix,
 	},
 ).withRoutes(append(nodesWithMoreIPsRoutes,
 	// IPv6 route is now valid
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		Dst:         "feed:dead:beef::/128",
 		DstNodeName: localHostname,
 	})...,
 ).withName("routes for nodes with more IPs some of them unexpected/invalid")
 
 var nodesWithMoreIPsRoutesDeletedExtras = append(vxlanWithBlockRoutes[0:len(vxlanWithBlockRoutes):len(vxlanWithBlockRoutes) /* force copy */],
-	proto.RouteUpdate{
-		Type:        proto.RouteType_LOCAL_HOST,
+	types.RouteUpdate{
+		Types:       proto.RouteType_LOCAL_HOST,
 		Dst:         localHostIP.String() + "/32",
 		DstNodeIp:   localHostIP.String(),
 		DstNodeName: localHostname,
@@ -2426,42 +3051,42 @@ var nodesWithMoreIPsRoutesDeletedExtras = append(vxlanWithBlockRoutes[0:len(vxla
 )
 
 var nodesWithMoreIPsDeleted = vxlanWithBlock.withKVUpdates(
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: remoteHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: remoteHostIPWithPrefix,
 			},
-			Addresses: []apiv3.NodeAddress{
+			Addresses: []internalapi.NodeAddress{
 				{
 					Address: remoteHostIPWithPrefix,
 				},
 			},
 		},
 	}},
-	KVPair{Key: localNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: localNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: localHostIPWithPrefix,
 			},
-			Addresses: []apiv3.NodeAddress{
+			Addresses: []internalapi.NodeAddress{
 				{
 					Address: localHostIPWithPrefix,
 				},
 			},
 		},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIPWithPrefix,
 	},
-	proto.HostMetadataV4V6Update{
+	&proto.HostMetadataUpdate{
 		Hostname: localHostname,
 		Ipv4Addr: localHostIPWithPrefix,
 	},
@@ -2482,9 +3107,9 @@ var endpointSliceAndLocalWorkload = empty.withKVUpdates(
 	localWlEp1Id,
 	[]mock.TierInfo{},
 ).withActiveProfiles(
-	proto.ProfileID{Name: "prof-1"},
-	proto.ProfileID{Name: "prof-2"},
-	proto.ProfileID{Name: "prof-missing"},
+	types.ProfileID{Name: "prof-1"},
+	types.ProfileID{Name: "prof-2"},
+	types.ProfileID{Name: "prof-missing"},
 ).withName("EndpointSliceInactive")
 
 // Add a network policy that makes the endpoint slice active.
@@ -2493,11 +3118,14 @@ var endpointSliceActive = endpointSliceAndLocalWorkload.withKVUpdates(
 ).withName("EndpointSliceActive").withIPSet("svc:Jhwii46PCMT5NlhWsUqZmv7al8TeHFbNQMhoVg", []string{
 	"10.0.0.1,tcp:80",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "svc-policy"},
+	types.PolicyID{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default", EgressPolicyNames: []string{"svc-policy"}},
+		{
+			Name:           "default",
+			EgressPolicies: []types.PolicyID{{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 )
 
@@ -2527,6 +3155,7 @@ var endpointSliceOverlap = endpointSliceActiveNewIPs.withName("EndpointSliceOver
 	"10.0.0.3,tcp:80",
 	"10.0.0.4,tcp:80",
 })
+
 var endpointSlice2OnlyActiveNewIPs2 = endpointSliceActive.withName("EndpointSlice2ActiveNewIPs2").withKVUpdates(
 	KVPair{Key: endpointSliceKey1, Value: nil},
 	KVPair{Key: endpointSliceKey2, Value: &endpointSlice2NewIPs2},
@@ -2542,11 +3171,14 @@ var endpointSliceActiveSpecNoPorts = endpointSliceAndLocalWorkload.withKVUpdates
 ).withName("EndpointSliceActiveNoPorts").withIPSet("svcnoport:T03S_6hogdrGKrNFBcbKTFsH_uKwDHEo8JddOg", []string{
 	"10.0.0.1/32",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "svc-policy"},
+	types.PolicyID{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default", IngressPolicyNames: []string{"svc-policy"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 )
 
@@ -2558,21 +3190,23 @@ var endpointSliceActiveSpecPortsAndNoPorts = endpointSliceActiveSpecNoPorts.with
 ).withIPSet("svc:Jhwii46PCMT5NlhWsUqZmv7al8TeHFbNQMhoVg", []string{
 	"10.0.0.1,tcp:80",
 }).withActivePolicies(
-	proto.PolicyID{Tier: "default", Name: "svc-policy"},
-	proto.PolicyID{Tier: "default", Name: "svc-policy2"},
+	types.PolicyID{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy},
+	types.PolicyID{Name: "svc-policy2", Kind: v3.KindGlobalNetworkPolicy},
 ).withEndpoint(
 	localWlEp1Id,
 	[]mock.TierInfo{
-		{Name: "default",
-			IngressPolicyNames: []string{"svc-policy"},
-			EgressPolicyNames:  []string{"svc-policy2"}},
+		{
+			Name:            "default",
+			IngressPolicies: []types.PolicyID{{Name: "svc-policy", Kind: v3.KindGlobalNetworkPolicy}},
+			EgressPolicies:  []types.PolicyID{{Name: "svc-policy2", Kind: v3.KindGlobalNetworkPolicy}},
+		},
 	},
 )
 
 var encapWithIPIPPool = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithIPIP},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: true, VxlanEnabled: false, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: true, VxlanEnabled: false, VxlanEnabledV6: false},
 ).withRoutes(
 	routeUpdateIPPoolIPIP,
 ).withName("Encap with IPIP Pool")
@@ -2580,7 +3214,7 @@ var encapWithIPIPPool = empty.withKVUpdates(
 var encapWithVXLANPool = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithVXLAN},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: false, VxlanEnabled: true, VxlanEnabledV6: false},
 ).withRoutes(
 	routeUpdateIPPoolVXLAN,
 ).withName("Encap with VXLAN Pool")
@@ -2589,7 +3223,7 @@ var encapWithIPIPAndVXLANPool = empty.withKVUpdates(
 	KVPair{Key: ipPoolKey, Value: &ipPoolWithIPIP},
 	KVPair{Key: ipPoolKey2, Value: &ipPool2WithVXLAN},
 ).withExpectedEncapsulation(
-	proto.Encapsulation{IpipEnabled: true, VxlanEnabled: true, VxlanEnabledV6: false},
+	&proto.Encapsulation{IpipEnabled: true, VxlanEnabled: true, VxlanEnabledV6: false},
 ).withRoutes(
 	routeUpdateIPPoolIPIP,
 	routeUpdateIPPool2VXLAN,
@@ -2604,27 +3238,27 @@ var wireguardV4 = empty.withKVUpdates(
 			PublicKey:         wgPublicKey1.String(),
 		},
 	},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: remoteHostIP.String() + "/24",
 			},
-			Wireguard: &apiv3.NodeWireguardSpec{
+			Wireguard: &internalapi.NodeWireguardSpec{
 				InterfaceIPv4Address: remoteHost2IP.String(),
 			},
 		},
-		Status: apiv3.NodeStatus{
+		Status: internalapi.NodeStatus{
 			WireguardPublicKey: wgPublicKey1.String(),
 		},
 	}},
 ).withName("Wireguard IPv4").withRoutes(
-	[]proto.RouteUpdate{
+	[]types.RouteUpdate{
 		routeUpdateRemoteHost,
 		{
-			Type:        proto.RouteType_REMOTE_TUNNEL,
+			Types:       proto.RouteType_REMOTE_TUNNEL,
 			IpPoolType:  proto.IPPoolType_NONE,
 			Dst:         remoteHost2IP.String() + "/32",
 			DstNodeName: remoteHostname,
@@ -2632,13 +3266,13 @@ var wireguardV4 = empty.withKVUpdates(
 			TunnelType:  &proto.TunnelType{Wireguard: true},
 		},
 	}...,
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteHostname,
 		Ipv4Addr: remoteHostIP.String() + "/24",
 	},
 ).withWireguardEndpoints(
-	[]proto.WireguardEndpointUpdate{
+	[]types.WireguardEndpointUpdate{
 		{
 			Hostname:          remoteHostname,
 			PublicKey:         wgPublicKey1.String(),
@@ -2656,32 +3290,32 @@ var wireguardV6 = empty.withKVUpdates(
 			PublicKeyV6:       wgPublicKey2.String(),
 		},
 	},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv6Address: remoteHostIPv6.String() + "/96",
 			},
-			Wireguard: &apiv3.NodeWireguardSpec{
+			Wireguard: &internalapi.NodeWireguardSpec{
 				InterfaceIPv6Address: remoteHost2IPv6.String(),
 			},
 		},
-		Status: apiv3.NodeStatus{
+		Status: internalapi.NodeStatus{
 			WireguardPublicKeyV6: wgPublicKey2.String(),
 		},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteNodeResKey.Name,
 		Ipv6Addr: remoteHostIPv6.String() + "/96",
 	},
 ).withName("Wireguard IPv6").withRoutes(
-	[]proto.RouteUpdate{
+	[]types.RouteUpdate{
 		routeUpdateRemoteHostV6,
 		{
-			Type:        proto.RouteType_REMOTE_TUNNEL,
+			Types:       proto.RouteType_REMOTE_TUNNEL,
 			IpPoolType:  proto.IPPoolType_NONE,
 			Dst:         remoteHost2IPv6.String() + "/128",
 			DstNodeName: remoteHostname,
@@ -2690,7 +3324,7 @@ var wireguardV6 = empty.withKVUpdates(
 		},
 	}...,
 ).withWireguardV6Endpoints(
-	[]proto.WireguardEndpointV6Update{
+	[]types.WireguardEndpointV6Update{
 		{
 			Hostname:          remoteHostname,
 			PublicKeyV6:       wgPublicKey2.String(),
@@ -2711,37 +3345,37 @@ var wireguardV4V6 = empty.withKVUpdates(
 			PublicKeyV6:       wgPublicKey2.String(),
 		},
 	},
-	KVPair{Key: remoteNodeResKey, Value: &apiv3.Node{
+	KVPair{Key: remoteNodeResKey, Value: &internalapi.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: localHostname,
 		},
-		Spec: apiv3.NodeSpec{
-			BGP: &apiv3.NodeBGPSpec{
+		Spec: internalapi.NodeSpec{
+			BGP: &internalapi.NodeBGPSpec{
 				IPv4Address: remoteHostIP.String() + "/24",
 				IPv6Address: remoteHostIPv6.String() + "/96",
 			},
-			Wireguard: &apiv3.NodeWireguardSpec{
+			Wireguard: &internalapi.NodeWireguardSpec{
 				InterfaceIPv4Address: remoteHost2IP.String(),
 				InterfaceIPv6Address: remoteHost2IPv6.String(),
 			},
 		},
-		Status: apiv3.NodeStatus{
+		Status: internalapi.NodeStatus{
 			WireguardPublicKey:   wgPublicKey1.String(),
 			WireguardPublicKeyV6: wgPublicKey2.String(),
 		},
 	}},
-).withHostMetadataV4V6(
-	proto.HostMetadataV4V6Update{
+).withHostMetadata(
+	&proto.HostMetadataUpdate{
 		Hostname: remoteNodeResKey.Name,
 		Ipv4Addr: remoteHostIP.String() + "/24",
 		Ipv6Addr: remoteHostIPv6.String() + "/96",
 	},
 ).withName("Wireguard IPv4+IPv6").withRoutes(
-	[]proto.RouteUpdate{
+	[]types.RouteUpdate{
 		routeUpdateRemoteHost,
 		routeUpdateRemoteHostV6,
 		{
-			Type:        proto.RouteType_REMOTE_TUNNEL,
+			Types:       proto.RouteType_REMOTE_TUNNEL,
 			IpPoolType:  proto.IPPoolType_NONE,
 			Dst:         remoteHost2IP.String() + "/32",
 			DstNodeName: remoteHostname,
@@ -2749,7 +3383,7 @@ var wireguardV4V6 = empty.withKVUpdates(
 			TunnelType:  &proto.TunnelType{Wireguard: true},
 		},
 		{
-			Type:        proto.RouteType_REMOTE_TUNNEL,
+			Types:       proto.RouteType_REMOTE_TUNNEL,
 			IpPoolType:  proto.IPPoolType_NONE,
 			Dst:         remoteHost2IPv6.String() + "/128",
 			DstNodeName: remoteHostname,
@@ -2758,7 +3392,7 @@ var wireguardV4V6 = empty.withKVUpdates(
 		},
 	}...,
 ).withWireguardEndpoints(
-	[]proto.WireguardEndpointUpdate{
+	[]types.WireguardEndpointUpdate{
 		{
 			Hostname:          remoteHostname,
 			PublicKey:         wgPublicKey1.String(),
@@ -2766,7 +3400,7 @@ var wireguardV4V6 = empty.withKVUpdates(
 		},
 	}...,
 ).withWireguardV6Endpoints(
-	[]proto.WireguardEndpointV6Update{
+	[]types.WireguardEndpointV6Update{
 		{
 			Hostname:          remoteHostname,
 			PublicKeyV6:       wgPublicKey2.String(),
@@ -2774,6 +3408,303 @@ var wireguardV4V6 = empty.withKVUpdates(
 		},
 	}...,
 )
+
+// Live migration states.  These test that LiveMigration resources correctly set the
+// live_migration_role field on proto.WorkloadEndpoint.
+
+var (
+	// LiveMigration resource keys.
+	liveMigrationKey1 = ResourceKey{
+		Kind:      internalapi.KindLiveMigration,
+		Name:      "lm-1",
+		Namespace: "default",
+	}
+
+	// A selector that matches localWlEp1's labels (has label "a").
+	liveMigrationTargetSelector = "has(a)"
+)
+
+// Case 1: Local WEP is a live migration source.
+var localEp1WithPolicyLMSource = localEp1WithPolicy.withKVUpdates(
+	KVPair{Key: liveMigrationKey1, Value: &internalapi.LiveMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      liveMigrationKey1.Name,
+			Namespace: liveMigrationKey1.Namespace,
+		},
+		Spec: internalapi.LiveMigrationSpec{
+			Source: &internalapi.LiveMigrationSource{
+				WorkloadEndpoint: &internalapi.WorkloadEndpointIdentifier{
+					Hostname:       localHostname,
+					OrchestratorID: "orch",
+					WorkloadID:     "wl1",
+					EndpointID:     "ep1",
+				},
+			},
+			Target: &internalapi.LiveMigrationTarget{
+				WorkloadEndpoint: &internalapi.WorkloadEndpointIdentifier{
+					Hostname:       "remote-host",
+					OrchestratorID: "orch",
+					WorkloadID:     "remote-wep",
+					EndpointID:     "ep1",
+				},
+			},
+		},
+	}},
+).withLiveMigrationRole(
+	localWlEp1Id, proto.LiveMigrationRole_SOURCE,
+).withName("ep1 local, policy, LM source")
+
+// Case 2: Local WEP is a live migration target (by direct name).
+var localEp1WithPolicyLMTargetByName = localEp1WithPolicy.withKVUpdates(
+	KVPair{Key: liveMigrationKey1, Value: &internalapi.LiveMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      liveMigrationKey1.Name,
+			Namespace: liveMigrationKey1.Namespace,
+		},
+		Spec: internalapi.LiveMigrationSpec{
+			Source: &internalapi.LiveMigrationSource{
+				WorkloadEndpoint: &internalapi.WorkloadEndpointIdentifier{
+					Hostname:       "remote-host",
+					OrchestratorID: "orch",
+					WorkloadID:     "remote-wep",
+					EndpointID:     "ep1",
+				},
+			},
+			Target: &internalapi.LiveMigrationTarget{
+				WorkloadEndpoint: &internalapi.WorkloadEndpointIdentifier{
+					Hostname:       localHostname,
+					OrchestratorID: "orch",
+					WorkloadID:     "wl1",
+					EndpointID:     "ep1",
+				},
+			},
+		},
+	}},
+).withLiveMigrationRole(
+	localWlEp1Id, proto.LiveMigrationRole_TARGET,
+).withName("ep1 local, policy, LM target by name")
+
+// Case 2b: Local WEP is a live migration source (workload-level, matches all endpoints).
+// This is the pattern used by KubeVirt, where a single LiveMigration covers all interfaces
+// of the migrating VM, and the target is identified by a selector.  The target selector
+// must not match the source WEP (in real KubeVirt usage, target pods have migration-specific
+// labels that the source pod does not have).
+var localEp1WithPolicyLMSourceWorkloadLevel = localEp1WithPolicy.withKVUpdates(
+	KVPair{Key: liveMigrationKey1, Value: &internalapi.LiveMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      liveMigrationKey1.Name,
+			Namespace: liveMigrationKey1.Namespace,
+		},
+		Spec: internalapi.LiveMigrationSpec{
+			Source: &internalapi.LiveMigrationSource{
+				Workload: &internalapi.WorkloadIdentifier{
+					Hostname:       localHostname,
+					OrchestratorID: "orch",
+					WorkloadID:     "wl1",
+				},
+			},
+			Target: &internalapi.LiveMigrationTarget{
+				Selector: stringPtr("has(migration-target)"),
+			},
+		},
+	}},
+).withLiveMigrationRole(
+	localWlEp1Id, proto.LiveMigrationRole_SOURCE,
+).withName("ep1 local, policy, LM source (workload-level)")
+
+// Test states for Istio functionality
+// Base state with Istio enabled but no endpoints
+var istioBaseState = initialisedStore.withIPSet("all-istio-weps", []string{}).withName("istio base state")
+
+// State with Istio ambient namespace and pod
+// Note: all-istio-weps IPSet should contain WEPs from ambient namespaces
+var istioWithAmbientPod = istioBaseState.withKVUpdates(
+	KVPair{Key: ResourceKey{Name: "istio-ambient", Kind: v3.KindProfile}, Value: namespaceToProfile(&istioNamespaceAmbient)},
+	KVPair{Key: istioWepAmbientKey, Value: &istioWepAmbient},
+).withEndpoint(
+	"orch/istio-wep-ambient/ep1",
+	[]mock.TierInfo{},
+).withActiveProfiles(
+	types.ProfileID{Name: "istio-ambient"},
+).withRoutes(
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.1.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::1/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+).withIPSet("all-istio-weps", []string{
+	"10.10.1.1/32",
+	"fc00:fe10::1/128",
+}).withName("istio with ambient pod")
+
+// State with multiple pods - mixed scenarios
+// Note: all-istio-weps IPSet should contain only ambient and direct-ambient WEPs
+var istioWithMixedPods = istioBaseState.withKVUpdates(
+	KVPair{Key: ResourceKey{Name: "istio-ambient", Kind: v3.KindProfile}, Value: namespaceToProfile(&istioNamespaceAmbient)},
+	KVPair{Key: ResourceKey{Name: "istio-none", Kind: v3.KindProfile}, Value: namespaceToProfile(&istioNamespaceNone)},
+	KVPair{Key: ResourceKey{Name: "regular", Kind: v3.KindProfile}, Value: namespaceToProfile(&regularNamespace)},
+	KVPair{Key: istioWepAmbientKey, Value: &istioWepAmbient},
+	KVPair{Key: istioWepNoneKey, Value: &istioWepNone},
+	KVPair{Key: regularWepKey, Value: &regularWep},
+	KVPair{Key: istioWepDirectAmbientKey, Value: &istioWepDirectAmbient},
+).withEndpoint(
+	"orch/istio-wep-ambient/ep1",
+	[]mock.TierInfo{},
+).withEndpoint(
+	"orch/istio-wep-none/ep1",
+	[]mock.TierInfo{},
+).withEndpoint(
+	"orch/regular-wep/ep1",
+	[]mock.TierInfo{},
+).withEndpoint(
+	"orch/istio-wep-direct-ambient/ep1",
+	[]mock.TierInfo{},
+).withActiveProfiles(
+	types.ProfileID{Name: "istio-ambient"},
+	types.ProfileID{Name: "istio-none"},
+	types.ProfileID{Name: "regular"},
+).withRoutes(
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.1.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::1/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.3.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::3/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.4.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::4/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.5.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::5/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+).withIPSet("all-istio-weps", []string{
+	"10.10.1.1/32",     // ambient namespace WEP
+	"fc00:fe10::1/128", // ambient namespace WEP
+	"10.10.5.1/32",     // direct ambient label WEP
+	"fc00:fe10::5/128", // direct ambient label WEP
+}).withName("istio with mixed pods")
+
+// Edge case: Pod in ambient namespace but with explicit istio.io/dataplane-mode=none label
+// Original selector: Should be EXCLUDED (namespace ambient but pod has explicit none)
+// Your selector: Should be EXCLUDED (pod doesn't have ambient label)
+// This test should FAIL with your change because the pod should NOT be in the IPSet
+var istioSelectorEdgeCases = istioBaseState.withKVUpdates(
+	KVPair{Key: ResourceKey{Name: "istio-ambient", Kind: v3.KindProfile}, Value: namespaceToProfile(&istioNamespaceAmbient)},
+	KVPair{Key: WorkloadEndpointKey{
+		Hostname:       localHostname,
+		OrchestratorID: "orch",
+		WorkloadID:     "ambient-ns-but-pod-none",
+		EndpointID:     "ep1",
+	}, Value: &WorkloadEndpoint{
+		State: "active",
+		Name:  "ambient-ns-but-pod-none",
+		IPv4Nets: []calinet.IPNet{
+			mustParseNet("10.10.9.1/32"),
+		},
+		Labels: uniquelabels.Make(map[string]string{
+			"projectcalico.org/namespace":    "istio-ambient",
+			"projectcalico.org/orchestrator": "k8s",
+			v3.LabelIstioDataplaneMode:       v3.LabelIstioDataplaneModeNone, // Explicit none on pod
+		}),
+		ProfileIDs: []string{"istio-ambient"},
+	}},
+).withEndpoint(
+	"orch/ambient-ns-but-pod-none/ep1",
+	[]mock.TierInfo{},
+).withActiveProfiles(
+	types.ProfileID{Name: "istio-ambient"},
+).withRoutes(
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.9.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+).withIPSet("all-istio-weps", []string{
+	// Should be EMPTY - this pod should be excluded by both selectors
+}).withName("istio selector edge cases")
+
+// Regression: NetworkSets in an ambient namespace inherit pcns.* labels via
+// their kns.<ns> profile. Without scoping the istio selector to pod WEPs,
+// a NetworkSet's CIDR (e.g. an apiserver IP) leaks into all-istio-weps.
+// The IPSet should contain only the ambient WEP, not the NetworkSet CIDR.
+var istioWithAmbientNetworkSet = istioBaseState.withKVUpdates(
+	KVPair{Key: ResourceKey{Name: "istio-ambient", Kind: v3.KindProfile}, Value: namespaceToProfile(&istioNamespaceAmbient)},
+	KVPair{Key: istioWepAmbientKey, Value: &istioWepAmbient},
+	KVPair{Key: NetworkSetKey{Name: "istio-ambient/apiserver-netset"}, Value: &NetworkSet{
+		Nets: []calinet.IPNet{
+			mustParseNet("192.168.99.99/32"),
+		},
+		Labels: uniquelabels.Make(map[string]string{
+			"projectcalico.org/namespace": "istio-ambient",
+		}),
+		ProfileIDs: []string{"istio-ambient"},
+	}},
+).withEndpoint(
+	"orch/istio-wep-ambient/ep1",
+	[]mock.TierInfo{},
+).withActiveProfiles(
+	types.ProfileID{Name: "istio-ambient"},
+).withRoutes(
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "10.10.1.1/32",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+	types.RouteUpdate{
+		Types:         proto.RouteType_LOCAL_WORKLOAD,
+		Dst:           "fc00:fe10::1/128",
+		DstNodeName:   localHostname,
+		LocalWorkload: true,
+	},
+).withIPSet("all-istio-weps", []string{
+	// 192.168.99.99/32 (NetworkSet) must NOT appear here.
+	"10.10.1.1/32",
+	"fc00:fe10::1/128",
+}).withName("istio with ambient namespace networkset")
 
 type StateList []State
 
@@ -2783,19 +3714,6 @@ func (l StateList) String() string {
 		names = append(names, state.String())
 	}
 	return "[" + strings.Join(names, ", ") + "]"
-}
-
-// UsesNodeResources returns true if any of the KVs in this state are apiv3.Node resources.
-// Some calculation graph nodes support either the v3 Node or the old model.HostIP object.
-func (l StateList) UsesNodeResources() bool {
-	for _, s := range l {
-		for _, kv := range s.DatastoreState {
-			if resourceKey, ok := kv.Key.(ResourceKey); ok && resourceKey.Kind == apiv3.KindNode {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // RouteSource returns the route source to use for the test, based on the states in the test.
@@ -2825,7 +3743,7 @@ func reverseStateOrder(baseTest StateList) (desc string, mappedTests []StateList
 	desc = "with order of states reversed"
 	palindrome := true
 	mappedTest := StateList{}
-	for ii := 0; ii < len(baseTest); ii++ {
+	for ii := range baseTest {
 		mappedTest = append(mappedTest, baseTest[len(baseTest)-ii-1])
 		if &baseTest[len(baseTest)-1-ii] != &baseTest[ii] {
 			palindrome = false
@@ -2909,4 +3827,21 @@ func squashStates(baseTests StateList) (desc string, mappedTests []StateList) {
 	mappedTest = append(mappedTest, mappedState)
 	mappedTests = []StateList{mappedTest}
 	return
+}
+
+func namespaceToProfile(ns *kapiv1.Namespace) *v3.Profile {
+	c := conversion.NewConverter()
+	kv, err := c.NamespaceToProfile(ns)
+	if err != nil {
+		panic(err)
+	}
+	profile, ok := kv.Value.(*v3.Profile)
+	if !ok {
+		panic(fmt.Errorf("Failed to convert namespace to profile.\nns: %v", ns))
+	}
+	return profile
+}
+
+func stringPtr(s string) *string {
+	return &s
 }

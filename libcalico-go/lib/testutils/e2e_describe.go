@@ -1,4 +1,4 @@
-// Copyright (c) 2017,2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,14 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package testutils
 
 import (
 	"fmt"
+	"os"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-
-	. "github.com/onsi/ginkgo"
 )
 
 type DatastoreType int
@@ -63,7 +66,8 @@ func E2eDatastoreDescribe(description string, datastores DatastoreType, body fun
 					Spec: apiconfig.CalicoAPIConfigSpec{
 						DatastoreType: apiconfig.Kubernetes,
 						KubeConfig: apiconfig.KubeConfig{
-							Kubeconfig: kubeconfig,
+							Kubeconfig:     kubeconfig,
+							CalicoAPIGroup: os.Getenv("CALICO_API_GROUP"),
 						},
 					},
 				})
@@ -71,4 +75,18 @@ func E2eDatastoreDescribe(description string, datastores DatastoreType, body fun
 	}
 
 	return true
+}
+
+// GetK8sInlineConfig returns a CalicoAPIConfig with the kubeconfig inline.
+func GetK8sInlineConfig() apiconfig.CalicoAPIConfig {
+	kc, err := os.ReadFile(kubeconfig)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	return apiconfig.CalicoAPIConfig{
+		Spec: apiconfig.CalicoAPIConfigSpec{
+			DatastoreType: apiconfig.Kubernetes,
+			KubeConfig: apiconfig.KubeConfig{
+				KubeconfigInline: string(kc),
+			},
+		},
+	}
 }

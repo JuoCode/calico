@@ -3,18 +3,14 @@
 package calico
 
 import (
+	"context"
 	"reflect"
 
-	"context"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
-
-	aapi "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -54,10 +50,10 @@ func NewFelixConfigurationStorage(opts Options) (registry.DryRunnableStorage, fa
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
 		versioner:         APIObjectVersioner{},
-		aapiType:          reflect.TypeOf(aapi.FelixConfiguration{}),
-		aapiListType:      reflect.TypeOf(aapi.FelixConfigurationList{}),
-		libCalicoType:     reflect.TypeOf(api.FelixConfiguration{}),
-		libCalicoListType: reflect.TypeOf(api.FelixConfigurationList{}),
+		aapiType:          reflect.TypeFor[api.FelixConfiguration](),
+		aapiListType:      reflect.TypeFor[api.FelixConfigurationList](),
+		libCalicoType:     reflect.TypeFor[api.FelixConfiguration](),
+		libCalicoListType: reflect.TypeFor[api.FelixConfigurationList](),
 		isNamespaced:      false,
 		create:            createFn,
 		update:            updateFn,
@@ -75,7 +71,7 @@ type FelixConfigurationConverter struct {
 }
 
 func (gc FelixConfigurationConverter) convertToLibcalico(aapiObj runtime.Object) resourceObject {
-	aapiFelixConfig := aapiObj.(*aapi.FelixConfiguration)
+	aapiFelixConfig := aapiObj.(*api.FelixConfiguration)
 	lcgFelixConfig := &api.FelixConfiguration{}
 	lcgFelixConfig.TypeMeta = aapiFelixConfig.TypeMeta
 	lcgFelixConfig.ObjectMeta = aapiFelixConfig.ObjectMeta
@@ -87,7 +83,7 @@ func (gc FelixConfigurationConverter) convertToLibcalico(aapiObj runtime.Object)
 
 func (gc FelixConfigurationConverter) convertToAAPI(libcalicoObject resourceObject, aapiObj runtime.Object) {
 	lcgFelixConfig := libcalicoObject.(*api.FelixConfiguration)
-	aapiFelixConfig := aapiObj.(*aapi.FelixConfiguration)
+	aapiFelixConfig := aapiObj.(*api.FelixConfiguration)
 	aapiFelixConfig.Spec = lcgFelixConfig.Spec
 	aapiFelixConfig.TypeMeta = lcgFelixConfig.TypeMeta
 	aapiFelixConfig.ObjectMeta = lcgFelixConfig.ObjectMeta
@@ -95,15 +91,15 @@ func (gc FelixConfigurationConverter) convertToAAPI(libcalicoObject resourceObje
 
 func (gc FelixConfigurationConverter) convertToAAPIList(libcalicoListObject resourceListObject, aapiListObj runtime.Object, pred storage.SelectionPredicate) {
 	lcgFelixConfigList := libcalicoListObject.(*api.FelixConfigurationList)
-	aapiFelixConfigList := aapiListObj.(*aapi.FelixConfigurationList)
+	aapiFelixConfigList := aapiListObj.(*api.FelixConfigurationList)
 	if libcalicoListObject == nil {
-		aapiFelixConfigList.Items = []aapi.FelixConfiguration{}
+		aapiFelixConfigList.Items = []api.FelixConfiguration{}
 		return
 	}
 	aapiFelixConfigList.TypeMeta = lcgFelixConfigList.TypeMeta
 	aapiFelixConfigList.ListMeta = lcgFelixConfigList.ListMeta
 	for _, item := range lcgFelixConfigList.Items {
-		aapiFelixConfig := aapi.FelixConfiguration{}
+		aapiFelixConfig := api.FelixConfiguration{}
 		gc.convertToAAPI(&item, &aapiFelixConfig)
 		if matched, err := pred.Matches(&aapiFelixConfig); err == nil && matched {
 			aapiFelixConfigList.Items = append(aapiFelixConfigList.Items, aapiFelixConfig)

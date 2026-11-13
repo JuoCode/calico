@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
 	"context"
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
-	"github.com/projectcalico/calico/felix/fv/metrics"
-
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
+	"github.com/projectcalico/calico/felix/fv/metrics"
 	"github.com/projectcalico/calico/felix/fv/workload"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
@@ -147,13 +144,5 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ label index metrics tests",
 			"Expected namespace selector with a less useful endpoint selector to result in a parent scan.")
 		Expect(metrics.GetFelixMetricInt(tc.Felixes[0].IP, "felix_label_index_num_active_selectors{optimized=\"false\"}")).To(BeNumerically("==", 1))
 		Expect(metrics.GetFelixMetricInt(tc.Felixes[0].IP, "felix_label_index_num_active_selectors{optimized=\"true\"}")).To(BeNumerically("==", 2))
-	})
-
-	AfterEach(func() {
-		tc.Stop()
-		if CurrentGinkgoTestDescription().Failed {
-			infra.DumpErrorData()
-		}
-		infra.Stop()
 	})
 })

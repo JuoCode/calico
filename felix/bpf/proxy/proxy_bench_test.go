@@ -23,11 +23,12 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/projectcalico/calico/felix/bpf/mock"
 	"github.com/projectcalico/calico/felix/bpf/proxy"
@@ -39,15 +40,18 @@ func benchmarkProxyUpdates(b *testing.B, svcN, epsN int) {
 	for n := 0; n < b.N; n++ {
 		svcs := makeSvcs(svcN)
 		eps := makeEps(svcN, epsN)
-		k8s := fake.NewSimpleClientset(append(svcs, eps...)...)
+		k8s := fake.NewClientset(append(svcs, eps...)...)
 
 		syncer, err := proxy.NewSyncer(4,
 			[]net.IP{net.IPv4(1, 1, 1, 1)},
 			&mock.DummyMap{},
 			&mock.DummyMap{},
 			&mock.DummyMap{},
+			&mock.DummyMap{},
 			proxy.NewRTCache(),
 			nil,
+			maglevLUTSize,
+			0,
 		)
 		Expect(err).ShouldNot(HaveOccurred())
 
@@ -103,7 +107,7 @@ func BenchmarkProxyUpdates(b *testing.B) {
 func makeSvcs(n int) []runtime.Object {
 	svcs := make([]runtime.Object, n)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		ip := net.IPv4(10, byte((i&0xff0000)>>16), byte((i&0xff00)>>8), byte(i&0xff))
 		svcs[i] = &v1.Service{
 			TypeMeta:   typeMetaV1("Service"),
@@ -130,23 +134,25 @@ func makeSvcs(n int) []runtime.Object {
 func makeEps(sn, ep int) []runtime.Object {
 	eps := make([]runtime.Object, sn)
 
-	for i := 0; i < sn; i++ {
-		addrs := make([]v1.EndpointAddress, ep)
-		for a := 0; a < ep; a++ {
-			addrs[a] = v1.EndpointAddress{IP: fmt.Sprintf("10.11.12.%d", a)}
+	for i := range sn {
+		addrs := make([]string, ep)
+		for a := range ep {
+			addrs[a] = fmt.Sprintf("10.11.12.%d", a)
 		}
-		ep := &v1.Endpoints{
-			TypeMeta:   typeMetaV1("Endpoints"),
-			ObjectMeta: objectMetaV1(fmt.Sprintf("service-%d", i)),
-			Subsets: []v1.EndpointSubset{
+		ep := &discoveryv1.EndpointSlice{
+			TypeMeta:    typeMetaV1("EndpointSlice"),
+			ObjectMeta:  objectMetaV1(fmt.Sprintf("service-%d", i)),
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{
 				{
 					Addresses: addrs,
-					Ports: []v1.EndpointPort{
-						{
-							Port: 1234,
-							Name: "1234",
-						},
-					},
+				},
+			},
+			Ports: []discoveryv1.EndpointPort{
+				{
+					Port:     ptr.To(int32(1234)),
+					Name:     ptr.To("1234"),
+					Protocol: ptr.To(v1.ProtocolTCP),
 				},
 			},
 		}

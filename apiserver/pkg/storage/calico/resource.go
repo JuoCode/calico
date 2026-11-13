@@ -1,17 +1,18 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 
 package calico
 
 import (
 	"bytes"
+	"context"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"reflect"
 	"strconv"
 	"time"
 
-	"context"
-
+	"github.com/sirupsen/logrus"
 	aapierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,8 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	k8swatch "k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/klog/v2"
 
+	"github.com/projectcalico/calico/apiserver/pkg/registry/projectcalico/util"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
@@ -45,7 +46,7 @@ type resourceConverter interface {
 	convertToAAPI(resourceObject, runtime.Object)
 	convertToAAPIList(resourceListObject, runtime.Object, storage.SelectionPredicate)
 }
-type clientOpts interface{}
+type clientOpts any
 
 type (
 	clientObjectOperator func(context.Context, clientv3.Interface, resourceObject, clientOpts) (resourceObject, error)
@@ -73,40 +74,77 @@ type resourceStore struct {
 	converter         resourceConverter
 }
 
+func (rs *resourceStore) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
+	logrus.Error("STUB: GetCurrentResourceVersion() not supported by Calico client.")
+	return 0, fmt.Errorf("GetCurrentResourceVersion() not supported by Calico client")
+}
+
 func (rs *resourceStore) RequestWatchProgress(ctx context.Context) error {
 	// This method is supposed to trigger the client to emit a progress
 	// notification on each active watch but our client doesn't support that
 	// yet.
-	klog.Error("STUB: RequestWatchProgress() not supported by Calico client.")
+	logrus.Error("STUB: RequestWatchProgress() not supported by Calico client.")
 	return nil
 }
 
-var _ storage.Interface = (*resourceStore)(nil)
+func (rs *resourceStore) ReadinessCheck() error {
+	logrus.Error("STUB: RedinessCheck() not supported by Calico client.")
+	return nil
+}
+
+func (rs *resourceStore) Stats(_ context.Context) (storage.Stats, error) {
+	logrus.Error("STUB: Stats() not supported by Calico client.")
+	return storage.Stats{}, nil
+}
+
+func (rs *resourceStore) SetKeysFunc(_ storage.KeysFunc) {
+	logrus.Error("STUB: SetKeysFunc() not supported by Calico client.")
+}
+
+func (rs *resourceStore) EnableResourceSizeEstimation(_ storage.KeysFunc) error {
+	logrus.Error("STUB: EnableResourceSizeEstimation() not supported by Calico client.")
+	return nil
+}
+
+func (rs *resourceStore) CompactRevision() int64 {
+	logrus.Error("STUB: CompactRevision() not supported by Calico client.")
+	return 0
+}
+
+var (
+	_ storage.Interface = (*resourceStore)(nil)
+	_ util.DryRunWriter = (*resourceStore)(nil)
+)
 
 func CreateClientFromConfig() clientv3.Interface {
 	// TODO(doublek): nicer errors returned
 	cfg, err := apiconfig.LoadClientConfig("")
 	if err != nil {
-		klog.Errorf("Failed to load client config: %q", err)
+		logrus.Errorf("Failed to load client config: %q", err)
 		os.Exit(1)
+	}
+
+	// if QPS not set in config, set default QPS
+	if cfg.Spec.K8sClientQPS == float32(0) {
+		cfg.Spec.K8sClientQPS = 50
 	}
 
 	c, err := clientv3.New(*cfg)
 	if err != nil {
-		klog.Errorf("Failed creating client: %q", err)
+		logrus.Errorf("Failed creating client: %q", err)
 		os.Exit(1)
 	}
 
 	err = c.EnsureInitialized(context.Background(), "", "")
 	if err != nil {
-		klog.Errorf("Failed initializing client: %q", err)
+		logrus.Errorf("Failed initializing client: %q", err)
 		os.Exit(1)
 	}
 
 	return c
 }
 
-// Versioner returns the versioner associated with this interface
+// Versioned returns the versioned associated with this interface
 func (rs *resourceStore) Versioner() storage.Versioner {
 	return rs.versioner
 }
@@ -130,13 +168,13 @@ func validationError(err error, qualifiedKind schema.GroupKind, name string) *aa
 // in seconds (0 means forever). If no error is returned and out is not nil, out will be
 // set to the read value from database.
 func (rs *resourceStore) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
-	klog.V(1).Infof("Create called with key: %v for resource %v\n", key, rs.resourceName)
+	logrus.Tracef("Create called with key: %v for resource %v\n", key, rs.resourceName)
 	lcObj := rs.converter.convertToLibcalico(obj)
 
 	opts := options.SetOptions{TTL: time.Duration(ttl) * time.Second}
 	createdObj, err := rs.create(ctx, rs.client, lcObj, opts)
 	if err != nil {
-		klog.Errorf("Error creating resource %v key %v error %v\n", rs.resourceName, key, err)
+		logrus.Errorf("Error creating resource %v key %v error %v\n", rs.resourceName, key, err)
 		switch err.(type) {
 		case errors.ErrorValidation:
 			rObj := obj.(resourceObject)
@@ -149,13 +187,58 @@ func (rs *resourceStore) Create(ctx context.Context, key string, obj, out runtim
 	return nil
 }
 
+// DryRunCreate sends obj to the Calico datastore as a dry-run create. It gets every
+// check a real create gets, including the backing CRD's schema, CEL rules and
+// admission, and nothing is persisted. The caller must pass an object it owns, since
+// the Calico client modifies it.
+func (rs *resourceStore) DryRunCreate(ctx context.Context, key string, obj runtime.Object) error {
+	res, ok := obj.(resourceObject)
+	if !ok {
+		return fmt.Errorf("dry-run create of %s: unexpected type %T", key, obj)
+	}
+	_, err := rs.create(ctx, rs.client, rs.converter.convertToLibcalico(res), options.SetOptions{DryRun: true})
+	return dryRunError(err, key, res)
+}
+
+// DryRunUpdate is DryRunCreate for an update from old to obj. An unconditional
+// update carries no resource version, so it takes old's, as GuaranteedUpdate does
+// for a real one.
+func (rs *resourceStore) DryRunUpdate(ctx context.Context, key string, obj, old runtime.Object) error {
+	res, ok := obj.(resourceObject)
+	if !ok {
+		return fmt.Errorf("dry-run update of %s: unexpected type %T", key, obj)
+	}
+	oldRes, ok := old.(resourceObject)
+	if !ok {
+		return fmt.Errorf("dry-run update of %s: unexpected type %T", key, old)
+	}
+	if res.GetObjectMeta().GetResourceVersion() == "" {
+		res.GetObjectMeta().SetResourceVersion(oldRes.GetObjectMeta().GetResourceVersion())
+	}
+	_, err := rs.update(ctx, rs.client, rs.converter.convertToLibcalico(res), options.SetOptions{DryRun: true})
+	return dryRunError(err, key, res)
+}
+
+// dryRunError maps the error from a dry-run write the same way Create maps one from
+// a real write.
+func dryRunError(err error, key string, res resourceObject) error {
+	var verr errors.ErrorValidation
+	if goerrors.As(err, &verr) {
+		return validationError(verr, res.GetObjectKind().GroupVersionKind().GroupKind(), res.GetObjectMeta().GetName())
+	}
+	if err != nil {
+		return aapiError(err, key)
+	}
+	return nil
+}
+
 // Delete removes the specified key and returns the value that existed at that spot.
 // If key didn't exist, it will return NotFound storage error.
 func (rs *resourceStore) Delete(ctx context.Context, key string, out runtime.Object,
 	preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc,
-	cachedExistingObject runtime.Object,
+	cachedExistingObject runtime.Object, o storage.DeleteOptions,
 ) error {
-	klog.V(1).Infof("Delete called with key: %v for resource %v\n", key, rs.resourceName)
+	logrus.Tracef("Delete called with key: %v for resource %v\n", key, rs.resourceName)
 
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
@@ -183,7 +266,7 @@ func (rs *resourceStore) Delete(ctx context.Context, key string, out runtime.Obj
 
 	libcalicoObj, err := rs.delete(ctx, rs.client, ns, name, delOpts)
 	if err != nil {
-		klog.Errorf("Clientv3 error deleting resource %v with key %v error %v\n", rs.resourceName, key, err)
+		logrus.Errorf("Clientv3 error deleting resource %v with key %v error %v\n", rs.resourceName, key, err)
 		return aapiError(err, key)
 	}
 
@@ -197,7 +280,7 @@ func checkPreconditions(key string, preconditions *storage.Preconditions, out ru
 	}
 	objMeta, err := meta.Accessor(out)
 	if err != nil {
-		return storage.NewInternalErrorf("can't enforce preconditions %v on un-introspectable object %v, got error: %v", *preconditions, out, err)
+		return storage.NewInternalError(fmt.Errorf("can't enforce preconditions %v on un-introspectable object %v, got error: %v", *preconditions, out, err))
 	}
 	if preconditions.UID != nil && *preconditions.UID != objMeta.GetUID() {
 		errMsg := fmt.Sprintf("Precondition failed: UID in precondition: %v, UID in object meta: %v", *preconditions.UID, objMeta.GetUID())
@@ -214,7 +297,7 @@ func checkPreconditions(key string, preconditions *storage.Preconditions, out ru
 // If resource version is "0", this interface will get current object at given key
 // and send it in an "ADDED" event, before watch starts.
 func (rs *resourceStore) Watch(ctx context.Context, key string, opts storage.ListOptions) (k8swatch.Interface, error) {
-	klog.V(1).Infof("Watch called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("Watch called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return nil, err
@@ -230,7 +313,7 @@ func (rs *resourceStore) Watch(ctx context.Context, key string, opts storage.Lis
 // If resource version is "0", this interface will list current objects directory defined by key
 // and send them in "ADDED" events, before watch starts.
 func (rs *resourceStore) WatchList(ctx context.Context, key string, opts storage.ListOptions) (k8swatch.Interface, error) {
-	klog.V(1).Infof("WatchList called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("WatchList called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return nil, err
@@ -246,7 +329,7 @@ func (rs *resourceStore) WatchList(ctx context.Context, key string, opts storage
 func (rs *resourceStore) Get(ctx context.Context, key string, optsK8s storage.GetOptions,
 	out runtime.Object,
 ) error {
-	klog.V(1).Infof("Get called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("Get called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return err
@@ -271,7 +354,7 @@ func (rs *resourceStore) Get(ctx context.Context, key string, optsK8s storage.Ge
 // The returned contents may be delayed, but it is guaranteed that they will
 // match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
 func (rs *resourceStore) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	klog.V(1).Infof("GetList called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("GetList called with key: %v on resource %v\n", key, rs.resourceName)
 	return rs.List(ctx, key, opts, listObj)
 }
 
@@ -280,7 +363,7 @@ func (rs *resourceStore) GetList(ctx context.Context, key string, opts storage.L
 // The returned contents may be delayed, but it is guaranteed that they will
 // be have at least 'resourceVersion'.
 func (rs *resourceStore) List(ctx context.Context, key string, optsK8s storage.ListOptions, listObj runtime.Object) error {
-	klog.V(1).Infof("List called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("List called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return err
@@ -375,26 +458,35 @@ func decode(
 //	   }
 //	})
 func (rs *resourceStore) GuaranteedUpdate(
-	ctx context.Context, key string, out runtime.Object, ignoreNotFound bool,
-	preconditions *storage.Preconditions, userUpdate storage.UpdateFunc, cachedExistingObject runtime.Object,
+	ctx context.Context,
+	key string,
+	out runtime.Object,
+	ignoreNotFound bool,
+	preconditions *storage.Preconditions,
+	userUpdate storage.UpdateFunc,
+	cachedExistingObject runtime.Object,
 ) error {
-	klog.V(6).Infof("GuaranteedUpdate called with key: %v on resource %v\n", key, rs.resourceName)
+	logrus.Tracef("GuaranteedUpdate called with key: %v on resource %v\n", key, rs.resourceName)
+
 	// If a cachedExistingObject was passed, use that as the initial object, otherwise use Get() to retrieve it
 	var initObj runtime.Object
 	if cachedExistingObject != nil {
+		logrus.Debugf("Using cached existing object for key: %v on resource %v\n", key, rs.resourceName)
 		initObj = cachedExistingObject
 	} else {
+		logrus.Debugf("Getting initial object for key: %v on resource %v\n", key, rs.resourceName)
 		initObj = reflect.New(rs.aapiType).Interface().(runtime.Object)
 		opts := storage.GetOptions{IgnoreNotFound: ignoreNotFound}
 		if err := rs.Get(ctx, key, opts, initObj); err != nil {
-			klog.Errorf("getting initial object (%s)", err)
+			logrus.Errorf("getting initial object (%s)", err)
 			return aapiError(err, key)
 		}
 	}
+
 	// In either case, extract current state from the initial object
 	curState, err := rs.getStateFromObject(initObj)
 	if err != nil {
-		klog.Errorf("getting state from initial object (%s)", err)
+		logrus.Errorf("getting state from initial object (%s)", err)
 		return err
 	}
 
@@ -410,19 +502,20 @@ func (rs *resourceStore) GuaranteedUpdate(
 		totalLoopCount++
 
 		if err := checkPreconditions(key, preconditions, curState.obj); err != nil {
-			klog.Errorf("checking preconditions (%s)", err)
+			logrus.Errorf("checking preconditions (%s)", err)
 			return err
 		}
+
 		// update the object by applying the userUpdate func & encode it
 		updatedObj, ttl, err := userUpdate(curState.obj, *curState.meta)
 		if err != nil {
-			klog.Errorf("applying user update: (%s)", err)
+			logrus.Errorf("applying user update: (%s)", err)
 			return err
 		}
 
 		updatedData, err := runtime.Encode(rs.codec, updatedObj)
 		if err != nil {
-			klog.Errorf("encoding candidate obj (%s)", err)
+			logrus.Errorf("encoding candidate obj (%s)", err)
 			return err
 		}
 
@@ -461,10 +554,10 @@ func (rs *resourceStore) GuaranteedUpdate(
 			opts = options.SetOptions{TTL: time.Duration(*ttl) * time.Second}
 		}
 		if shouldCreateOnUpdate() {
-			klog.V(6).Infof("Create on Update with key: %v on resource %v\n", key, rs.resourceName)
+			logrus.Tracef("Create on Update with key: %v on resource %v\n", key, rs.resourceName)
 			createdLibcalicoObj, err := rs.create(ctx, rs.client, libcalicoObj, opts)
 			if err != nil {
-				klog.Errorf("creating new object (%s) on PATCH", err)
+				logrus.Errorf("creating new object (%s) on PATCH", err)
 				return err
 			}
 			rs.converter.convertToAAPI(createdLibcalicoObj, out)
@@ -479,19 +572,19 @@ func (rs *resourceStore) GuaranteedUpdate(
 			default:
 				e := aapiError(err, key)
 				if storage.IsConflict(e) {
-					klog.V(4).Infof(
+					logrus.Debugf(
 						"GuaranteedUpdate of %s failed because of a conflict, going to retry",
 						key,
 					)
 					newCurObj := reflect.New(rs.aapiType).Interface().(runtime.Object)
 					opts := storage.GetOptions{IgnoreNotFound: ignoreNotFound}
 					if err := rs.Get(ctx, key, opts, newCurObj); err != nil {
-						klog.Errorf("getting new current object (%s)", err)
+						logrus.Errorf("getting new current object (%s)", err)
 						return aapiError(err, key)
 					}
 					ncs, err := rs.getStateFromObject(newCurObj)
 					if err != nil {
-						klog.Errorf("getting state from new current object (%s)", err)
+						logrus.Errorf("getting state from new current object (%s)", err)
 						return err
 					}
 					curState = ncs
@@ -503,7 +596,7 @@ func (rs *resourceStore) GuaranteedUpdate(
 		rs.converter.convertToAAPI(createdLibcalicoObj, out)
 		return nil
 	}
-	klog.Errorf("GuaranteedUpdate failed.")
+	logrus.Error("GuaranteedUpdate failed.")
 	return nil
 }
 

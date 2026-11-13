@@ -24,6 +24,11 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/watch"
 )
 
+const (
+	DefaultFelixRouteTableRangeMin = 1
+	DefaultFelixRouteTableRangeMax = 250
+)
+
 // FelixConfigurationInterface has methods to work with FelixConfiguration resources.
 type FelixConfigurationInterface interface {
 	Create(ctx context.Context, res *apiv3.FelixConfiguration, opts options.SetOptions) (*apiv3.FelixConfiguration, error)
@@ -107,8 +112,7 @@ func (r felixConfigurations) Watch(ctx context.Context, opts options.ListOptions
 }
 
 func setDefaults(fc *apiv3.FelixConfiguration) {
-	// Defaulting of the FloatingIPs field is handled via CRD validation in CRD mode, but
-	// requires an explicit defaulting step for etcd.
+	// The CRD defaults FloatingIPs in CRD mode; etcd needs this explicit step.
 	if fc.Spec.FloatingIPs == nil {
 		disabled := apiv3.FloatingIPsDisabled
 		fc.Spec.FloatingIPs = &disabled

@@ -1,0 +1,54 @@
+// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package registry
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+)
+
+// OperatorImage is the operator's image name
+const OperatorImage = "operator"
+
+// ResolveDigest returns the manifest digest of image, authenticating with the
+// ambient Docker credentials. exists is false with a nil error when the tag is
+// absent; auth and network failures return an error instead.
+func ResolveDigest(image string) (digest string, exists bool, err error) {
+	ref, err := name.ParseReference(image)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to parse image reference for %s: %w", image, err)
+	}
+	desc, err := remote.Head(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	if err != nil {
+		var te *transport.Error
+		if errors.As(err, &te) && te.StatusCode == http.StatusNotFound {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("failed to resolve digest for %s: %w", image, err)
+	}
+	return desc.Digest.String(), true, nil
+}
+
+// CheckImage reports whether image is present in its registry.
+func CheckImage(image string) (bool, error) {
+	_, exists, err := ResolveDigest(image)
+	return exists, err
+}

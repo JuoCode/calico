@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,39 +15,39 @@
 package policysync_test
 
 import (
+	"context"
 	"errors"
 	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/policysync"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/pod2daemon/binder"
-
-	"context"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 )
 
 var _ = Describe("Server", func() {
 	var uut *policysync.Server
-	var joins chan interface{}
+	var joins chan any
 
 	BeforeEach(func() {
-		joins = make(chan interface{})
-		uut = policysync.NewServer(joins, policysync.NewUIDAllocator().NextUID)
+		joins = make(chan any)
+		uut = policysync.NewServer(joins, nil, policysync.NewUIDAllocator().NextUID)
 	})
 
 	Describe("Sync tests", func() {
 
 		Context("after calling Sync and joining", func() {
 			var stream *testSyncStream
-			var updates chan<- proto.ToDataplane
+			var updates chan<- *proto.ToDataplane
 			var output chan *proto.ToDataplane
 			syncDone := make(chan bool)
 
-			BeforeEach(func(done Done) {
+			BeforeEach(func() {
 				output = make(chan *proto.ToDataplane)
 				stream = &testSyncStream{output: output}
 				go func() {
@@ -56,51 +56,45 @@ var _ = Describe("Server", func() {
 				}()
 				j := <-joins
 				jr := j.(policysync.JoinRequest)
-				Expect(jr.EndpointID.GetWorkloadId()).To(Equal(WorkloadID))
+				Expect(jr.EndpointID.WorkloadId).To(Equal(WorkloadID))
 				updates = jr.C
-				close(done)
 			})
 
-			It("should stream messages", func(done Done) {
-				msgs := []proto.ToDataplane{
+			It("should stream messages", func() {
+				msgs := []*proto.ToDataplane{
 					{Payload: &proto.ToDataplane_WorkloadEndpointUpdate{}},
 					{Payload: &proto.ToDataplane_InSync{}},
 				}
 				for _, msg := range msgs {
 					updates <- msg
 					g := <-output
-					Expect(g).To(Equal(&msg))
+					Expect(googleproto.Equal(g, msg)).To(BeTrue())
 				}
-
-				close(done)
 			})
 
 			Context("with unstreamed updates", func() {
-				BeforeEach(func(done Done) {
+				BeforeEach(func() {
 					// Queue up 10 messages. This should not block because the updates channel should be buffered.
-					for i := 0; i < 10; i++ {
-						updates <- proto.ToDataplane{}
+					for range 10 {
+						updates <- &proto.ToDataplane{}
 					}
-					close(done)
 				})
 
 				Context("after error on stream", func() {
-					BeforeEach(func(done Done) {
+					BeforeEach(func() {
 						stream.sendErr = true
 						<-output
-						close(done)
 					})
 
-					It("should drain updates channel, send leave request and end Sync", func(done Done) {
-						for i := 0; i < 10; i++ {
-							updates <- proto.ToDataplane{}
+					It("should drain updates channel, send leave request and end Sync", func() {
+						for range 10 {
+							updates <- &proto.ToDataplane{}
 						}
 						j := <-joins
 						lr := j.(policysync.LeaveRequest)
-						Expect(lr.EndpointID.GetWorkloadId()).To(Equal(WorkloadID))
+						Expect(lr.EndpointID.WorkloadId).To(Equal(WorkloadID))
 						close(updates)
 						<-syncDone
-						close(done)
 					})
 
 				})
@@ -110,15 +104,14 @@ var _ = Describe("Server", func() {
 						close(updates)
 					})
 
-					It("send pending updates, leave request and end Sync", func(done Done) {
-						for i := 0; i < 10; i++ {
+					It("send pending updates, leave request and end Sync", func() {
+						for range 10 {
 							<-output
 						}
 						j := <-joins
 						lr := j.(policysync.LeaveRequest)
-						Expect(lr.EndpointID.GetWorkloadId()).To(Equal(WorkloadID))
+						Expect(lr.EndpointID.WorkloadId).To(Equal(WorkloadID))
 						<-syncDone
-						close(done)
 					})
 				})
 			})
@@ -155,11 +148,11 @@ func (*testSyncStream) Context() context.Context {
 	return &testContext{}
 }
 
-func (*testSyncStream) SendMsg(m interface{}) error {
+func (*testSyncStream) SendMsg(m any) error {
 	panic("not implemented")
 }
 
-func (*testSyncStream) RecvMsg(m interface{}) error {
+func (*testSyncStream) RecvMsg(m any) error {
 	panic("not implemented")
 }
 
@@ -181,7 +174,7 @@ const WorkloadName = "servertest"
 const Namespace = "default"
 const WorkloadID = "default/servertest"
 
-func (*testContext) Value(key interface{}) interface{} {
+func (*testContext) Value(key any) any {
 	// Server accesses the peer value only.
 	peer := &peer.Peer{AuthInfo: binder.Credentials{
 		Uid:            "test",

@@ -2,12 +2,28 @@
 // Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
-#ifndef __CALI_BPF_JUMP_H__
-#define __CALI_BPF_JUMP_H__
+#ifndef __CALI_JUMP_H__
+#define __CALI_JUMP_H__
 
-CALI_MAP(cali_state, 4,
+#include "cali_bpf.h"
+#include "globals.h"
+#include "log.h"
+#include "types.h"
+
+#define STATE_SIZE 512
+
+static CALI_BPF_INLINE void __compile_state_asserts(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-local-typedef"
+COMPILE_TIME_ASSERT(sizeof(struct cali_tc_state) <= STATE_SIZE);
+/* TC globals and the packet scratch area share one state-map slot. */
+COMPILE_TIME_ASSERT(sizeof(struct cali_tc_globals) + sizeof(struct pkt_scratch) <= STATE_SIZE);
+#pragma clang diagnostic pop
+}
+
+CALI_MAP(cali_state, 6,
 		BPF_MAP_TYPE_PERCPU_ARRAY,
-		__u32, struct cali_tc_state,
+		__u32, char[STATE_SIZE],
 		2, 0)
 
 static CALI_BPF_INLINE struct cali_tc_state *state_get(void)
@@ -45,12 +61,27 @@ CALI_MAP_V1(cali_jump_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 400, 0)
 
 #else /* CALI_F_XDP */
 
-#define cali_jump_map map_symbol(cali_progs, 3)
+/*
+ * BPF programs have a type, which depends on where they are attached. 
+ * As of kernel 6.12, jump maps are limited to a single program type and 
+ * it is forbidden to jump from one type of program to a different type of map.
+ * TCX ingress and egress programs have different types, so this means that we need to split the jump maps for the two directions.
+ * Note: in our code, we generally use "ingress" and "egress" to refer to the policy direction, 
+ * relative to the endpoint that is being secured, which means that, for workload endpoints, 
+ * "ingress" policy is implemented in the kernel's "egress" tc(x) program(!). 
+ * To avoid (further) confusion, we call the kernel's directions "to host" (ingress) and "from host" (egress).
+*/
+
+#ifdef CALI_HOOK_INGRESS
+#define cali_jump_map map_symbol(cali_progs_ing, 2)
+#else
+#define cali_jump_map map_symbol(cali_progs_egr, 2)
+#endif
 
 CALI_MAP_V1(cali_jump_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 400, 0)
 
 #define __CALI_JUMP_TO(ctx, index) do {	\
-	CALI_DEBUG("jump to idx %d prog at %d\n", index, (ctx)->globals->data.jumps[PROG_PATH(index)]);	\
+	CALI_DEBUG("jump to idx %d prog at %d", index, (ctx)->globals->data.jumps[PROG_PATH(index)]);	\
 	bpf_tail_call((ctx)->skb, &cali_jump_map, (ctx)->globals->data.jumps[PROG_PATH(index)]);	\
 } while (0)
 
@@ -68,6 +99,9 @@ enum cali_jump_index {
 	PROG_INDEX_HOST_CT_CONFLICT,
 	PROG_INDEX_ICMP_INNER_NAT,
 	PROG_INDEX_NEW_FLOW,
+	PROG_INDEX_IP_FRAG,
+	PROG_INDEX_MAGLEV,
+	PROG_INDEX_TCP_RST,
 
 	PROG_INDEX_MAIN_DEBUG,
 	PROG_INDEX_POLICY_DEBUG,
@@ -77,6 +111,9 @@ enum cali_jump_index {
 	PROG_INDEX_HOST_CT_CONFLICT_DEBUG,
 	PROG_INDEX_ICMP_INNER_NAT_DEBUG,
 	PROG_INDEX_NEW_FLOW_DEBUG,
+	PROG_INDEX_IP_FRAG_DEBUG,
+	PROG_INDEX_MAGLEV_DEBUG,
+	PROG_INDEX_TCP_RST_DEBUG,
 };
 
 #if CALI_F_XDP
@@ -92,16 +129,20 @@ CALI_MAP_V1(cali_jump_prog_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 2400, 0)
 	bpf_tail_call((ctx)->xdp, &cali_jump_prog_map, (ctx)->xdp_globals->jumps[PROG_INDEX_POLICY])
 #else /* CALI_F_XDP */
 
-#define cali_jump_prog_map map_symbol(cali_jump, 3)
+#ifdef CALI_HOOK_INGRESS
+#define cali_jump_prog_map map_symbol(cali_jump_ing, 2)
+#else
+#define cali_jump_prog_map map_symbol(cali_jump_egr, 2)
+#endif
 
 CALI_MAP_V1(cali_jump_prog_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 240000, 0)
 
 #define __CALI_JUMP_TO_POLICY(ctx, allow, deny, pol) do {	\
 	(ctx)->skb->cb[0] = (ctx)->globals->data.jumps[PROG_PATH(allow)];			\
 	(ctx)->skb->cb[1] = (ctx)->globals->data.jumps[PROG_PATH(deny)];				\
-	CALI_DEBUG("policy allow prog at %d\n", (ctx)->globals->data.jumps[PROG_PATH(allow)]);	\
-	CALI_DEBUG("policy deny prog at %d\n", (ctx)->globals->data.jumps[PROG_PATH(deny)]);	\
-	CALI_DEBUG("jump to policy prog at %d\n", (ctx)->globals->data.jumps[pol]);		\
+	CALI_DEBUG("policy allow prog at %d", (ctx)->globals->data.jumps[PROG_PATH(allow)]);	\
+	CALI_DEBUG("policy deny prog at %d", (ctx)->globals->data.jumps[PROG_PATH(deny)]);	\
+	CALI_DEBUG("jump to policy prog at %d", (ctx)->globals->data.jumps[pol]);		\
 	bpf_tail_call((ctx)->skb, &cali_jump_prog_map, (ctx)->globals->data.jumps[pol]);	\
 } while (0)
 
@@ -109,4 +150,4 @@ CALI_MAP_V1(cali_jump_prog_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 240000, 0
 	__CALI_JUMP_TO_POLICY(ctx, PROG_INDEX_ALLOWED, PROG_INDEX_DROP, PROG_INDEX_POLICY)
 #endif
 
-#endif /* __CALI_BPF_JUMP_H__ */
+#endif /* __CALI_JUMP_H__ */

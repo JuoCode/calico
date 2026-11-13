@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,74 +16,83 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 	uruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
-	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam/accounting"
+	"github.com/projectcalico/calico/libcalico-go/lib/kubevirt"
 )
 
 const (
 	RateLimitK8s          = "k8s"
-	RateLimitCalicoCreate = "calico-create"
 	RateLimitCalicoList   = "calico-list"
-	RateLimitCalicoUpdate = "calico-update"
 	RateLimitCalicoDelete = "calico-delete"
 	nodeLabelAnnotation   = "projectcalico.org/kube-labels"
 	hepCreatedLabelKey    = "projectcalico.org/created-by"
 	hepCreatedLabelValue  = "calico-kube-controllers"
-)
-
-var (
-	retrySleepTime = 100 * time.Millisecond
+	timer                 = 5 * time.Minute
 )
 
 // NodeController implements the Controller interface.  It is responsible for monitoring
 // kubernetes nodes and responding to delete events by removing them from the Calico datastore.
 type NodeController struct {
 	ctx context.Context
+	cfg config.NodeControllerConfig
 
 	// For syncing node objects from the k8s API.
 	nodeInformer cache.SharedIndexInformer
 	podInformer  cache.SharedIndexInformer
-	k8sClientset *kubernetes.Clientset
+	k8sClientset kubernetes.Interface
 
 	// For accessing Calico datastore.
 	calicoClient client.Interface
-	dataFeed     *DataFeed
+	dataFeed     *utils.DataFeed
 
 	// Sub-controllers
-	ipamCtrl *ipamController
+	ipamCtrl               *IPAMController
+	hostEndpointController *autoHostEndpointController
+	nodeLabelController    *nodeLabelController
 }
 
 // NewNodeController Constructor for NodeController
 func NewNodeController(ctx context.Context,
-	k8sClientset *kubernetes.Clientset,
+	k8sClientset kubernetes.Interface,
 	calicoClient client.Interface,
 	cfg config.NodeControllerConfig,
-	nodeInformer, podInformer cache.SharedIndexInformer) controller.Controller {
+	nodeInformer, podInformer cache.SharedIndexInformer,
+	dataFeed *utils.DataFeed,
+	tracker *accounting.Tracker,
+	deferredInformers *kubevirt.DeferredInformers,
+) controller.Controller {
 	nc := &NodeController{
 		ctx:          ctx,
+		cfg:          cfg,
 		calicoClient: calicoClient,
 		k8sClientset: k8sClientset,
-		dataFeed:     NewDataFeed(calicoClient),
+		dataFeed:     dataFeed,
 		nodeInformer: nodeInformer,
 		podInformer:  podInformer,
 	}
 
 	// Store functions to call on node deletion.
-	nodeDeletionFuncs := []func(){}
+	nodeDeletionFuncs := []func(*v1.Node){}
+	podDeletionFuncs := []func(*v1.Pod){}
 
-	// Create the IPAM controller.
-	nc.ipamCtrl = NewIPAMController(cfg, calicoClient, k8sClientset, podInformer.GetIndexer(), nodeInformer.GetIndexer())
+	nc.ipamCtrl = NewIPAMController(cfg, calicoClient, k8sClientset, podInformer.GetIndexer(), nodeInformer.GetIndexer(), deferredInformers, tracker)
 	nc.ipamCtrl.RegisterWith(nc.dataFeed)
 	nodeDeletionFuncs = append(nodeDeletionFuncs, nc.ipamCtrl.OnKubernetesNodeDeleted)
+	podDeletionFuncs = append(podDeletionFuncs, nc.ipamCtrl.OnKubernetesPodDeleted)
 
 	if cfg.DeleteNodes {
 		// If we're running in etcd mode, then we also need to delete the node resource.
@@ -97,31 +106,43 @@ func NewNodeController(ctx context.Context,
 	// Setup event handlers for nodes and pods learned through the
 	// respective informers.
 	nodeHandlers := cache.ResourceEventHandlerFuncs{
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
+			node, ok := nodeFromDeleteObj(obj)
+			if !ok {
+				return
+			}
 			// Call all of the registered node deletion funcs.
 			for _, f := range nodeDeletionFuncs {
-				f()
+				f(node)
 			}
-		}}
+		},
+	}
+	podHandlers := cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj any) {
+			pod, ok := podFromDeleteObj(obj)
+			if !ok {
+				return
+			}
+			// Call all of the registered pod deletion funcs.
+			for _, f := range podDeletionFuncs {
+				f(pod)
+			}
+		},
+	}
 
 	// Create the Auto HostEndpoint sub-controller and register it to receive data.
 	// We always launch this controller, even if auto-HEPs are disabled, since the controller
 	// is responsible for cleaning up after itself in case it was previously enabled.
-	autoHEPController := NewAutoHEPController(cfg, calicoClient)
-	autoHEPController.RegisterWith(nc.dataFeed)
+	nc.hostEndpointController = NewAutoHEPController(cfg, calicoClient)
+	nc.hostEndpointController.RegisterWith(nc.dataFeed)
 
 	if cfg.SyncLabels {
 		// Note that the configuration code has already handled disabling this if
 		// we are in KDD mode.
 
 		// Create Label-sync controller and register it to receive data.
-		nodeLabelCtrl := NewNodeLabelController(calicoClient)
-		nodeLabelCtrl.RegisterWith(nc.dataFeed)
-
-		// Hook the node label controller into the node informer so we are notified
-		// when Kubernetes node labels change.
-		nodeHandlers.AddFunc = func(obj interface{}) { nodeLabelCtrl.OnKubernetesNodeUpdate(obj) }
-		nodeHandlers.UpdateFunc = func(_, obj interface{}) { nodeLabelCtrl.OnKubernetesNodeUpdate(obj) }
+		nc.nodeLabelController = NewNodeLabelController(calicoClient, nodeInformer)
+		nc.nodeLabelController.RegisterWith(nc.dataFeed)
 	}
 
 	// Set the handlers on the informers.
@@ -129,15 +150,55 @@ func NewNodeController(ctx context.Context,
 		log.WithError(err).Error("failed to add event handler for node")
 		return nil
 	}
-
-	// Start the Calico data feed.
-	nc.dataFeed.Start()
+	if _, err := nc.podInformer.AddEventHandler(podHandlers); err != nil {
+		log.WithError(err).Error("failed to add event handler for pod")
+		return nil
+	}
 
 	return nc
 }
 
+// nodeFromDeleteObj extracts a *v1.Node from an informer delete event object,
+// unwrapping the cache.DeletedFinalStateUnknown tombstone the informer may
+// deliver when its watch state is lost. Returns ok=false (and logs) if the
+// object is not a Node, so callers can skip the delete instead of panicking.
+func nodeFromDeleteObj(obj any) (*v1.Node, bool) {
+	if node, ok := obj.(*v1.Node); ok {
+		return node, true
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		log.WithField("type", fmt.Sprintf("%T", obj)).Warn("Unexpected object type in node delete event")
+		return nil, false
+	}
+	node, ok := tombstone.Obj.(*v1.Node)
+	if !ok {
+		log.WithField("type", fmt.Sprintf("%T", tombstone.Obj)).Warn("Tombstone contained non-Node object")
+		return nil, false
+	}
+	return node, true
+}
+
+// podFromDeleteObj is the pod counterpart to nodeFromDeleteObj.
+func podFromDeleteObj(obj any) (*v1.Pod, bool) {
+	if pod, ok := obj.(*v1.Pod); ok {
+		return pod, true
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		log.WithField("type", fmt.Sprintf("%T", obj)).Warn("Unexpected object type in pod delete event")
+		return nil, false
+	}
+	pod, ok := tombstone.Obj.(*v1.Pod)
+	if !ok {
+		log.WithField("type", fmt.Sprintf("%T", tombstone.Obj)).Warn("Tombstone contained non-Pod object")
+		return nil, false
+	}
+	return pod, true
+}
+
 // getK8sNodeName is a helper method that searches a calicoNode for its kubernetes nodeRef.
-func getK8sNodeName(calicoNode api.Node) (string, error) {
+func getK8sNodeName(calicoNode internalapi.Node) (string, error) {
 	for _, orchRef := range calicoNode.Spec.OrchRefs {
 		if orchRef.Orchestrator == "k8s" {
 			if orchRef.NodeName == "" {
@@ -173,6 +234,11 @@ func (c *NodeController) Run(stopCh chan struct{}) {
 
 	// We're in-sync. Start the sub-controllers.
 	c.ipamCtrl.Start(stopCh)
+	c.hostEndpointController.Start(stopCh)
+
+	if c.cfg.SyncLabels {
+		c.nodeLabelController.Start(stopCh)
+	}
 
 	<-stopCh
 	log.Info("Stopping Node controller")
@@ -181,7 +247,7 @@ func (c *NodeController) Run(stopCh chan struct{}) {
 // kick puts an item on the channel in non-blocking write. This means if there
 // is already something pending, it has no effect. This allows us to coalesce
 // multiple requests into a single pending request.
-func kick(c chan<- interface{}) {
+func kick(c chan<- any) {
 	select {
 	case c <- nil:
 		// pass

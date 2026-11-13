@@ -19,18 +19,17 @@ import (
 	"os"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/reporters"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/felix/logutils"
+	"github.com/projectcalico/calico/lib/logrusr"
 	"github.com/projectcalico/calico/libcalico-go/lib/testutils"
 )
 
 func init() {
 	testutils.HookLogrusForGinkgo()
-	logutils.ConfigureEarlyLogging()
+	logrusr.ConfigureEarlyLoggingFromEnv("felix")
 	logLevel, err := log.ParseLevel(os.Getenv("K8SFV_LOG_LEVEL"))
 	panicIfError(err)
 	log.SetLevel(logLevel)
@@ -42,8 +41,15 @@ func init() {
 }
 
 func TestMain(t *testing.T) {
-	RegisterFailHandler(Fail)
+	gomega.RegisterFailHandler(ginkgo.Fail)
+	suiteConfig, reporterConfig := ginkgo.GinkgoConfiguration()
 	// The run-test script runs this file from k8sfv/output.
-	junitReporter := reporters.NewJUnitReporter("../../report/k8sfv_suite.xml")
-	RunSpecsWithDefaultAndCustomReporters(t, "Felix/KDD FV tests", []Reporter{junitReporter})
+	nameTypha := ""
+	fileTypha := ""
+	if os.Getenv("USE_TYPHA") == "true" {
+		nameTypha = " (typha)"
+		fileTypha = "typha_"
+	}
+	reporterConfig.JUnitReport = "../../report/felix_k8sfv_" + fileTypha + "suite.xml"
+	ginkgo.RunSpecs(t, "k8sfv tests"+nameTypha, suiteConfig, reporterConfig)
 }

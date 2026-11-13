@@ -1,4 +1,4 @@
-// Copyright (c) 2018,2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,17 @@
 package calc_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/calc"
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 var _ = Describe("profileDecoder", func() {
@@ -100,7 +99,7 @@ var _ = Describe("profileDecoder", func() {
 		It("should send k8s service account profile remove", func() {
 			update := removeUpdate(conversion.ServiceAccountProfileNamePrefix + "test_namespace.test_serviceaccount")
 			uut.OnUpdate(update)
-			Expect(callbacks.saRemoves).To(Equal([]proto.ServiceAccountID{
+			Expect(callbacks.saRemoves).To(Equal([]types.ServiceAccountID{
 				{Name: "test_serviceaccount", Namespace: "test_namespace"},
 			}))
 		})
@@ -108,7 +107,7 @@ var _ = Describe("profileDecoder", func() {
 		It("should send k8s namespace remove", func() {
 			update := removeUpdate(conversion.NamespaceProfileNamePrefix + "test_namespace")
 			uut.OnUpdate(update)
-			Expect(callbacks.nsRemoves).To(Equal([]proto.NamespaceID{
+			Expect(callbacks.nsRemoves).To(Equal([]types.NamespaceID{
 				{Name: "test_namespace"},
 			}))
 		})
@@ -133,28 +132,12 @@ var _ = Describe("profileDecoder", func() {
 
 type passthruCallbackRecorder struct {
 	saUpdates []*proto.ServiceAccountUpdate
-	saRemoves []proto.ServiceAccountID
+	saRemoves []types.ServiceAccountID
 	nsUpdates []*proto.NamespaceUpdate
-	nsRemoves []proto.NamespaceID
+	nsRemoves []types.NamespaceID
 }
 
-func (p *passthruCallbackRecorder) OnHostIPUpdate(hostname string, ip *net.IP) {
-	Fail("HostIPUpdate received")
-}
-
-func (p *passthruCallbackRecorder) OnHostIPRemove(hostname string) {
-	Fail("HostIPRemove received")
-}
-
-func (p *passthruCallbackRecorder) OnHostIPv6Update(hostname string, ip *net.IP) {
-	Fail("HostIPv6Update received")
-}
-
-func (p *passthruCallbackRecorder) OnHostIPv6Remove(hostname string) {
-	Fail("HostIPv6Remove received")
-}
-
-func (p *passthruCallbackRecorder) OnHostMetadataUpdate(hostname string, ip4 *net.IPNet, ip6 *net.IPNet, asnumber string, labels map[string]string) {
+func (p *passthruCallbackRecorder) OnHostMetadataUpdate(hostname string, info *calc.HostInfo) {
 	Fail("HostUpdate received")
 }
 
@@ -182,7 +165,7 @@ func (p *passthruCallbackRecorder) OnServiceAccountUpdate(update *proto.ServiceA
 	p.saUpdates = append(p.saUpdates, update)
 }
 
-func (p *passthruCallbackRecorder) OnServiceAccountRemove(id proto.ServiceAccountID) {
+func (p *passthruCallbackRecorder) OnServiceAccountRemove(id types.ServiceAccountID) {
 	p.saRemoves = append(p.saRemoves, id)
 }
 
@@ -190,7 +173,7 @@ func (p *passthruCallbackRecorder) OnNamespaceUpdate(update *proto.NamespaceUpda
 	p.nsUpdates = append(p.nsUpdates, update)
 }
 
-func (p *passthruCallbackRecorder) OnNamespaceRemove(id proto.NamespaceID) {
+func (p *passthruCallbackRecorder) OnNamespaceRemove(id types.NamespaceID) {
 	p.nsRemoves = append(p.nsRemoves, id)
 }
 
@@ -199,7 +182,7 @@ func (p *passthruCallbackRecorder) OnGlobalBGPConfigUpdate(*v3.BGPConfiguration)
 }
 
 func labelsKV(name string, labels map[string]string) model.KVPair {
-	var value interface{}
+	var value any
 	if labels != nil {
 		value = &v3.Profile{
 			Spec: v3.ProfileSpec{

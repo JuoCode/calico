@@ -19,10 +19,11 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/bpf/conntrack"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/polprog"
 	"github.com/projectcalico/calico/felix/bpf/routes"
@@ -67,6 +68,7 @@ func TestICMPRelatedPlain(t *testing.T) {
 	defer func() { bpfIfaceName = "" }()
 
 	defer resetBPFMaps()
+	hostIP = node1ip
 
 	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
 	Expect(err).NotTo(HaveOccurred())
@@ -92,7 +94,7 @@ func TestICMPRelatedPlain(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 	})
 	expectMark(tcdefs.MarkSeen)
 
@@ -125,6 +127,7 @@ func TestICMPRelatedNATPodPod(t *testing.T) {
 	RegisterTestingT(t)
 
 	defer resetBPFMaps()
+	hostIP = node1ip
 
 	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
 	Expect(err).NotTo(HaveOccurred())
@@ -165,7 +168,7 @@ func TestICMPRelatedNATPodPod(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		natPkt = gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 	})
@@ -195,6 +198,7 @@ func TestICMPRelatedFromHost(t *testing.T) {
 	RegisterTestingT(t)
 
 	defer resetBPFMaps()
+	hostIP = node1ip
 
 	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
 	Expect(err).NotTo(HaveOccurred())
@@ -209,7 +213,7 @@ func TestICMPRelatedFromHost(t *testing.T) {
 	runBpfTest(t, "calico_from_host_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 	})
 	expectMark(tcdefs.MarkSeen)
 
@@ -230,6 +234,7 @@ func TestICMPRelatedFromHostBeforeNAT(t *testing.T) {
 	RegisterTestingT(t)
 
 	defer resetBPFMaps()
+	hostIP = node1ip
 
 	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
 	Expect(err).NotTo(HaveOccurred())
@@ -276,7 +281,7 @@ func TestICMPRelatedFromHostBeforeNAT(t *testing.T) {
 	runBpfTest(t, "calico_from_host_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 	})
 	expectMark(tcdefs.MarkSeenBypassForward)
 
@@ -296,9 +301,89 @@ func TestICMPRelatedFromHostBeforeNAT(t *testing.T) {
 	})
 }
 
-func makeICMPError(ipInner *layers.IPv4, l4 gopacket.SerializableLayer, icmpType, icmpCode uint8) []byte {
+func TestICMPRelatedHostNetBackend(t *testing.T) {
+	RegisterTestingT(t)
+
+	defer resetBPFMaps()
 	hostIP = node1ip
 
+	_, ipv4, l4, _, pktBytes, err := testPacketUDPDefault()
+	Expect(err).NotTo(HaveOccurred())
+	udp := l4.(*layers.UDP)
+
+	err = natMap.Update(
+		nat.NewNATKey(ipv4.DstIP, uint16(udp.DstPort), uint8(ipv4.Protocol)).AsBytes(),
+		nat.NewNATValue(0, 1, 0, 0).AsBytes(),
+	)
+	Expect(err).NotTo(HaveOccurred())
+
+	natIP := hostIP
+	natPort := uint16(666)
+
+	err = natBEMap.Update(
+		nat.NewNATBackendKey(0, 0).AsBytes(),
+		nat.NewNATBackendValue(natIP, natPort).AsBytes(),
+	)
+	Expect(err).NotTo(HaveOccurred())
+	defer func() {
+		err := natBEMap.Delete(nat.NewNATBackendKey(0, 0).AsBytes())
+		Expect(err).NotTo(HaveOccurred())
+	}()
+
+	// route to local host
+	err = rtMap.Update(
+		routes.NewKey(ip.CIDRFromIPNet(&node1CIDR).(ip.V4CIDR)).AsBytes(),
+		routes.NewValue(routes.FlagsLocalHost).AsBytes(),
+	)
+	Expect(err).NotTo(HaveOccurred())
+
+	var recvPkt, respPkt []byte
+
+	skbMark = 0
+	// this will create NAT tracking entries for a nodeport
+	runBpfTest(t, "calico_from_host_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+		recvPkt = res.dataOut
+		respPkt = udpResponseRaw(recvPkt)
+	})
+	expectMark(tcdefs.MarkSeen)
+
+	skbMark = 0
+	// this will create NAT tracking entries for a nodeport
+	runBpfTest(t, "calico_to_host_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(respPkt)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+	}, withHostNetworked())
+
+	// we base the packet on the original packet before NAT as if we let the original packet through
+	// before we do the actual NAT as that is where we check for TTL as doing it for the tunneled
+	// packet would be complicated
+	ipv4.SrcIP, ipv4.DstIP = ipv4.DstIP, ipv4.SrcIP
+	udp.SrcPort, udp.DstPort = udp.DstPort, udp.SrcPort
+	icmpFragNeeded := makeICMPErrorFrom(net.ParseIP("192.168.1.1"), ipv4, udp, 3 /* unreach */, 4 /* frag needed */)
+
+	dumpCTMap(ctMap)
+
+	skbMark = 0
+	runBpfTest(t, "calico_from_host_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(icmpFragNeeded)
+		Expect(err).NotTo(HaveOccurred())
+		// we have a normal ct record, it is related, must be allowed
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+
+		checkICMP(res.dataOut, net.ParseIP("192.168.1.1"), hostIP, hostIP, ipv4.DstIP, ipv4.Protocol,
+			natPort, uint16(udp.DstPort))
+	})
+}
+
+func makeICMPError(ipInner *layers.IPv4, l4 gopacket.SerializableLayer, icmpType, icmpCode uint8) []byte {
+	return makeICMPErrorFrom(node1ip, ipInner, l4, icmpType, icmpCode)
+}
+
+func makeICMPErrorFrom(from net.IP, ipInner *layers.IPv4, l4 gopacket.SerializableLayer, icmpType, icmpCode uint8) []byte {
 	payloadBuf := gopacket.NewSerializeBuffer()
 	err := gopacket.SerializeLayers(payloadBuf, gopacket.SerializeOptions{}, ipInner, l4)
 	Expect(err).NotTo(HaveOccurred())
@@ -317,7 +402,7 @@ func makeICMPError(ipInner *layers.IPv4, l4 gopacket.SerializableLayer, icmpType
 		IHL:      5,
 		TTL:      64,
 		Flags:    layers.IPv4DontFragment,
-		SrcIP:    hostIP,
+		SrcIP:    from,
 		DstIP:    ipInner.SrcIP,
 		Protocol: layers.IPProtocolICMPv4,
 		Length:   uint16(20 + 8 + len(payload)),
@@ -389,6 +474,10 @@ func checkICMP(bytes []byte, outSrc, outDst, innerSrc, innerDst net.IP,
 
 	fmt.Printf("pktR = %+v\n", icmpPkt)
 
+	ethL := icmpPkt.Layer(layers.LayerTypeEthernet)
+	Expect(ethL).NotTo(BeNil())
+	ethR := ethL.(*layers.Ethernet)
+
 	ipv4L := icmpPkt.Layer(layers.LayerTypeIPv4)
 	Expect(ipv4L).NotTo(BeNil())
 	ipv4R := ipv4L.(*layers.IPv4)
@@ -396,8 +485,22 @@ func checkICMP(bytes []byte, outSrc, outDst, innerSrc, innerDst net.IP,
 	Expect(ipv4R.SrcIP.String()).To(Equal(outSrc.String()))
 	Expect(ipv4R.DstIP.String()).To(Equal(outDst.String()))
 
+	icmpL := icmpPkt.Layer(layers.LayerTypeICMPv4)
+	Expect(icmpL).NotTo(BeNil())
+	icmpR := icmpL.(*layers.ICMPv4)
+
 	payloadL := icmpPkt.ApplicationLayer()
 	Expect(payloadL).NotTo(BeNil())
+
+	// Check if the packet has correct checksums
+	pkt := gopacket.NewSerializeBuffer()
+	err := gopacket.SerializeLayers(pkt, gopacket.SerializeOptions{ComputeChecksums: true},
+		ethR, ipv4R, icmpR, gopacket.Payload(payloadL.Payload()))
+	Expect(err).NotTo(HaveOccurred())
+	pktBytes := pkt.Bytes()
+
+	Expect(bytes).To(Equal(pktBytes))
+
 	origPkt := gopacket.NewPacket(payloadL.Payload(), layers.LayerTypeIPv4, gopacket.Default)
 	Expect(origPkt).NotTo(BeNil())
 	fmt.Printf("origPkt = %+v\n", origPkt)
@@ -435,6 +538,10 @@ func checkICMPv6(bytes []byte, outSrc, outDst, innerSrc, innerDst net.IP,
 
 	fmt.Printf("pktR = %+v\n", icmpPkt)
 
+	ethL := icmpPkt.Layer(layers.LayerTypeEthernet)
+	Expect(ethL).NotTo(BeNil())
+	ethR := ethL.(*layers.Ethernet)
+
 	ipv6L := icmpPkt.Layer(layers.LayerTypeIPv6)
 	Expect(ipv6L).NotTo(BeNil())
 	ipv6R := ipv6L.(*layers.IPv6)
@@ -442,8 +549,23 @@ func checkICMPv6(bytes []byte, outSrc, outDst, innerSrc, innerDst net.IP,
 	Expect(ipv6R.SrcIP.String()).To(Equal(outSrc.String()))
 	Expect(ipv6R.DstIP.String()).To(Equal(outDst.String()))
 
+	icmpL := icmpPkt.Layer(layers.LayerTypeICMPv6)
+	Expect(icmpL).NotTo(BeNil())
+	icmpR := icmpL.(*layers.ICMPv6)
+	_ = icmpR.SetNetworkLayerForChecksum(ipv6L.(gopacket.NetworkLayer))
+
 	payloadL := icmpPkt.ApplicationLayer()
 	Expect(payloadL).NotTo(BeNil())
+
+	// Check if the packet has correct checksums
+	pkt := gopacket.NewSerializeBuffer()
+	err := gopacket.SerializeLayers(pkt, gopacket.SerializeOptions{ComputeChecksums: true},
+		ethR, ipv6R, icmpR, gopacket.Payload(payloadL.Payload()))
+	Expect(err).NotTo(HaveOccurred())
+	pktBytes := pkt.Bytes()
+
+	Expect(bytes).To(Equal(pktBytes))
+
 	origPkt := gopacket.NewPacket(payloadL.Payload()[4:], layers.LayerTypeIPv6, gopacket.Default)
 	Expect(origPkt).NotTo(BeNil())
 	fmt.Printf("origPkt = %+v\n", origPkt)
@@ -510,7 +632,7 @@ func TestICMPv6RelatedPlain(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 	}, withIPv6())
 	expectMark(tcdefs.MarkSeen)
 
@@ -586,7 +708,7 @@ func TestICMPv6RelatedNATPodPod(t *testing.T) {
 	runBpfTest(t, "calico_from_workload_ep", rulesAllowUDP, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		natPkt = gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 	}, withIPv6())
@@ -610,4 +732,54 @@ func TestICMPv6RelatedNATPodPod(t *testing.T) {
 		checkICMPv6(res.dataOut, hostIP, ipv6.SrcIP, ipv6.SrcIP, ipv6.DstIP, 17,
 			uint16(udp.SrcPort), uint16(udp.DstPort))
 	}, withIPv6())
+}
+
+// TestICMPRelatedStaleNATForwardIsInvalid checks that an ICMP error quoting a stale forward entry's tuple is invalid, not a new flow.
+func TestICMPRelatedStaleNATForwardIsInvalid(t *testing.T) {
+	RegisterTestingT(t)
+
+	defer resetBPFMaps()
+	hostIP = node1ip
+
+	bpfIfaceName = "ICsF"
+	defer func() { bpfIfaceName = "" }()
+
+	natIP := net.IPv4(8, 8, 8, 8).To4()
+	natPort := uint16(666)
+	srcPort := uint16(54321)
+	svcPort := uint16(7890)
+
+	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	Expect(rtMap.Update(rtKey, rtVal)).NotTo(HaveOccurred())
+
+	// The forward entry's reverse key now holds an unrelated connection.
+	fwdKey := conntrack.NewKey(conntrack.ProtoTCP, srcIP, srcPort, dstIP, svcPort)
+	revKey := conntrack.NewKey(conntrack.ProtoTCP, srcIP, srcPort, natIP, natPort)
+	Expect(ctMap.Update(fwdKey.AsBytes(), conntrack.NewValueNATForward(0, 0, revKey).AsBytes())).NotTo(HaveOccurred())
+	Expect(ctMap.Update(revKey.AsBytes(), conntrack.NewValueNormal(0, 0,
+		conntrack.Leg{SynSeen: true, AckSeen: true, Opener: true, Approved: true},
+		conntrack.Leg{SynSeen: true, AckSeen: true, Approved: true}).AsBytes())).NotTo(HaveOccurred())
+
+	inner := *ipv4Default
+	inner.Protocol = layers.IPProtocolTCP
+	innerTCP := &layers.TCP{
+		SrcPort:    layers.TCPPort(srcPort),
+		DstPort:    layers.TCPPort(svcPort),
+		ACK:        true,
+		DataOffset: 5,
+	}
+	icmpUnreachable := makeICMPError(&inner, innerTCP, 3, 1)
+
+	skbMark = tcdefs.MarkSeen
+	runBpfTest(t, "calico_to_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(icmpUnreachable)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_SHOT))
+	})
+
+	ct, err := conntrack.LoadMapMem(ctMap)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(ct).NotTo(HaveKey(fwdKey))
+	Expect(ct).To(HaveKey(revKey))
 }

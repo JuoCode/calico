@@ -1,3 +1,6 @@
+# The tests in this directory use the projectcalico.org/v3 API group for CRDs.
+CALICO_API_GROUP ?= projectcalico.org/v3
+
 # If ../metadata.mk exists, we're running this logic from within the calico repository.
 # If it does not, then we're in the api repo and we should use the local metadata.mk.
 ifneq ("$(wildcard ../metadata.mk)", "")
@@ -7,17 +10,23 @@ include ./metadata.mk
 endif
 
 PACKAGE_NAME    ?= github.com/projectcalico/api
-LOCAL_CHECKS     = lint-cache-dir goimports check-copyright
+LOCAL_CHECKS     = lint-cache-dir check-copyright
 
 BINDIR ?= bin
 BUILD_DIR ?= build
 TOP_SRC_DIRS = pkg
+KIND_CONFIG = $(KIND_DIR)/kind-single.config
 
 ##############################################################################
 # Download and include ../lib.Makefile before anything else
 #   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
 #   that variable is evaluated when we declare DOCKER_RUN and siblings.
 ##############################################################################
+# The api container mounts at /go/src/$(PACKAGE_NAME), not the default calico
+# repo path.  Override DOCKER_GIT_WORK_TREE so that git worktree support in
+# lib.Makefile sets GIT_WORK_TREE to the correct container path.
+DOCKER_GIT_WORK_TREE := /go/src/$(PACKAGE_NAME)
+
 # If ../lib.Makefile exists, we're running this logic from within the calico repository.
 # If it does not, then we're in the api repo and should use the local lib.Makefile.
 ifneq ("$(wildcard ../lib.Makefile)", "")
@@ -28,20 +37,21 @@ endif
 
 # Override DOCKER_RUN from lib.Makefile. We need to trick this particular directory to think
 # that its package is github.com/projectcalico/api for easier mirroring.
-DOCKER_RUN := mkdir -p ../.go-pkg-cache bin $(GOMOD_CACHE) && \
+DOCKER_RUN := mkdir -p $(LOCAL_GO_PKG_CACHE) bin $(GOMOD_CACHE) && \
 	docker run --rm \
 		--net=host \
 		--init \
 		$(EXTRA_DOCKER_ARGS) \
+		$(DOCKER_GIT_WORKTREE_ARGS) \
 		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
 		-e GOCACHE=/go-cache \
 		$(GOARCH_FLAGS) \
 		-e GOPATH=/go \
 		-e OS=$(BUILDOS) \
 		-e GOOS=$(BUILDOS) \
-		-e GOFLAGS=$(GOFLAGS) \
+		-e "GOFLAGS=$(GOFLAGS)" \
 		-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
-		-v $(CURDIR)/../.go-pkg-cache:/go-cache:rw \
+		-v $(LOCAL_GO_PKG_CACHE):/go-cache:rw \
 		-w /go/src/$(PACKAGE_NAME)
 
 build: gen-files examples
@@ -52,37 +62,34 @@ build: gen-files examples
 # Regenerate all files if the gen exes changed or any "types.go" files changed
 .PHONY: gen-files
 gen-files .generate_files: lint-cache-dir clean-generated
-	# Generate defaults
-	$(DOCKER_RUN) $(CALICO_BUILD) \
-	   sh -c '$(GIT_CONFIG_SSH) defaulter-gen \
-		--v 1 --logtostderr \
-		--go-header-file "/go/src/$(PACKAGE_NAME)/hack/boilerplate/boilerplate.go.txt" \
-		--input-dirs "$(PACKAGE_NAME)/pkg/apis/projectcalico/v3" \
-		--extra-peer-dirs "$(PACKAGE_NAME)/pkg/apis/projectcalico/v3" \
-		--output-file-base "zz_generated.defaults"'
-	# Generate deep copies
-	$(DOCKER_RUN) $(CALICO_BUILD) \
-	   sh -c '$(GIT_CONFIG_SSH) deepcopy-gen \
-		--v 1 --logtostderr \
-		--go-header-file "/go/src/$(PACKAGE_NAME)/hack/boilerplate/boilerplate.go.txt" \
-		--input-dirs "$(PACKAGE_NAME)/pkg/apis/projectcalico/v3" \
-		--bounding-dirs $(PACKAGE_NAME) \
-		--output-file-base zz_generated.deepcopy'
+	# Prune stale CRDs, keeping embed.go, which lives with the CRDs it embeds.
+	rm -f config/crd/*.yaml
+	# Generate CRDs using the in-repo Calico-patched controller-gen.
+	$(MAKE) -C $(REPO_ROOT) $(CALICO_CONTROLLER_GEN_BIN)
+	$(DOCKER_RUN) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) $(CALICO_CONTROLLER_GEN) crd:allowDangerousTypes=true,crdVersions=v1 paths=./pkg/apis/... output:crd:dir=config/crd/'
+	# Remove the first yaml separator line.
+	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'find ./config/crd -name "*.yaml" | xargs sed -i 1d'
+	# Run prettier to fix indentation
+	docker run --rm --user $(id -u):$(id -g) -v $(CURDIR)/config/crd/:/work/config/crd/ tmknom/prettier --write --parser=yaml "/work/config/crd/*.yaml"
+	# Remove the profiles CRD. Profiles are backed by Namespaces in Kubernetes and the CRD is not needed.
+	rm -f config/crd/*.orig config/crd/projectcalico.org_profiles.yaml
 
-	# generate all pkg/client contents
-	$(DOCKER_RUN) $(CALICO_BUILD) \
-	   sh -c '$(GIT_CONFIG_SSH) $(BUILD_DIR)/update-client-gen.sh'
-
-	# generate openapi
-	$(DOCKER_RUN) $(CALICO_BUILD) \
-	   sh -c '$(GIT_CONFIG_SSH) openapi-gen \
-		--v 1 --logtostderr \
-		--go-header-file "/go/src/$(PACKAGE_NAME)/hack/boilerplate/boilerplate.go.txt" \
-		--input-dirs "$(PACKAGE_NAME)/pkg/apis/projectcalico/v3,k8s.io/api/core/v1,k8s.io/api/networking/v1,k8s.io/apimachinery/pkg/apis/meta/v1,k8s.io/apimachinery/pkg/version,k8s.io/apimachinery/pkg/runtime,k8s.io/apimachinery/pkg/util/intstr,$(PACKAGE_NAME)/pkg/lib/numorstring" \
-		--output-package "$(PACKAGE_NAME)/pkg/openapi"'
+	# Generate the Go artifacts (defaults, deep copies, OpenAPI definitions, and
+	# the clientset/listers/informers). The logic lives in build/codegen.sh so it
+	# can be shared with the standalone projectcalico/api and tigera/api repos,
+	# which mirror build/ but keep their own Makefile. CRD generation stays above
+	# because it uses the monorepo-only Calico-patched controller-gen.
+	$(DOCKER_RUN) -e PACKAGE_NAME=$(PACKAGE_NAME) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) $(BUILD_DIR)/codegen.sh'
 
 	touch .generate_files
 	$(MAKE) fix
+
+# Would be nice to use the monorepo's more-thorough fix target here but,
+# once the API package is exported to its own repo, the monorepo's scripts are
+# not available.
+fix:
+	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'find . -iname "*.go" ! -wholename "./vendor/*" | xargs goimports -w -local github.com/projectcalico/calico/'
+
 
 .PHONY: lint-cache-dir
 lint-cache-dir:
@@ -101,7 +108,7 @@ clean-generated:
 	find $(TOP_SRC_DIRS) -name zz_generated* -exec rm {} \;
 	# rollback changes to the generated clientset directories
 	# find $(TOP_SRC_DIRS) -type d -name *_generated -exec rm -rf {} \;
-	rm -rf pkg/client/clientset_generated pkg/client/informers_generated pkg/client/listers_generated pkg/openapi pkg/lib/numorstring/openapi_generated.go
+	rm -rf pkg/client/clientset_generated pkg/client/informers_generated pkg/client/listers_generated pkg/client/applyconfiguration_generated pkg/openapi
 
 clean-bin:
 	rm -rf $(BINDIR) \
@@ -118,9 +125,23 @@ WHAT?=.
 GINKGO_FOCUS?=.*
 
 .PHONY:ut
-ut:
-	$(DOCKER_RUN) --privileged $(CALICO_BUILD) \
-		sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r -focus="$(GINKGO_FOCUS)" $(WHAT)'
+ut: kind-cluster-create
+	mkdir -p report
+	$(DOCKER_RUN) \
+		--privileged \
+		-e KUBECONFIG=/kubeconfig.yaml \
+		-v $(KIND_KUBECONFIG):/kubeconfig.yaml \
+		$(CALICO_BUILD) \
+		sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -r --junit-report=api_ut.xml --output-dir=report/ -focus="$(GINKGO_FOCUS)" $(WHAT)'
+
+## Run CRD validation tests using envtest (no kind cluster required)
+.PHONY: ut-validation
+ut-validation: setup-envtest
+	$(DOCKER_RUN) \
+		-v $$(ls -d $(ENVTEST_DIR)/k8s/*-$(BUILDOS)-$(BUILDARCH) | tail -1):/envtest:ro \
+		-e KUBEBUILDER_ASSETS=/envtest \
+		$(CALICO_BUILD) \
+		sh -c 'go test -count=1 ./...'
 
 ## Check if generated files are out of date
 .PHONY: check-generated-files

@@ -6,7 +6,6 @@ spec:
   nodeToNodeMeshEnabled: false
 
 ---
-
 kind: BGPPeer
 apiVersion: projectcalico.org/v3
 metadata:
@@ -14,11 +13,11 @@ metadata:
 spec:
   peerIP: 10.192.0.3
   asNumber: 64512
+  localASNumber: 64512
   node: kube-master
   numAllowedLocalASNumbers: 1
 
 ---
-
 kind: BGPPeer
 apiVersion: projectcalico.org/v3
 metadata:
@@ -26,10 +25,10 @@ metadata:
 spec:
   peerIP: 10.192.0.4
   asNumber: 64566
+  localASNumber: 65001
   node: kube-master
 
 ---
-
 kind: IPPool
 apiVersion: projectcalico.org/v3
 metadata:
@@ -40,7 +39,6 @@ spec:
   natOutgoing: true
 
 ---
-
 kind: Node
 apiVersion: projectcalico.org/v3
 metadata:
@@ -50,7 +48,6 @@ spec:
     ipv4Address: 10.192.0.2/16
 
 ---
-
 kind: Node
 apiVersion: projectcalico.org/v3
 metadata:
@@ -60,7 +57,6 @@ spec:
     ipv4Address: 10.192.0.3/16
 
 ---
-
 kind: Node
 apiVersion: projectcalico.org/v3
 metadata:
@@ -68,4 +64,3 @@ metadata:
 spec:
   bgp:
     ipv4Address: 10.192.0.4/16
-
